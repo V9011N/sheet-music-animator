@@ -44,4 +44,4 @@ python -m venv .venv
 
 * Notes are engraved by Verovio, so the layout is Verovio's, not your notation program's.
 * Only the first page is used; Verovio is asked for one tall page, which is plenty for typical pieces.
-* Clefs/key/time signature changes in the middle of a piece are always visible (they are not timed).
+* Clefs/key/time signatures, barlines and the like are always visible unless you time them in the Selection tab.

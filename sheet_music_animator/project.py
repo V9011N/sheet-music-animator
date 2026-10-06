@@ -49,6 +49,7 @@ class Project:
     keys: list[CameraKey] = field(default_factory=list)
     overrides: dict[int, float] = field(default_factory=dict)   # unit uid -> extra seconds
     keys_edited: bool = False
+    timed: set[int] = field(default_factory=set)   # clefs, barlines... (static units) that follow the music
 
     # ---- camera ---------------------------------------------------------------------
     def camera_at(self, t: float):
@@ -116,8 +117,14 @@ class Project:
             prev = frac
         return wipe
 
+    def always_visible(self, unit) -> bool:
+        """Clefs, barlines, key signatures... are on show from the start until they are given a timing."""
+        return unit.static and unit.uid not in self.timed
+
     def reveal(self, unit, t: float):
         """(opacity, wipe fraction) of a unit at time t."""
+        if self.always_visible(unit):
+            return 1.0, 1.0
         s = self.settings
         dt = t - self.start_of(unit)
         if dt < 0:
@@ -135,7 +142,7 @@ class Project:
         data = {"version": 1, "xml_path": self.xml_path, "settings": asdict(self.settings),
                 "keys": [asdict(k) for k in self.keys],
                 "overrides": {str(k): v for k, v in self.overrides.items()},
-                "keys_edited": self.keys_edited}
+                "keys_edited": self.keys_edited, "timed": sorted(self.timed)}
         Path(path).write_text(json.dumps(data, indent=1), encoding="utf8")
 
     @classmethod
@@ -146,7 +153,8 @@ class Project:
                 settings=Settings(**{k: v for k, v in d.get("settings", {}).items() if k in known}),
                 keys=[CameraKey(**k) for k in d.get("keys", [])],
                 overrides={int(k): v for k, v in d.get("overrides", {}).items()},
-                keys_edited=d.get("keys_edited", False))
+                keys_edited=d.get("keys_edited", False),
+                timed={int(u) for u in d.get("timed", [])})
         return p
 
 

@@ -5,7 +5,7 @@ import math
 from bisect import bisect_left, bisect_right
 
 from PySide6.QtCore import QByteArray, QPointF, QRectF, Qt, Signal
-from PySide6.QtGui import QBrush, QColor, QPainter, QPen, QPicture, QPixmap
+from PySide6.QtGui import QBrush, QColor, QPainter, QPen, QPicture, QPixmap, QPixmapCache
 from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import (QGraphicsItem, QGraphicsScene, QGraphicsView, QStyle, QWidget)
 
@@ -92,6 +92,9 @@ class SheetScene(QGraphicsScene):
 
     def __init__(self, score: Score, project: Project, parent=None):
         super().__init__(parent)
+        # Qt's default 10 MB pixmap cache is far too small for the thousands of cached items of a long
+        # piece: they evict each other and everything is re-rendered on every repaint.
+        QPixmapCache.setCacheLimit(max(QPixmapCache.cacheLimit(), 256 * 1024))
         self.score, self.project = score, project
         m = 2500  # breathing room so the camera can sit at the edge of the page
         self.page = QRectF(0, 0, score.width, score.height)
@@ -106,14 +109,15 @@ class SheetScene(QGraphicsScene):
         self._items: list[SvgItem] = []          # parallel to score.units
         for u in score.units:
             it = SvgItem(u.svg, u.rect)
-            it.setZValue(1)
+            # Beams, slurs, dynamics... have big bounding boxes: keep them below the notes so that a
+            # click on a note selects the note, while every engraved element can be selected.
+            it.setZValue(2 if u.kind in SELECTABLE else 1)
             it.setVisible(False)
             it.unit = u
             it.setOpacity(0.0)
             it.setCacheMode(QGraphicsItem.DeviceCoordinateCache)
-            if u.kind in SELECTABLE:
-                it.setFlag(QGraphicsItem.ItemIsSelectable, True)
-                it.setAcceptedMouseButtons(Qt.LeftButton)
+            it.setFlag(QGraphicsItem.ItemIsSelectable, True)
+            it.setAcceptedMouseButtons(Qt.LeftButton)
             self.addItem(it)
             self.items_by_uid[u.uid] = it
             self._items.append(it)
@@ -132,6 +136,9 @@ class SheetScene(QGraphicsScene):
         fade = 0.0 if s.reveal == "instant" else s.fade
         self._starts, self._buckets = [], {}
         for i, u in enumerate(self.score.units):
+            if proj.always_visible(u):   # never changes with time: set once, no need to index
+                self._starts.append(-math.inf)
+                continue
             start = proj.start_of(u)
             if u.steps:
                 finish = max(m + s.offset + proj.overrides.get(uid, 0.0) for uid, m, _ in u.steps) + fade

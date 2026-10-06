@@ -8,7 +8,7 @@ from pathlib import Path
 
 from PySide6.QtCore import QElapsedTimer, QRectF, QSettings, Qt, QTimer, QUrl
 from PySide6.QtGui import QAction, QColor, QImage, QKeySequence, QPalette
-from PySide6.QtWidgets import (QApplication, QColorDialog, QComboBox, QDoubleSpinBox, QFileDialog, QFormLayout,
+from PySide6.QtWidgets import (QApplication, QCheckBox, QColorDialog, QComboBox, QDoubleSpinBox, QFileDialog, QFormLayout,
                                QGraphicsView, QGroupBox, QHBoxLayout, QLabel, QMainWindow, QMessageBox,
                                QProgressDialog, QPushButton, QSizePolicy, QSpinBox, QSplitter, QTabWidget,
                                QToolBar, QVBoxLayout, QWidget)
@@ -41,6 +41,10 @@ def dark_palette() -> QPalette:
     return p
 
 
+SELECT_HINT = ("Click any element of the score (note, rest, beam, slur, clef, barline, arpeggio…) or drag a box "
+               "around several to select them.")
+
+
 def spin(lo, hi, step, decimals=2, suffix="") -> QDoubleSpinBox:
     s = QDoubleSpinBox()
     s.setRange(lo, hi)
@@ -66,6 +70,7 @@ class MainWindow(QMainWindow):
         self.wav_path: str | None = None
         self._updating = False
         self._clock = QElapsedTimer()
+        self._sel_units, self._reselecting = [], False
         self._editor_clock = QElapsedTimer()
         self._clock_t0 = 0.0
         self._timer = QTimer(self, interval=16)
@@ -233,13 +238,17 @@ class MainWindow(QMainWindow):
     def _note_tab(self):
         w = QWidget()
         f = QFormLayout(w)
-        self.lbl_sel = QLabel("Click a note (or drag a box) in the sheet to select it.")
+        self.lbl_sel = QLabel(SELECT_HINT)
         self.lbl_sel.setWordWrap(True)
+        self.chk_timed = QCheckBox("Reveal with the music (otherwise always visible)")
+        self.chk_timed.setVisible(False)
+        self.chk_timed.toggled.connect(self._timed_toggled)
         self.sp_note = spin(-10, 10, 0.05, 2, " s")
         self.sp_note.valueChanged.connect(self._note_offset_changed)
         reset = QPushButton("Reset to XML timing")
         reset.clicked.connect(lambda: self.sp_note.setValue(0.0))
         f.addRow(self.lbl_sel)
+        f.addRow(self.chk_timed)
         f.addRow("Reveal earlier / later", self.sp_note)
         f.addRow(reset)
         return w
@@ -343,6 +352,7 @@ class MainWindow(QMainWindow):
             QApplication.processEvents()
             self.score = score
             self.scene = SheetScene(score, self.project)
+            self._sel_units = []
             self.editor.setScene(self.scene)
             self.preview.view.setScene(self.scene)
             if not self.project.keys:
@@ -619,27 +629,59 @@ class MainWindow(QMainWindow):
 
     # ================================================================== note selection
     def _selection_changed(self):
-        units = self.scene.selected_units() if self.scene else []
+        if self._reselecting:   # Qt deselects items that become hidden; the panel keeps its elements
+            return
+        self._sel_units = self.scene.selected_units() if self.scene else []
+        self._update_selection_panel()
+
+    def _update_selection_panel(self):
+        units = self._sel_units
         self._updating = True
         self.tabs.setTabText(3, f"Selection ({len(units)})" if units else "Selection")
+        static = [u for u in units if u.static]
+        self.chk_timed.setVisible(bool(static))
         if not units:
-            self.lbl_sel.setText("Click a note (or drag a box) in the sheet to select it.")
+            self.lbl_sel.setText(SELECT_HINT)
             self.sp_note.setValue(0.0)
         else:
             u = units[0]
-            self.lbl_sel.setText(f"{len(units)} selected — {u.kind} first heard at {fmt(u.time)} (XML timing)")
+            self.chk_timed.setChecked(bool(static) and all(s.uid in self.project.timed for s in static))
+            if u.static and u.uid not in self.project.timed:
+                self.lbl_sel.setText(f"{len(units)} selected — {u.kind} is always visible. Tick the box or set a "
+                                     f"time to make it appear with the music (XML timing {fmt(u.time)}).")
+            else:
+                self.lbl_sel.setText(f"{len(units)} selected — {u.kind} first heard at {fmt(u.time)} (XML timing)")
             self.sp_note.setValue(self.project.overrides.get(u.uid, 0.0))
         self._updating = False
 
-    def _note_offset_changed(self, v):
+    def _retime_selection(self, change):
+        """Apply `change(unit)` to the selected elements.  An element that is moved later than the playhead
+        disappears, and Qt would drop it from the selection, so the selection is restored afterwards."""
         if self._updating or not self.scene:
             return
-        for u in self.scene.selected_units():
+        units = self._sel_units
+        for u in units:
+            change(u)
+        self._reselecting = True
+        self.scene.apply_time(force=True)
+        for u in units:
+            self.scene.items_by_uid[u.uid].setSelected(True)   # no-op for hidden ones
+        self._reselecting = False
+        self._update_selection_panel()
+        self._refresh_time(follow=False)
+
+    def _note_offset_changed(self, v):
+        def change(u):
             if abs(v) < 1e-9:
                 self.project.overrides.pop(u.uid, None)
             else:
                 self.project.overrides[u.uid] = v
-        self.scene.apply_time(force=True)
+                if u.static:   # moving a clef or barline in time only makes sense once it is timed
+                    self.project.timed.add(u.uid)
+        self._retime_selection(change)
+
+    def _timed_toggled(self, on):
+        self._retime_selection(lambda u: u.static and (self.project.timed.add if on else self.project.timed.discard)(u.uid))
 
     # ================================================================== output
     def _audio_for_render(self):

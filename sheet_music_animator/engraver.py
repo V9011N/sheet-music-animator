@@ -64,6 +64,7 @@ class Unit:
     end: float           # notes: stops sounding; spanning shapes: last note they cover
     system: int
     wipe: bool = False
+    static: bool = False  # clefs, barlines, key signatures...: always on show unless the project times them
     # Beams, tuplets, tremolos: (member uid, member time, fraction of rect width to show once that
     # member has appeared) so the shape grows note by note instead of all at once.
     steps: tuple = ()
@@ -324,7 +325,8 @@ class _Builder:
                     if _tag(p) == "path":
                         self._unit(p, "ledger", si)
             elif c & STATIC:
-                continue
+                if self._drawable(ch):
+                    self._unit(ch, next(iter(c & STATIC)), si, static=True)
             elif c & STRUCTURE:
                 found += self._walk(ch, next(iter(c & STRUCTURE)), si)
             elif parent in ("measure", "layer") and self._drawable(ch):
@@ -340,6 +342,9 @@ class _Builder:
                 members.append(self._unit(ch, self._kind(c), si))
             elif c & BUNDLES:
                 members += self._bundle(ch, si, next(iter(c & BUNDLES)))
+            elif c & STATIC:
+                if self._drawable(ch):
+                    self._unit(ch, next(iter(c & STATIC)), si, static=True)
             elif _tag(ch) in DRAWABLE or (_tag(ch) == "g" and self._drawable(ch)):
                 loose.append(ch)
         if loose:  # beam polygons, tuplet brackets ... become one unit of their own
@@ -351,7 +356,7 @@ class _Builder:
             self._unit(wrap, kind, si)["members"] = members
         return members
 
-    def _unit(self, el, kind, si):
+    def _unit(self, el, kind, si, static=False):
         el.set("data-unit", str(len(self.recs)))
         if kind in NOTE_KINDS:
             ids = [e.get("id") for e in el.iter(_G) if "note" in _classes(e)] if kind == "chord" \
@@ -361,7 +366,7 @@ class _Builder:
         else:
             ids = []
         rec = {"n": len(self.recs), "el": el, "kind": kind, "box": self.calc.box(el), "system": si,
-               "ids": ids, "members": [], "time": None, "end": None}
+               "ids": ids, "members": [], "time": None, "end": None, "static": static}
         self.recs.append(rec)
         return rec
 
@@ -388,6 +393,12 @@ class _Builder:
                     anchors[r["system"]].append((x, r["time"]))
         for a in anchors:
             a.sort()
+        chords = [[] for _ in range(nsys)]   # per system: (x, y0, y1, time) of every note, for arpeggio signs
+        for r in self.recs:
+            if r["kind"] in NOTE_KINDS and r["time"] is not None and r["box"] is not None:
+                x = self._anchor_x(r)
+                if x is not None:
+                    chords[r["system"]].append((x, r["box"][1], r["box"][3], r["time"]))
 
         for r in self.recs:  # everything else is timed by where it sits next to the notes
             if r["time"] is not None or r["members"] or r["box"] is None:
@@ -397,6 +408,12 @@ class _Builder:
                 r["time"] = r["end"] = 0.0
                 continue
             xs = [p[0] for p in a]
+            if r["kind"] == "arpeg":   # the wavy line sits just left of the chord it rolls: it appears with that chord
+                b = r["box"]
+                nxt = [c for c in chords[r["system"]] if c[0] >= b[0] and c[1] <= b[3] and b[1] <= c[2]]
+                if nxt:
+                    r["time"] = r["end"] = min(nxt, key=lambda c: (c[0], c[3]))[3]
+                    continue
             if r["kind"] in NOTE_KINDS | REST_KINDS | {"ledger"}:
                 x = self._anchor_x(r)
                 i = bisect_right(xs, x)
@@ -459,7 +476,7 @@ class _Builder:
             span = r["end"] - r["time"]
             out.append(Unit(uid=r["n"], kind=r["kind"], svg=self._doc(r["el"], rect), rect=rect,
                             time=r["time"], end=r["end"], system=r["system"],
-                            wipe=r["kind"] in WIPE_KINDS and span > 0.12,
+                            wipe=r["kind"] in WIPE_KINDS and span > 0.12, static=r["static"],
                             steps=self._steps(r, rect) if r["members"] else ()))
         return out
 
