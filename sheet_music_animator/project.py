@@ -22,6 +22,7 @@ class CameraKey:
 @dataclass
 class Settings:
     layout: str = "pages"        # "pages" (systems stacked) or "horizontal" (one long line)
+    reveal: str = "fade"         # "fade" (notes fade/wipe in) or "instant" (notes pop in at their time)
     fade: float = 0.25           # seconds a note takes to fade in
     ghost: float = 0.0           # opacity of notes that have not played yet (0 = hidden)
     offset: float = 0.0          # shift every reveal by this many seconds (audio latency, etc.)
@@ -102,6 +103,8 @@ class Project:
         dt = t - self.start_of(unit)
         if dt < 0:
             return s.ghost, 0.0
+        if s.reveal == "instant":
+            return 1.0, 1.0
         a = 1.0 if s.fade <= 0 else min(dt / s.fade, 1.0)
         a = a * a * (3 - 2 * a)
         wipe = 1.0

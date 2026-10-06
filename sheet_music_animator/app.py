@@ -156,6 +156,9 @@ class MainWindow(QMainWindow):
     def _look_tab(self):
         w = QWidget()
         f = QFormLayout(w)
+        self.cb_reveal = QComboBox()
+        self.cb_reveal.addItem("Fade in", "fade")
+        self.cb_reveal.addItem("Appear instantly", "instant")
         self.sp_fade = spin(0, 3, 0.05, 2, " s")
         self.sp_ghost = spin(0, 0.5, 0.02, 2)
         self.sp_offset = spin(-5, 5, 0.05, 2, " s")
@@ -169,6 +172,8 @@ class MainWindow(QMainWindow):
         for s in (self.sp_fade, self.sp_ghost, self.sp_offset, self.sp_tail):
             s.valueChanged.connect(self._settings_changed)
         self.cb_layout.activated.connect(self._layout_changed)
+        self.cb_reveal.activated.connect(self._settings_changed)
+        f.addRow("Note reveal", self.cb_reveal)
         f.addRow("Fade-in time", self.sp_fade)
         f.addRow("Unplayed notes opacity", self.sp_ghost)
         f.addRow("Shift all notes", self.sp_offset)
@@ -501,7 +506,9 @@ class MainWindow(QMainWindow):
         s = self.project.settings
         self._updating = True
         self.sp_follow.setValue(s.follow_width)
+        self.cb_reveal.setCurrentIndex(self.cb_reveal.findData(s.reveal))
         self.sp_fade.setValue(s.fade)
+        self.sp_fade.setEnabled(s.reveal == "fade")
         self.sp_ghost.setValue(s.ghost)
         self.sp_offset.setValue(s.offset)
         self.sp_tail.setValue(s.tail)
@@ -523,6 +530,8 @@ class MainWindow(QMainWindow):
             return
         s = self.project.settings
         s.follow_width = self.sp_follow.value()
+        s.reveal = self.cb_reveal.currentData()
+        self.sp_fade.setEnabled(s.reveal == "fade")
         s.fade, s.ghost, s.offset, s.tail = (self.sp_fade.value(), self.sp_ghost.value(),
                                              self.sp_offset.value(), self.sp_tail.value())
         s.width, s.height, s.fps = self.sp_w.value(), self.sp_h.value(), int(self.cb_fps.currentText())
