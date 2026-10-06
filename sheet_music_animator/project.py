@@ -25,6 +25,7 @@ class Settings:
     reveal: str = "fade"         # "fade" (notes fade/wipe in) or "instant" (notes pop in at their time)
     fade: float = 0.25           # seconds a note takes to fade in
     ghost: float = 0.0           # opacity of notes that have not played yet (0 = hidden)
+    lookahead: int = 4           # only this many measures after the playhead show ghost notes (0 = all)
     offset: float = 0.0          # shift every reveal by this many seconds (audio latency, etc.)
     tail: float = 2.0            # seconds of video after the last note
     width: int = 1920

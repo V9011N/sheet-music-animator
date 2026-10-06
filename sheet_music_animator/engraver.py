@@ -13,6 +13,7 @@ page margin already applied ("page space").
 """
 from __future__ import annotations
 
+import base64
 import copy
 import json
 import math
@@ -30,6 +31,7 @@ XLINK_NS = "http://www.w3.org/1999/xlink"
 _G, _SVG, _USE = (f"{{{SVG_NS}}}{t}" for t in ("g", "svg", "use"))
 _HREF = f"{{{XLINK_NS}}}href"
 _NUM = re.compile(r"-?(?:\d+\.?\d*|\.\d+)(?:e-?\d+)?", re.I)
+_NOT_LINES = re.compile(r"[^eE\d\s.,+-]")   # what is left once absolute M/L commands are removed from plain-polyline paths
 
 NOTE_KINDS = {"note", "chord"}
 REST_KINDS = {"rest", "mRest", "multiRest", "mRpt", "mRpt2", "beatRpt", "halfmRpt"}
@@ -194,11 +196,16 @@ class BoxCalculator:
             return None if b is None else _xf_box(b, m)
         b = None
         if tag == "path":
-            try:
-                bb = SvgPath(el.get("d") or "").bbox()
-                b = None if bb is None else tuple(bb)
-            except Exception:
-                b = None
+            d = el.get("d") or ""
+            if d and not _NOT_LINES.search(d.replace("M", "").replace("L", "")):   # stems, ledger lines: skip the slow parser
+                v = [float(x) for x in _NUM.findall(d)]
+                b = (min(v[0::2]), min(v[1::2]), max(v[0::2]), max(v[1::2])) if len(v) >= 4 else None
+            else:
+                try:
+                    bb = SvgPath(d).bbox()
+                    b = None if bb is None else tuple(float(v) for v in bb)
+                except Exception:
+                    b = None
         elif tag in ("polygon", "polyline"):
             v = [float(x) for x in _NUM.findall(el.get("points") or "")]
             if len(v) >= 4:
@@ -484,15 +491,89 @@ class _Builder:
                                         min(ts, default=0.0), max(ends + ts, default=0.0)))
 
     # -- audio ------------------------------------------------------------------------------
+    @staticmethod
+    def _midi_notes(tk):
+        """(pitch, start, end, velocity) of every note, read from one MIDI rendering.
+
+        Asking Verovio for each element's pitch (getMIDIValuesForElement) re-renders the MIDI
+        every time, which took ~10 s for a long piece.  Returns None when the MIDI cannot be read.
+        """
+        try:
+            data = base64.b64decode(tk.renderToMIDI())
+            if data[:4] != b"MThd":
+                return None
+            ntracks, division = int.from_bytes(data[10:12], "big"), int.from_bytes(data[12:14], "big")
+            if division & 0x8000:
+                return None
+            pos, events, tempos = 14, [], []
+            for _ in range(ntracks):
+                if data[pos:pos + 4] != b"MTrk":
+                    return None
+                end = pos + 8 + int.from_bytes(data[pos + 4:pos + 8], "big")
+                pos, tick, status = pos + 8, 0, 0
+
+                def varlen():
+                    nonlocal pos
+                    v = 0
+                    while True:
+                        b = data[pos]
+                        pos += 1
+                        v = (v << 7) | (b & 0x7F)
+                        if not b & 0x80:
+                            return v
+                while pos < end:
+                    tick += varlen()
+                    if data[pos] & 0x80:
+                        status, pos = data[pos], pos + 1
+                    if status == 0xFF:
+                        kind, size = data[pos], None
+                        pos += 1
+                        size = varlen()
+                        if kind == 0x51 and size == 3:
+                            tempos.append((tick, int.from_bytes(data[pos:pos + 3], "big")))
+                        pos += size
+                    elif status in (0xF0, 0xF7):
+                        pos += varlen()
+                    elif status >> 4 in (0xC, 0xD):
+                        pos += 1
+                    else:
+                        if status >> 4 in (0x8, 0x9):
+                            events.append((tick, status >> 4 == 0x9 and data[pos + 1] > 0, data[pos], data[pos + 1]))
+                        pos += 2
+                pos = end
+        except (IndexError, ValueError):
+            return None
+        tempos = sorted(set(tempos)) or [(0, 500000)]
+        marks, sec = [], 0.0   # (tick, seconds at that tick, microseconds per quarter)
+        for i, (tk_, us) in enumerate(tempos):
+            if marks:
+                sec += (tk_ - marks[-1][0]) * marks[-1][2] / 1e6 / division
+            marks.append((tk_, sec, us))
+        ticks = [m[0] for m in marks]
+
+        def seconds(t):
+            m = marks[max(bisect_right(ticks, t) - 1, 0)]
+            return m[1] + (t - m[0]) * m[2] / 1e6 / division
+        notes, open_ = [], {}
+        for tick, on, pitch, vel in sorted(events, key=lambda e: (e[0], e[1])):   # offs before ons
+            if on:
+                open_.setdefault(pitch, []).append((seconds(tick), vel))
+            elif open_.get(pitch):
+                start, v = open_[pitch].pop(0)
+                notes.append([pitch, start, seconds(tick), 80])
+        return notes or None
+
     def _audio_notes(self, tk):
-        notes = []
-        for r in self.recs:
-            if r["kind"] in NOTE_KINDS:
-                for i in r["ids"]:
-                    if i in self.on:
-                        pitch = tk.getMIDIValuesForElement(i).get("pitch")
-                        if pitch is not None:
-                            notes.append([pitch, self.on[i], self.off.get(i, self.on[i] + 0.25), 80])
+        notes = self._midi_notes(tk)
+        if notes is None:   # slow path: ask Verovio for every element's pitch
+            notes = []
+            for r in self.recs:
+                if r["kind"] in NOTE_KINDS:
+                    for i in r["ids"]:
+                        if i in self.on:
+                            pitch = tk.getMIDIValuesForElement(i).get("pitch")
+                            if pitch is not None:
+                                notes.append([pitch, self.on[i], self.off.get(i, self.on[i] + 0.25), 80])
         notes.sort(key=lambda n: (n[0], n[1]))
         merged = []  # fuse ties: same pitch where the next note starts as the previous ends
         for n in notes:

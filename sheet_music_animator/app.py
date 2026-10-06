@@ -3,14 +3,15 @@ from __future__ import annotations
 
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 from PySide6.QtCore import QElapsedTimer, QRectF, QSettings, Qt, QTimer, QUrl
 from PySide6.QtGui import QAction, QColor, QImage, QKeySequence, QPalette
 from PySide6.QtWidgets import (QApplication, QColorDialog, QComboBox, QDoubleSpinBox, QFileDialog, QFormLayout,
-                               QGroupBox, QHBoxLayout, QLabel, QMainWindow, QMessageBox, QProgressDialog,
-                               QPushButton, QSizePolicy, QSpinBox, QSplitter, QTabWidget, QToolBar, QVBoxLayout,
-                               QWidget)
+                               QGraphicsView, QGroupBox, QHBoxLayout, QLabel, QMainWindow, QMessageBox,
+                               QProgressDialog, QPushButton, QSizePolicy, QSpinBox, QSplitter, QTabWidget,
+                               QToolBar, QVBoxLayout, QWidget)
 
 from . import audio
 from .engraver import engrave
@@ -65,6 +66,7 @@ class MainWindow(QMainWindow):
         self.wav_path: str | None = None
         self._updating = False
         self._clock = QElapsedTimer()
+        self._editor_clock = QElapsedTimer()
         self._clock_t0 = 0.0
         self._timer = QTimer(self, interval=16)
         self._timer.timeout.connect(self._tick)
@@ -161,6 +163,13 @@ class MainWindow(QMainWindow):
         self.cb_reveal.addItem("Appear instantly", "instant")
         self.sp_fade = spin(0, 3, 0.05, 2, " s")
         self.sp_ghost = spin(0, 0.5, 0.02, 2)
+        self.sp_look = QSpinBox()
+        self.sp_look.setRange(0, 64)
+        self.sp_look.setSpecialValueText("All")
+        self.sp_look.setSuffix(" measures")
+        self.sp_look.setKeyboardTracking(False)
+        self.sp_look.setToolTip("Unplayed notes are only drawn this many measures ahead of the playhead, "
+                                "which keeps long pieces fast.")
         self.sp_offset = spin(-5, 5, 0.05, 2, " s")
         self.sp_tail = spin(0, 30, 0.5, 1, " s")
         self.cb_layout = QComboBox()
@@ -169,13 +178,14 @@ class MainWindow(QMainWindow):
         self.btn_ink, self.btn_paper = QPushButton(), QPushButton()
         for b, which in ((self.btn_ink, "ink"), (self.btn_paper, "paper")):
             b.clicked.connect(lambda _=False, which=which: self._pick_color(which))
-        for s in (self.sp_fade, self.sp_ghost, self.sp_offset, self.sp_tail):
+        for s in (self.sp_fade, self.sp_ghost, self.sp_look, self.sp_offset, self.sp_tail):
             s.valueChanged.connect(self._settings_changed)
         self.cb_layout.activated.connect(self._layout_changed)
         self.cb_reveal.activated.connect(self._settings_changed)
         f.addRow("Note reveal", self.cb_reveal)
         f.addRow("Fade-in time", self.sp_fade)
         f.addRow("Unplayed notes opacity", self.sp_ghost)
+        f.addRow("Unplayed notes shown ahead", self.sp_look)
         f.addRow("Shift all notes", self.sp_offset)
         f.addRow("End padding", self.sp_tail)
         f.addRow("Score layout", self.cb_layout)
@@ -393,6 +403,9 @@ class MainWindow(QMainWindow):
         if self.t >= self.end_time() - 0.01:
             self.t = 0.0
         self.playing = True
+        # The whole-page editor repaints far more than the preview; while playing redraw it ~15x/s by hand.
+        self.editor.setViewportUpdateMode(QGraphicsView.NoViewportUpdate)
+        self._editor_clock.start()
         self.a_play.setText("⏸  Pause")
         self._clock_t0 = self.t
         self._clock.start()
@@ -406,6 +419,8 @@ class MainWindow(QMainWindow):
             return
         self.playing = False
         self._timer.stop()
+        self.editor.setViewportUpdateMode(QGraphicsView.FullViewportUpdate)
+        self.editor.viewport().update()
         self.a_play.setText("▶  Play")
         if self.player:
             self.player.pause()
@@ -425,7 +440,10 @@ class MainWindow(QMainWindow):
         self.scene.apply_time(self.t)
         rect = self.project.camera_rect(self.t)
         qrect = QRectF(*rect) if rect else None
-        self.editor.set_camera(qrect, self.project.settings.aspect)
+        self.editor.cam, self.editor.aspect = qrect, self.project.settings.aspect
+        if not self.playing or self._editor_clock.elapsed() > 66:
+            self._editor_clock.restart()
+            self.editor.viewport().update()
         self.preview.set_aspect(self.project.settings.aspect)
         self.preview.view.set_camera(qrect)
         self.timeline.set_time(self.t)
@@ -510,6 +528,8 @@ class MainWindow(QMainWindow):
         self.sp_fade.setValue(s.fade)
         self.sp_fade.setEnabled(s.reveal == "fade")
         self.sp_ghost.setValue(s.ghost)
+        self.sp_look.setValue(s.lookahead)
+        self.sp_look.setEnabled(s.ghost > 0)
         self.sp_offset.setValue(s.offset)
         self.sp_tail.setValue(s.tail)
         self.cb_layout.setCurrentIndex(self.cb_layout.findData(s.layout))
@@ -531,6 +551,8 @@ class MainWindow(QMainWindow):
         s = self.project.settings
         s.follow_width = self.sp_follow.value()
         s.reveal = self.cb_reveal.currentData()
+        s.lookahead = self.sp_look.value()
+        self.sp_look.setEnabled(self.sp_ghost.value() > 0)
         self.sp_fade.setEnabled(s.reveal == "fade")
         s.fade, s.ghost, s.offset, s.tail = (self.sp_fade.value(), self.sp_ghost.value(),
                                              self.sp_offset.value(), self.sp_tail.value())
@@ -640,17 +662,17 @@ class MainWindow(QMainWindow):
         dlg.setMinimumDuration(0)
         dlg.setWindowTitle("Rendering")
 
-        fps, t_before, shown = self.project.settings.fps, self.t, QElapsedTimer()
-        shown.start()
+        fps, t_before, next_ui = self.project.settings.fps, self.t, [0.0]
 
         def progress(done, total):
             dlg.setMaximum(max(total, 1))
             dlg.setValue(done)
             dlg.setLabelText(f"Rendering frame {done} of {total}")
-            if shown.elapsed() > 100:   # let the camera window, preview and timeline follow the render
-                shown.restart()
+            now = time.perf_counter()
+            if now >= next_ui[0]:   # let the camera window, preview and timeline follow the render...
                 self.t = min(done / fps, self.end_time())
                 self._refresh_time()
+                next_ui[0] = time.perf_counter() + max(0.25, 8 * (time.perf_counter() - now))   # ...at ~10% cost
             QApplication.processEvents()
             return not dlg.wasCanceled()
 
