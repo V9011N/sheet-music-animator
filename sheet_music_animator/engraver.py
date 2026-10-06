@@ -18,6 +18,7 @@ import copy
 import json
 import math
 import re
+import zipfile
 from bisect import bisect_right
 from dataclasses import dataclass, field
 from pathlib import Path as FsPath
@@ -238,6 +239,134 @@ class BoxCalculator:
         return (x0, y - fs, x0 + w, y + fs * 0.35)
 
 
+# --------------------------------------------------------------------------- hidden staves
+MEI_NS = "http://www.music-encoding.org/ns/mei"
+XML_ID = "{http://www.w3.org/XML/1998/namespace}id"
+
+
+def _read_musicxml(path):
+    """Root element of a (possibly compressed) MusicXML file, or None."""
+    try:
+        data = FsPath(path).read_bytes()
+        if data[:2] == b"PK":
+            with zipfile.ZipFile(FsPath(path)) as z:
+                names = [n for n in z.namelist() if n.lower().endswith((".xml", ".musicxml")) and not n.startswith("META-INF")]
+                if "META-INF/container.xml" in z.namelist():
+                    full = etree.fromstring(z.read("META-INF/container.xml")).find(".//{*}rootfile")
+                    if full is not None and full.get("full-path") in z.namelist():
+                        names = [full.get("full-path")]
+                data = z.read(names[0])
+        return etree.fromstring(data)
+    except Exception:
+        return None
+
+
+def hidden_staves(path) -> dict[str, set[int]]:
+    """{measure number: staves that the notation program hid there}, read from the MusicXML.
+
+    Staves are numbered the way Verovio/MEI numbers them (continuing across parts).  MuseScore hides an
+    empty staff per system and writes `<staff-details print-object="no">` in the first measure of every
+    system where it is hidden; other programs switch it off until the next staff-details.
+    """
+    root = _read_musicxml(path)
+    if root is None or root.tag != "score-partwise":
+        return {}
+    musescore = "musescore" in " ".join(root.xpath("//software/text()")).lower()
+    hidden: dict[str, set[int]] = {}
+    base = 0
+    for part in root.findall("part"):
+        measures = part.findall("measure")
+        nstaves = max([int(t) for t in part.xpath(".//attributes/staves/text()") if t.strip().isdigit()] or [1])
+        off: set[int] = set()       # staves currently switched off (part-relative numbers)
+        for i, m in enumerate(measures):
+            new_system = i == 0 or any(p.get("new-system") == "yes" or p.get("new-page") == "yes" for p in m.findall("print"))
+            if new_system and musescore:
+                off = set()
+            for d in m.findall("attributes/staff-details"):
+                n = int(d.get("number") or 1)
+                (off.add if d.get("print-object") == "no" else off.discard)(n)
+            if off:
+                hidden.setdefault(m.get("number"), set()).update(base + n for n in off)
+        base += nstaves
+    return hidden
+
+
+def _hide_staves(tk, hidden) -> set[str] | None:
+    """Verovio ignores print-object="no".  Mark the hidden staves invisible (re-loading the score
+    through MEI) and return the xml:ids of those <staff> elements so that `_remove_hidden_staves`
+    can take them out of the SVG.  Only staves holding nothing but rests are touched, so no notes are lost."""
+    ns = {"m": MEI_NS}
+    root = etree.fromstring(tk.getMEI().encode("utf8"))
+    ids: set[str] = set()
+    for measure in root.iterfind(".//m:measure", ns):
+        gone = hidden.get(measure.get("n"), set())
+        for staff in measure.findall("m:staff", ns):
+            sid = staff.get(XML_ID)
+            if sid and int(staff.get("n", 0)) in gone and not staff.xpath(".//m:note", namespaces=ns):
+                staff.set("visible", "false")
+                ids.add(sid)
+            elif staff.get("visible") == "false":
+                del staff.attrib["visible"]   # Verovio's import switches off *every* staff of such a measure
+    if ids and tk.loadData(etree.tostring(root, encoding="unicode")):
+        return ids
+    return None
+
+
+def _scale_y(d: str, top: float, k: float) -> str:
+    """Scale the y coordinates of an absolute M/C/L path about `top`."""
+    nums = _NUM.findall(d)
+    out, i = [], 0
+    for tok in re.split(r"(-?(?:\d+\.?\d*|\.\d+)(?:e-?\d+)?)", d):
+        if i < len(nums) and tok == nums[i]:
+            v = float(tok)
+            out.append(f"{(top + (v - top) * k) if i % 2 else v:.2f}")
+            i += 1
+        else:
+            out.append(tok)
+    return "".join(out)
+
+
+def _remove_hidden_staves(svg_root, ids: set[str]):
+    """Delete the hidden staves from the SVG and shrink each system's brace (and centre its labels) to
+    the staves that are left, the way the notation program draws it."""
+    cls = lambda e: set((e.get("class") or "").split())
+    for system in [e for e in svg_root.iter(_G) if "system" in cls(e)]:
+        measures = [e for e in system if e.tag == _G and "measure" in cls(e)]
+        gone = [st for m in measures for st in m if st.tag == _G and st.get("id") in ids]
+        if not gone or not measures:
+            continue
+        first_staves = [st for st in measures[0] if st.tag == _G and "staff" in cls(st)]
+        keep = [st for st in first_staves if st.get("id") not in ids]
+        mixed = not all(any(st.get("id") in ids for st in m if st.tag == _G) for m in measures)
+        for st in gone:
+            st.getparent().remove(st)
+        if mixed:
+            continue   # a system that mixes hidden and shown measures keeps its full brace
+        lines = lambda st: [float(v) for p in st if p.tag.endswith("path") for v in _NUM.findall(p.get("d") or "")[1::2]]
+        ys = [y for st in keep for y in lines(st)]
+        old_ys = [y for st in first_staves for y in lines(st)]
+        if not ys or not old_ys:
+            continue
+        top, old_bottom, new_bottom = min(old_ys), max(old_ys), max(ys)
+        for grp in system:
+            if grp.tag.endswith("path"):   # the line at the start of the system joins all the staves
+                v = [float(x) for x in _NUM.findall(grp.get("d") or "")[1::2]]
+                if len(v) >= 2 and max(v) > min(v):
+                    lo, hi = min(v), max(v)
+                    grp.set("d", _scale_y(grp.get("d"), lo, (hi - (old_bottom - new_bottom) - lo) / (hi - lo)))
+            elif grp.tag == _G and "grpSym" in cls(grp):
+                paths = [p for p in grp if p.tag.endswith("path")]
+                pys = [float(v) for p in paths for v in _NUM.findall(p.get("d") or "")[1::2]]
+                if pys and max(pys) - min(pys) > 1:
+                    t, b = min(pys), max(pys)
+                    k = (new_bottom + (b - old_bottom) - t) / (b - t)
+                    for p in paths:
+                        p.set("d", _scale_y(p.get("d"), t, k))
+            elif grp.tag == _G and cls(grp) & {"label", "labelAbbr"}:   # centred on the whole group: move to the staves left
+                dy = ((top + new_bottom) - (top + old_bottom)) / 2
+                grp.set("transform", f"translate(0,{dy:g}) " + (grp.get("transform") or ""))
+
+
 # --------------------------------------------------------------------------- engraving
 def engrave(path, layout: str = "pages", ink: str = "#000000", progress=None) -> Score:
     say = progress or (lambda *_: None)
@@ -249,6 +378,10 @@ def engrave(path, layout: str = "pages", ink: str = "#000000", progress=None) ->
     tk.setOptions(opts)
     if not tk.loadFile(str(path)):
         raise ValueError(f"Verovio could not read {path}")
+    hidden = hidden_staves(path)
+    hidden_ids = _hide_staves(tk, hidden) if hidden else None
+    if hidden and hidden_ids is None:
+        tk.loadFile(str(path))   # could not be applied: keep the plain import
     svg = tk.renderToSVG(1)
     timemap = tk.renderToTimemap({"includeRests": True, "includeMeasures": True})
     timemap = json.loads(timemap) if isinstance(timemap, str) else timemap
@@ -265,6 +398,8 @@ def engrave(path, layout: str = "pages", ink: str = "#000000", progress=None) ->
 
     say("Splitting layers…")
     root = etree.fromstring(svg.encode("utf8"), etree.XMLParser(remove_blank_text=True))
+    if hidden_ids:
+        _remove_hidden_staves(root, hidden_ids)
     inner = next(e for e in root if e.tag == _SVG)
     vb = [float(x) for x in inner.get("viewBox").split()]
     defs = {e.get("id"): e for d in root.iter(f"{{{SVG_NS}}}defs") for e in d if e.get("id")}

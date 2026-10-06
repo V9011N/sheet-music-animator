@@ -27,6 +27,8 @@ python -m venv .venv
 | Output | Resolution, frame rate, audio (built-in piano synth, your own audio file, or none) → **Render video…** or **Save current frame as PNG…**. |
 | Projects | `Ctrl+S` saves a `.smanim` file (camera keys, timing tweaks, settings). |
 
+Staves that MuseScore hid because they are empty (`print-object="no"` in the exported MusicXML) stay hidden for those systems; Verovio ignores this itself, so the animator removes them.
+
 ## How it works
 
 * `engraver.py` – Verovio engraves the MusicXML to SVG and gives a timemap. The SVG is split into a
