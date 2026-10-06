@@ -20,11 +20,20 @@ def total_duration(scene: SheetScene, project: Project) -> float:
 
 def render_frame(scene: SheetScene, project: Project, t: float, image: QImage):
     scene.apply_time(t)
-    cam = project.camera_rect(t)
+    cx, cy, w, h, rot = project.camera_pose(t)
     image.fill(QColor(project.settings.paper))
     p = QPainter(image)
     p.setRenderHints(QPainter.Antialiasing | QPainter.SmoothPixmapTransform | QPainter.TextAntialiasing)
-    scene.render(p, QRectF(0, 0, image.width(), image.height()), QRectF(*cam), Qt.IgnoreAspectRatio)
+    # Map the (rotated) camera window onto the image, then let the scene draw the area it covers.
+    p.translate(image.width() / 2, image.height() / 2)
+    p.rotate(-rot)
+    p.scale(image.width() / w, image.height() / h)
+    p.translate(-cx, -cy)
+    a = math.radians(rot)
+    half_w = abs(w * math.cos(a)) / 2 + abs(h * math.sin(a)) / 2
+    half_h = abs(w * math.sin(a)) / 2 + abs(h * math.cos(a)) / 2
+    area = QRectF(cx - half_w, cy - half_h, 2 * half_w, 2 * half_h)
+    scene.render(p, area, area, Qt.IgnoreAspectRatio)
     p.end()
 
 
@@ -34,7 +43,7 @@ def render_video(scene: SheetScene, project: Project, out_path: str, audio_path:
     s = project.settings
     w, h = size or (s.width, s.height)
     w, h = w - w % 2, h - h % 2  # yuv420p needs even dimensions
-    if not project.keys:
+    if not project.has_keys():
         raise ValueError("Add at least one camera keyframe first.")
     total = math.ceil(total_duration(scene, project) * s.fps)
     cmd = [imageio_ffmpeg.get_ffmpeg_exe(), "-y", "-loglevel", "error",

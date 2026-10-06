@@ -49,6 +49,7 @@ LINE_KINDS = {"hairpin", "pedal", "octave", "bracketSpan", "gliss", "dir", "dyna
 DRAWABLE = {"path", "use", "polygon", "polyline", "rect", "ellipse", "text", "line"}
 CSS = "ellipse,path,polygon,polyline,rect{stroke:currentColor}"
 CROSS_STAFF_SPACING = 20   # Verovio's default is 12; cross-staff beams then run into the notes of the staff below
+FONT_TOKEN = b"@@FONT@@"   # stands for the font family in every SVG; filled in when drawing
 POSITION_TOLERANCE = 160.0  # how far left of a control event a note may sit and still "start" it
 
 LAYOUTS = {
@@ -73,6 +74,16 @@ class Unit:
     # Beams, tuplets, tremolos: (member uid, member time, fraction of rect width to show once that
     # member has appeared) so the shape grows note by note instead of all at once.
     steps: tuple = ()
+    measure: int = -1     # index of the measure the element belongs to (in drawing order)
+
+
+@dataclass
+class MeasureInfo:
+    index: int
+    system: int
+    rect: tuple           # x, y, w, h of the staves of the measure (page space)
+    time: float           # first note in the measure
+    end: float
 
 
 @dataclass
@@ -97,6 +108,8 @@ class Score:
     units: list[Unit] = field(default_factory=list)
     systems: list[System] = field(default_factory=list)
     measures: list[tuple] = field(default_factory=list)   # (time, number)
+    measure_infos: list[MeasureInfo] = field(default_factory=list)
+    line_starts: list[int] = field(default_factory=list)  # index of the first measure of every line
     notes: list[tuple] = field(default_factory=list)      # (midi pitch, start, end, velocity)
     duration: float = 0.0
     _now_cache: dict = field(default_factory=dict, repr=False)
@@ -500,12 +513,24 @@ def _merge_slur_chains(root) -> bool:
     return merged
 
 
-def _adjust_mei(tk, path, hidden, cross) -> set[str]:
+def _set_line_breaks(root, breaks) -> bool:
+    """Replace the line and page breaks of the score: `breaks` is a number (a break before every n-th
+    measure) or the sorted indices of the measures that start a line."""
+    ns = {"m": MEI_NS}
+    for el in list(root.iter(f"{{{MEI_NS}}}sb")) + list(root.iter(f"{{{MEI_NS}}}pb")):
+        el.getparent().remove(el)
+    for i, measure in enumerate(root.iterfind(".//m:measure", ns)):
+        if i and (i in breaks if isinstance(breaks, (list, tuple, set)) else i % breaks == 0):
+            measure.addprevious(etree.Element(f"{{{MEI_NS}}}sb"))
+    return True
+
+
+def _adjust_mei(tk, path, hidden, cross, breaks=None) -> set[str]:
     """Work around Verovio's MusicXML import by re-loading the score through MEI:
     * hidden staves (print-object="no"): marked invisible, their xml:ids returned so that
       `_remove_hidden_staves` can take them out of the SVG afterwards (only rest-only staves are touched);
     * cross-staff clefs (see `_fix_cross_staff_clefs`).
-    Returns the ids of the hidden <staff> elements."""
+    Returns the ids of the hidden <staff> elements (and re-breaks the lines when `breaks` is given)."""
     ns = {"m": MEI_NS}
     root = etree.fromstring(tk.getMEI().encode("utf8"))
     changed = _fix_cross_staff_clefs(root) if cross else False
@@ -523,6 +548,8 @@ def _adjust_mei(tk, path, hidden, cross) -> set[str]:
                 elif staff.get("visible") == "false":
                     del staff.attrib["visible"]   # Verovio's import switches off *every* staff of such a measure
         changed = changed or bool(ids)
+    if breaks:
+        changed = _set_line_breaks(root, breaks) or changed
     if not changed:
         return set()
     if not tk.loadData(etree.tostring(root, encoding="unicode")):
@@ -587,20 +614,35 @@ def _remove_hidden_staves(svg_root, ids: set[str]):
 
 
 # --------------------------------------------------------------------------- engraving
-def engrave(path, layout: str = "pages", ink: str = "#000000", progress=None) -> Score:
+ENCODED_BREAKS = {"breaks": "encoded", "pageWidth": 100000, "pageHeight": 60000,
+                  "adjustPageWidth": True, "adjustPageHeight": True}
+
+
+def engrave(path, layout: str = "pages", ink: str = "#000000", progress=None,
+            measures_per_line: int | None = None, line_starts: list[int] | None = None) -> Score:
+    """Engrave a MusicXML file.  `measures_per_line` (0 = the whole score on one line) or the explicit
+    `line_starts` (index of the first measure of every line) decide where the lines break; without
+    either, `layout` is used and Verovio breaks the lines itself."""
     say = progress or (lambda *_: None)
     say("Engraving with Verovio…")
     tk = verovio.toolkit()
     opts = {"scale": 40, "svgViewBox": True, "header": "none", "footer": "none",
             "pageMarginLeft": 40, "pageMarginRight": 40, "pageMarginTop": 60, "pageMarginBottom": 60}
-    opts.update(LAYOUTS[layout])
+    breaks = None
+    if line_starts is not None or measures_per_line is not None:
+        one_line = len(line_starts) <= 1 if line_starts is not None else measures_per_line == 0
+        opts.update(LAYOUTS["horizontal"] if one_line else ENCODED_BREAKS)
+        if not one_line:
+            breaks = sorted(set(line_starts)) if line_starts is not None else measures_per_line
+    else:
+        opts.update(LAYOUTS[layout])
     hidden, cross = hidden_staves(path), has_cross_staff(path)
     if cross:   # a beam that crosses between staves is not taken into account when Verovio spaces the staves
         opts["spacingStaff"] = CROSS_STAFF_SPACING
     tk.setOptions(opts)
     if not tk.loadFile(str(path)):
         raise ValueError(f"Verovio could not read {path}")
-    hidden_ids = _adjust_mei(tk, path, hidden, cross) if hidden or cross else set()
+    hidden_ids = _adjust_mei(tk, path, hidden, cross, breaks) if hidden or cross or breaks else set()
     svg = tk.renderToSVG(1)
     timemap = tk.renderToTimemap({"includeRests": True, "includeMeasures": True})
     timemap = json.loads(timemap) if isinstance(timemap, str) else timemap
@@ -641,6 +683,8 @@ class _Builder:
         self.margin_tf = margin_transform
         self.m = _parse_transform(margin_transform)
         self.recs: list[dict] = []
+        self.measure_recs: list[dict] = []   # {"system", "rect"} of every measure in drawing order
+        self.cur_measure = -1
 
     def run(self, margin, on, off, tk) -> Score:
         self.on, self.off = on, off
@@ -650,6 +694,7 @@ class _Builder:
         self._resolve_times(max(len(systems), 1))
         score = Score()
         score.units = self._make_units()
+        self._make_measures(score)
         self._make_static(systems, score)
         score.notes = self._audio_notes(tk)
         return score
@@ -683,7 +728,11 @@ class _Builder:
                     mid = parent == "layer"   # a clef/key/meter change inside the music, not at the start of the staff
                     self._unit(ch, next(iter(c & STATIC)), si, static=not mid, mid=mid)
             elif c & STRUCTURE:
+                if "measure" in c:
+                    self.cur_measure = self._measure(ch, si)
                 found += self._walk(ch, next(iter(c & STRUCTURE)), si)
+                if "measure" in c:
+                    self.cur_measure = -1
             elif (parent in ("measure", "layer") or "spanning" in c) and self._drawable(ch):
                 # "spanning": the part of a slur/8va/hairpin... that continues on the next system
                 kind = next((k for k in (ch.get("class") or "g").split() if k != "autogenerated"), "g")
@@ -712,18 +761,47 @@ class _Builder:
             self._unit(wrap, kind, si)["members"] = members
         return members
 
-    def _unit(self, el, kind, si, static=False, mid=False):
+    def _measure(self, el, si) -> int:
+        """Register a measure; its rectangle is the extent of the staff lines of its staves."""
+        xs, ys = [], []
+        for st in el:
+            if _tag(st) == "g" and "staff" in _classes(st):
+                for p in st:
+                    if _tag(p) == "path":
+                        b = self.calc.box(p)
+                        if b:
+                            xs += [b[0], b[2]]
+                            ys += [b[1], b[3]]
+        if xs:
+            x0, y0, x1, y1 = _xf_box((min(xs), min(ys), max(xs), max(ys)), self.m)
+            rect = (x0, y0, x1 - x0, y1 - y0)
+        else:
+            rect = (0.0, 0.0, 0.0, 0.0)
+        self.measure_recs.append({"system": si, "rect": rect})
+        return len(self.measure_recs) - 1
+
+    PART_CLASSES = {"accid", "artic", "dots"}   # parts of a note that can be moved on their own
+
+    def _unit(self, el, kind, si, static=False, mid=False, parent=None):
         el.set("data-unit", str(len(self.recs)))
+        parts = []
         if kind in NOTE_KINDS:
             ids = [e.get("id") for e in el.iter(_G) if "note" in _classes(e)] if kind == "chord" \
                 else [el.get("id")]
+            for e in list(el.iter(_G)):   # accidentals, articulations and dots become units of their own
+                if e is not el and _classes(e) & self.PART_CLASSES and self._drawable(e):
+                    e.getparent().remove(e)
+                    parts.append(e)
         elif kind in REST_KINDS:
             ids = [el.get("id")]
         else:
             ids = []
         rec = {"n": len(self.recs), "el": el, "kind": kind, "box": self.calc.box(el), "system": si,
-               "ids": ids, "members": [], "time": None, "end": None, "static": static, "mid": mid}
+               "ids": ids, "members": [], "time": None, "end": None, "static": static, "mid": mid,
+               "measure": self.cur_measure, "parent": parent}
         self.recs.append(rec)
+        for e in parts:
+            self._unit(e, next(iter(_classes(e) & self.PART_CLASSES)), si, parent=rec)
         return rec
 
     # -- timing ----------------------------------------------------------------------
@@ -747,6 +825,10 @@ class _Builder:
                 x = self._anchor_x(r)
                 if x is not None and r["kind"] in ("note", "chord", "rest"):
                     anchors[r["system"]].append((x, r["time"]))
+        for r in self.recs:   # accidentals, articulations... appear with the note they belong to
+            p = r["parent"]
+            if p is not None and p["time"] is not None:
+                r["time"], r["end"] = p["time"], p["time"]
         for a in anchors:
             a.sort()
         self.anchors = anchors
@@ -800,7 +882,7 @@ class _Builder:
         tf = f' transform="{self.margin_tf}"' if self.margin_tf else ""
         return (f'<svg xmlns="{SVG_NS}" xmlns:xlink="{XLINK_NS}" viewBox="{x:.2f} {y:.2f} {w:.2f} {h:.2f}" '
                 f'width="{w:.2f}" height="{h:.2f}"><style type="text/css">{CSS}</style><defs>').encode() \
-            + defs + f'</defs><g color="{self.ink}" fill="{self.ink}" font-family="Times, serif">' \
+            + defs + f'</defs><g color="{self.ink}" fill="{self.ink}" font-family="@@FONT@@">' \
                      f'<g{tf}>'.encode() + etree.tostring(el, with_tail=False) + b"</g></g></svg>"
 
     def _page_rect(self, box, pad):
@@ -861,10 +943,34 @@ class _Builder:
             span = r["end"] - r["time"]
             out.append(Unit(uid=r["n"], kind=r["kind"], svg=self._doc(r["el"], rect), rect=rect,
                             time=r["time"], end=r["end"], system=r["system"],
-                            wipe=r["kind"] in WIPE_KINDS and span > 0.12, static=r["static"],
+                            wipe=r["kind"] in WIPE_KINDS and span > 0.12, static=r["static"], measure=r["measure"],
                             steps=self._steps(r, rect) if r["members"] else
                             self._line_steps(r, rect) if r["kind"] in LINE_KINDS and span > 0.12 else ()))
         return out
+
+    def _make_measures(self, score):
+        """Measure rectangles with their times, and the measure of every element that sits outside a
+        measure (the continuation of a slur on the next line, a label...)."""
+        times: dict[int, list] = {}
+        for u in score.units:
+            if u.measure >= 0 and u.kind in NOTE_KINDS | REST_KINDS:
+                times.setdefault(u.measure, []).append((u.time, u.end))
+        infos = []
+        for i, m in enumerate(self.measure_recs):
+            ts = times.get(i)
+            t0 = min(t for t, _ in ts) if ts else (infos[-1].end if infos else 0.0)
+            t1 = max(e for _, e in ts) if ts else t0
+            infos.append(MeasureInfo(i, m["system"], m["rect"], t0, t1))
+        score.measure_infos = infos
+        score.line_starts = [next(m.index for m in infos if m.system == si) for si in sorted({m.system for m in infos})]
+        for u in score.units:
+            if u.measure >= 0:
+                continue
+            cx = u.rect[0] + u.rect[2] / 2
+            mine = [m for m in infos if m.system == u.system and m.rect[2] > 0]
+            if mine:
+                u.measure = min(mine, key=lambda m: 0 if m.rect[0] <= cx <= m.rect[0] + m.rect[2]
+                                else min(abs(cx - m.rect[0]), abs(cx - m.rect[0] - m.rect[2]))).index
 
     def _make_static(self, systems, score):
         for si, system in enumerate(systems):

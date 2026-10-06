@@ -6,18 +6,19 @@ import tempfile
 import time
 from pathlib import Path
 
-from PySide6.QtCore import QElapsedTimer, QRectF, QSettings, Qt, QTimer, QUrl
-from PySide6.QtGui import QAction, QColor, QImage, QKeySequence, QPalette
-from PySide6.QtWidgets import (QApplication, QCheckBox, QColorDialog, QComboBox, QDoubleSpinBox, QFileDialog, QFormLayout,
-                               QGraphicsView, QGroupBox, QHBoxLayout, QLabel, QMainWindow, QMessageBox,
-                               QProgressDialog, QPushButton, QSizePolicy, QSpinBox, QSplitter, QTabWidget,
-                               QToolBar, QVBoxLayout, QWidget)
+from PySide6.QtCore import QElapsedTimer, QPointF, QRectF, QSettings, Qt, QTimer, QUrl
+from PySide6.QtGui import QAction, QColor, QFont, QImage, QKeySequence, QPalette
+from PySide6.QtWidgets import (QApplication, QCheckBox, QColorDialog, QComboBox, QDialog, QDoubleSpinBox,
+                               QFileDialog, QFontComboBox, QFormLayout, QGraphicsView, QGroupBox, QHBoxLayout,
+                               QLabel, QMainWindow, QMessageBox, QProgressDialog, QPushButton, QSizePolicy, QSpinBox,
+                               QSplitter, QTabWidget, QToolBar, QVBoxLayout, QWidget)
 
 from . import audio
 from .engraver import engrave
 from .export import render_frame, render_video, total_duration
-from .project import Project, auto_camera
+from .project import CATEGORIES, CHANNEL_LABELS, CHANNELS, FIXED_KINDS, Key, Project, auto_camera
 from .scene import EditorView, PreviewWidget, SheetScene
+from .layout import relayout_project
 from .timeline import Timeline, fmt
 
 try:
@@ -41,8 +42,86 @@ def dark_palette() -> QPalette:
     return p
 
 
-SELECT_HINT = ("Click any element of the score (note, rest, beam, slur, clef, barline, arpeggio…) or drag a box "
-               "around several to select them.")
+SELECT_HINT = ("Click any element of the score (note, rest, beam, slur, clef, barline, arpeggio…) or the white "
+               "space of a measure, or drag a box around several, to select them. Ctrl+click adds to the "
+               "selection; Shift+click selects the measures in between.")
+
+
+class History:
+    """Undo/redo as a list of project snapshots (JSON text); `index` is the current one."""
+
+    LIMIT = 300
+
+    def __init__(self):
+        self.states: list[str] = []
+        self.index = -1
+
+    def reset(self, state: str):
+        self.states, self.index = [state], 0
+
+    def push(self, state: str) -> bool:
+        if self.states and state == self.states[self.index]:
+            return False
+        del self.states[self.index + 1:]
+        self.states.append(state)
+        if len(self.states) > self.LIMIT:
+            del self.states[0]
+        self.index = len(self.states) - 1
+        return True
+
+    def can_undo(self) -> bool:
+        return self.index > 0
+
+    def can_redo(self) -> bool:
+        return self.index < len(self.states) - 1
+
+    def undo(self) -> str:
+        self.index -= 1
+        return self.states[self.index]
+
+    def redo(self) -> str:
+        self.index += 1
+        return self.states[self.index]
+
+
+class TriBox(QCheckBox):
+    """A tri-state checkbox that only toggles between 'all' and 'none' when clicked."""
+
+    def nextCheckState(self):
+        self.setCheckState(Qt.Unchecked if self.checkState() == Qt.Checked else Qt.Checked)
+
+
+class LayoutDialog(QDialog):
+    """Asks how many measures go on each line of the score."""
+
+    def __init__(self, parent, default: int, measures: int | None = None):
+        super().__init__(parent)
+        self.setWindowTitle("Measures per line")
+        self.result_value: int | None = None
+        lay = QVBoxLayout(self)
+        lay.addWidget(QLabel("How many measures should each line of the score hold?\n"
+                             "This sets the size of the canvas and the automatic camera path."))
+        row = QHBoxLayout()
+        self.spin = QSpinBox()
+        self.spin.setRange(1, 500)
+        self.spin.setValue(max(default, 1))
+        row.addWidget(self.spin)
+        row.addWidget(QLabel("measures per line" + (f"  (the score has {measures})" if measures else "")))
+        row.addStretch(1)
+        lay.addLayout(row)
+        buttons = QHBoxLayout()
+        ok, one, cancel = QPushButton("OK"), QPushButton("Whole score on one line"), QPushButton("Cancel")
+        ok.setDefault(True)
+        ok.clicked.connect(lambda: self._done(self.spin.value()))
+        one.clicked.connect(lambda: self._done(0))
+        cancel.clicked.connect(self.reject)
+        for b in (ok, one, cancel):
+            buttons.addWidget(b)
+        lay.addLayout(buttons)
+
+    def _done(self, value: int):
+        self.result_value = value
+        self.accept()
 
 
 def spin(lo, hi, step, decimals=2, suffix="") -> QDoubleSpinBox:
@@ -70,7 +149,9 @@ class MainWindow(QMainWindow):
         self.wav_path: str | None = None
         self._updating = False
         self._clock = QElapsedTimer()
-        self._sel_units, self._reselecting = [], False
+        self._sel_units, self._sel_measures, self._reselecting = [], [], False
+        self.history = History()
+        self._saved_state = self.project.snapshot()
         self._editor_clock = QElapsedTimer()
         self._clock_t0 = 0.0
         self._timer = QTimer(self, interval=16)
@@ -93,11 +174,16 @@ class MainWindow(QMainWindow):
         self.timeline = Timeline()
         self.timeline.seeked.connect(self.seek)
         self.timeline.keysChanged.connect(self._keys_changed)
+        self.timeline.keysEditFinished.connect(self.commit)
         self.timeline.addKeyRequested.connect(self.add_key_at)
+        shown = self.cfg.value("timeline_channels", "pos,size,rot")
+        self.timeline.set_visible_channels(str(shown).split(","))
+        self.timeline.channelsChanged.connect(
+            lambda: self.cfg.setValue("timeline_channels", ",".join(self.timeline.visible_channels)))
 
         self.editor = EditorView()
         self.editor.cameraEdited.connect(self._camera_dragged)
-        self.editor.cameraEditFinished.connect(self._keys_changed)
+        self.editor.cameraEditFinished.connect(self._camera_edit_finished)
         self.editor.setDragMode(EditorView.RubberBandDrag)
         self.preview = PreviewWidget()
 
@@ -135,26 +221,35 @@ class MainWindow(QMainWindow):
         w = QWidget()
         f = QFormLayout(w)
         self.cam_x, self.cam_y, self.cam_w = spin(-1e7, 1e7, 100, 0), spin(-1e7, 1e7, 100, 0), spin(100, 1e7, 100, 0)
-        for s in (self.cam_x, self.cam_y, self.cam_w):
-            s.valueChanged.connect(self._camera_spin_changed)
+        self.cam_rot = spin(-360, 360, 1, 1, "°")
+        for s_ in (self.cam_x, self.cam_y, self.cam_w, self.cam_rot):
+            s_.valueChanged.connect(self._camera_spin_changed)
         f.addRow("Center X", self.cam_x)
         f.addRow("Center Y", self.cam_y)
         f.addRow("Width", self.cam_w)
+        f.addRow("Rotation", self.cam_rot)
+        self.chk_autokey = QCheckBox("Auto keyframe when the camera is moved, resized or rotated")
+        self.chk_autokey.setChecked(str(self.cfg.value("autokey", "true")).lower() == "true")
+        self.chk_autokey.setToolTip("Off: dragging the camera only changes keyframes that already sit at the playhead.")
+        self.chk_autokey.toggled.connect(lambda on: self.cfg.setValue("autokey", "true" if on else "false"))
+        f.addRow(self.chk_autokey)
         self.sp_follow = spin(2000, 200000, 500, 0)
         self.sp_follow.setToolTip("Width of the camera used by 'Follow music' (about 200 units per staff space)")
         self.sp_follow.valueChanged.connect(self._settings_changed)
         f.addRow("Follow-music width", self.sp_follow)
         row = QHBoxLayout()
-        for text, fn in (("Add key here", lambda: self.add_key_at(self.t)),
-                         ("Delete key", self.timeline.delete_selected),
+        for text, fn in (("Add keys here", lambda: self.add_key_at(None, self.t)),
+                         ("Delete keys", self.timeline.delete_selected),
                          ("Follow music", self.generate_camera)):
             b = QPushButton(text)
             b.clicked.connect(fn)
             row.addWidget(b)
         f.addRow(row)
-        hint = QLabel("Drag the orange window on the sheet to move it, drag its corners to resize. "
-                      "Any change at the playhead creates/updates a keyframe. "
-                      "Double-click the Camera lane to add a key; right-click a key for easing.")
+        hint = QLabel("Drag the orange window on the sheet to move it, drag a corner to resize it and the round "
+                      "handle above it to rotate (Shift snaps to 15°). Keyframes live on three channels "
+                      "(position, frame size, rotation) in the timeline; the Camera label there chooses which are "
+                      "shown. Double-click a lane to add a key; click/Ctrl+click/Shift+click/Ctrl+A to select; "
+                      "right-click for easing.")
         hint.setWordWrap(True)
         hint.setStyleSheet("color:#9a9aa0")
         f.addRow(hint)
@@ -177,15 +272,21 @@ class MainWindow(QMainWindow):
                                 "which keeps long pieces fast.")
         self.sp_offset = spin(-5, 5, 0.05, 2, " s")
         self.sp_tail = spin(0, 30, 0.5, 1, " s")
-        self.cb_layout = QComboBox()
-        self.cb_layout.addItem("Pages (systems stacked)", "pages")
-        self.cb_layout.addItem("Horizontal (one long line)", "horizontal")
+        self.sp_mpl = QSpinBox()
+        self.sp_mpl.setRange(1, 500)
+        self.sp_mpl.setSuffix(" measures")
+        self.sp_mpl.setKeyboardTracking(False)
+        self.btn_one_line = QPushButton("Whole score on one line")
+        self.font_box = QFontComboBox()
+        self.font_box.setEditable(True)
+        self.font_box.currentFontChanged.connect(lambda f: self._font_changed(f.family()))
         self.btn_ink, self.btn_paper = QPushButton(), QPushButton()
         for b, which in ((self.btn_ink, "ink"), (self.btn_paper, "paper")):
             b.clicked.connect(lambda _=False, which=which: self._pick_color(which))
         for s in (self.sp_fade, self.sp_ghost, self.sp_look, self.sp_offset, self.sp_tail):
             s.valueChanged.connect(self._settings_changed)
-        self.cb_layout.activated.connect(self._layout_changed)
+        self.sp_mpl.editingFinished.connect(lambda: self._layout_changed(self.sp_mpl.value()))
+        self.btn_one_line.clicked.connect(lambda: self._layout_changed(0))
         self.cb_reveal.activated.connect(self._settings_changed)
         f.addRow("Note reveal", self.cb_reveal)
         f.addRow("Fade-in time", self.sp_fade)
@@ -193,7 +294,9 @@ class MainWindow(QMainWindow):
         f.addRow("Unplayed notes shown ahead", self.sp_look)
         f.addRow("Shift all notes", self.sp_offset)
         f.addRow("End padding", self.sp_tail)
-        f.addRow("Score layout", self.cb_layout)
+        f.addRow("Font (all text)", self.font_box)
+        f.addRow("Measures per line", self.sp_mpl)
+        f.addRow(self.btn_one_line)
         f.addRow("Ink colour", self.btn_ink)
         f.addRow("Paper colour", self.btn_paper)
         return w
@@ -247,10 +350,33 @@ class MainWindow(QMainWindow):
         self.sp_note.valueChanged.connect(self._note_offset_changed)
         reset = QPushButton("Reset to XML timing")
         reset.clicked.connect(lambda: self.sp_note.setValue(0.0))
+        self.btn_reset_geom = QPushButton("Reset position and size")
+        self.btn_reset_geom.clicked.connect(self._reset_geometry)
+        self.lbl_geom = QLabel("Drag the selected engraving to move it; drag a corner handle to resize it. "
+                               "Noteheads, note tails and beams cannot be moved.")
+        self.lbl_geom.setWordWrap(True)
+        self.lbl_geom.setStyleSheet("color:#9a9aa0")
+        # measures
+        self.grp_measures = QGroupBox("Show in the selected measures")
+        gl = QVBoxLayout(self.grp_measures)
+        self.cat_boxes: dict[str, TriBox] = {}
+        for cat in CATEGORIES:
+            cb = TriBox(cat)
+            cb.setTristate(True)
+            cb.clicked.connect(lambda _=False, cat=cat: self._category_clicked(cat))
+            self.cat_boxes[cat] = cb
+            gl.addWidget(cb)
+        self.btn_line_up = QPushButton("Move this line up to the previous line")
+        self.btn_line_up.clicked.connect(self.move_lines_up)
+        gl.addWidget(self.btn_line_up)
+        self.grp_measures.setVisible(False)
         f.addRow(self.lbl_sel)
         f.addRow(self.chk_timed)
         f.addRow("Reveal earlier / later", self.sp_note)
         f.addRow(reset)
+        f.addRow(self.lbl_geom)
+        f.addRow(self.btn_reset_geom)
+        f.addRow(self.grp_measures)
         return w
 
     def _build_actions(self):
@@ -272,11 +398,14 @@ class MainWindow(QMainWindow):
         self.a_save = act("Save project", self.save_project, "Ctrl+S")
         self.a_play = act("▶  Play", self.toggle_play, "Space")
         self.a_home = act("⏮", lambda: self.seek(0.0), "Home", "Back to start")
-        self.a_key = act("◆ Key", lambda: self.add_key_at(self.t), "K", "Add camera keyframe at playhead (K)")
+        self.a_undo = act("↶", self.undo, "Ctrl+Z", "Undo (Ctrl+Z)")
+        self.a_redo = act("↷", self.redo, None, "Redo (Ctrl+Y or Ctrl+Shift+Z)")
+        self.a_redo.setShortcuts([QKeySequence("Ctrl+Y"), QKeySequence("Ctrl+Shift+Z")])
+        self.a_key = act("◆ Key", lambda: self.add_key_at(None, self.t), "K", "Add camera keyframes at the playhead (K)")
         self.a_fit = act("Fit sheet", self.editor_fit, "F", "Fit the sheet to the editor (F)")
         self.a_cam = act("Show camera", self.editor_to_camera, "C", "Centre the editor on the camera (C)")
         self.a_render = act("Render…", self.render, "Ctrl+R")
-        for a in (self.a_open, self.a_openp, self.a_save):
+        for a in (self.a_open, self.a_openp, self.a_save, self.a_undo, self.a_redo):
             tb.addAction(a)
         tb.addSeparator()
         for a in (self.a_home, self.a_play):
@@ -302,28 +431,61 @@ class MainWindow(QMainWindow):
         has = self.score is not None
         for a in (self.a_play, self.a_home, self.a_key, self.a_fit, self.a_cam, self.a_render, self.a_save):
             a.setEnabled(has)
+        self.a_undo.setEnabled(self.history.can_undo())
+        self.a_redo.setEnabled(self.history.can_redo())
         self.tabs.setEnabled(True)
 
     # ================================================================== loading
+    def _confirm_discard(self) -> bool:
+        """True when it is fine to throw away the current project (saved, or the user says so)."""
+        if self.scene is None or not self.is_dirty():
+            return True
+        r = QMessageBox.question(self, "Unsaved changes", "Save the changes to this project first?",
+                                 QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel, QMessageBox.Save)
+        if r == QMessageBox.Cancel:
+            return False
+        if r == QMessageBox.Save:
+            self.save_project()
+            return not self.is_dirty()
+        return True
+
     def open_xml(self):
+        if not self._confirm_discard():
+            return
         path, _ = QFileDialog.getOpenFileName(
             self, "Open MusicXML", self.cfg.value("last_dir", ""),
             "MusicXML (*.mxl *.musicxml *.xml);;All files (*)")
         if path:
-            self.cfg.setValue("last_dir", str(Path(path).parent))
-            self.project = Project(xml_path=path, settings=self.project.settings)
-            self.project_path = None
-            self.load_score()
+            self.open_xml_path(path)
+
+    def open_xml_path(self, path: str) -> bool:
+        """Start a new project from a MusicXML file, asking how many measures go on a line."""
+        dlg = LayoutDialog(self, int(self.cfg.value("measures_per_line", 4)))
+        if dlg.exec() != QDialog.Accepted:
+            return False
+        self.cfg.setValue("last_dir", str(Path(path).parent))
+        if dlg.result_value:
+            self.cfg.setValue("measures_per_line", dlg.result_value)
+        old = self.project.settings
+        self.project = Project(xml_path=path, settings=old)
+        self.project.settings.measures_per_line = dlg.result_value
+        self.project.settings.layout = "horizontal" if dlg.result_value == 0 else "pages"
+        self.project_path = None
+        self._sync_settings_to_ui()
+        return self.load_score()
 
     def open_project(self):
+        if not self._confirm_discard():
+            return
         path, _ = QFileDialog.getOpenFileName(self, "Open project", self.cfg.value("last_dir", ""),
                                               "Sheet Music Animator project (*.smanim);;All files (*)")
         if path:
             try:
-                self.project = Project.load(path)
+                project = Project.load(path)
             except Exception as e:
                 QMessageBox.critical(self, "Could not open project", str(e))
                 return
+            self.project = project
             self.project_path = path
             self.cfg.setValue("last_dir", str(Path(path).parent))
             self._sync_settings_to_ui()
@@ -337,30 +499,61 @@ class MainWindow(QMainWindow):
                 return
             self.project_path = path
         self.project.save(self.project_path)
+        self._saved_state = self.project.snapshot()
+        self._update_title()
         self.status.showMessage(f"Saved {self.project_path}", 4000)
 
-    def load_score(self):
-        """(Re)engrave the project's MusicXML and rebuild the scene."""
+    def is_dirty(self) -> bool:
+        return self.project.snapshot() != self._saved_state
+
+    def _update_title(self):
+        name = Path(self.project.xml_path).name if self.project.xml_path else ""
+        self.setWindowTitle(f"Sheet Music Animator — {name}{' *' if self.scene and self.is_dirty() else ''}")
+
+    def closeEvent(self, e):
+        self.pause()
+        if self._confirm_discard():
+            super().closeEvent(e)
+        else:
+            e.ignore()
+
+    def _engrave(self):
+        s = self.project.settings
+        return engrave(self.project.xml_path, s.layout, s.ink, None,
+                       measures_per_line=None if s.measures_per_line < 0 else s.measures_per_line,
+                       line_starts=self.project.line_starts)
+
+    def load_score(self, old_score=None, fresh: bool = True) -> bool:
+        """(Re)engrave the project's MusicXML and rebuild the scene.  With `old_score` the project is carried
+        over from that layout (undo history is kept); otherwise a fresh history starts."""
         self.pause()
         s = self.project.settings
         QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
             self.status.showMessage("Engraving…")
             QApplication.processEvents()
-            score = engrave(self.project.xml_path, s.layout, s.ink)
+            score = self._engrave()
             self.status.showMessage("Building scene…")
             QApplication.processEvents()
+            if old_score is not None:
+                relayout_project(self.project, old_score, score)
             self.score = score
             self.scene = SheetScene(score, self.project)
-            self._sel_units = []
+            self._sel_units, self._sel_measures = [], []
             self.editor.setScene(self.scene)
             self.preview.view.setScene(self.scene)
-            if not self.project.keys:
-                self.project.keys = auto_camera(score, s)
+            if not self.project.has_keys():
+                self.project.channels = auto_camera(score, s)
             self._build_audio()
             self.timeline.set_data(self.project, score, total_duration(self.scene, self.project))
-            self.setWindowTitle(f"Sheet Music Animator — {Path(self.project.xml_path).name}")
             self.scene.selectionChanged.connect(self._selection_changed)
+            self.scene.geometryChanged.connect(self._geometry_changed)
+            self.scene.editFinished.connect(self.commit)
+            self._layout_key = self._layout_signature()
+            if fresh:
+                self.history.reset(self.project.snapshot())
+                self._saved_state = self.history.states[0]
+            self._update_title()
             self.seek(0.0)
             QTimer.singleShot(60, self.editor_fit)  # after the window has been laid out
             self.status.showMessage(f"{len(score.units)} elements, {len(score.notes)} notes, "
@@ -369,9 +562,14 @@ class MainWindow(QMainWindow):
             QApplication.restoreOverrideCursor()
             self.status.clearMessage()
             QMessageBox.critical(self, "Could not load score", f"{type(e).__name__}: {e}")
-            return
+            return False
         QApplication.restoreOverrideCursor()
         self._update_enabled()
+        return True
+
+    def _layout_signature(self):
+        s = self.project.settings
+        return (s.measures_per_line, tuple(self.project.line_starts or ()), s.ink, self.project.xml_path)
 
     def _build_audio(self):
         self.wav_path = None
@@ -448,27 +646,28 @@ class MainWindow(QMainWindow):
         if self.scene is None:
             return
         self.scene.apply_time(self.t)
-        rect = self.project.camera_rect(self.t)
-        qrect = QRectF(*rect) if rect else None
-        self.editor.cam, self.editor.aspect = qrect, self.project.settings.aspect
+        pose = self.project.camera_pose(self.t)
+        self.editor.cam, self.editor.aspect = pose, self.project.settings.aspect
         if not self.playing or self._editor_clock.elapsed() > 66:
             self._editor_clock.restart()
             self.editor.viewport().update()
         self.preview.set_aspect(self.project.settings.aspect)
-        self.preview.view.set_camera(qrect)
+        self.preview.view.set_camera(pose)
         self.timeline.set_time(self.t)
         self.lbl_time.setText(f"{fmt(self.t)} / {fmt(self.end_time())}")
-        if rect:
+        if pose:
             self._updating = True
-            self.cam_x.setValue(rect[0] + rect[2] / 2)
-            self.cam_y.setValue(rect[1] + rect[3] / 2)
-            self.cam_w.setValue(rect[2])
+            self.cam_x.setValue(pose[0])
+            self.cam_y.setValue(pose[1])
+            self.cam_w.setValue(pose[2])
+            self.cam_rot.setValue(pose[4])
             self._updating = False
             if follow:
                 view_rect = self.editor.mapToScene(self.editor.viewport().rect()).boundingRect()
+                centre = QPointF(pose[0], pose[1])
                 if not view_rect.adjusted(view_rect.width() * .1, view_rect.height() * .1,
-                                          -view_rect.width() * .1, -view_rect.height() * .1).contains(qrect.center()):
-                    self.editor.centerOn(qrect.center())
+                                          -view_rect.width() * .1, -view_rect.height() * .1).contains(centre):
+                    self.editor.centerOn(centre)
 
     # ================================================================== camera editing
     def _current_camera(self, t):
@@ -476,25 +675,48 @@ class MainWindow(QMainWindow):
         if c:
             return c
         r = self.editor.mapToScene(self.editor.viewport().rect()).boundingRect()
-        return r.center().x(), r.center().y(), r.width() * 0.6
+        return r.center().x(), r.center().y(), r.width() * 0.6, 0.0
 
-    def add_key_at(self, t: float):
+    def add_key_at(self, channel, t: float):
+        """Add a keyframe at t on `channel` (None: on every channel shown in the timeline)."""
         if self.scene is None:
             return
-        cx, cy, w = self._current_camera(t)
-        self.timeline.selected = self.project.set_key(t, cx, cy, w)
+        if self.project.camera_at(t) is None:   # no camera yet: start from what the editor shows
+            cx, cy, w, rot = self._current_camera(t)
+            self.project.set_camera(t, cx, cy, w, rot)
+        keys = []
+        for ch in ([channel] if channel else self.timeline.visible_channels):
+            k = self.project.add_key(ch, t)
+            if k is not None:
+                keys.append(k)
+        self.timeline.selected = set(keys)
         self._keys_changed()
+        self.commit()
 
-    def _camera_dragged(self, cx, cy, w):
-        self.project.set_key(self.t, cx, cy, w)
-        self.timeline.selected = next((k for k in self.project.keys if abs(k.t - self.t) <= 0.02), None)
+    def _apply_camera(self, cx, cy, w, rot, create=True):
+        """Store a camera pose edited by hand.  Without auto keyframing only keys that already sit at the
+        playhead change."""
+        auto = self.chk_autokey.isChecked()
+        keys = self.project.set_camera(self.t, cx, cy, w, rot, create=auto and create)
+        if keys:
+            self.timeline.selected = set(keys)
+        elif not auto:
+            self.status.showMessage("Auto keyframe is off: add a keyframe at the playhead (K) to edit the camera there.", 4000)
         self._refresh_time(follow=False)  # don't auto-scroll the editor while the user is dragging
+        self.timeline.update()
+
+    def _camera_dragged(self, cx, cy, w, rot):
+        self._apply_camera(cx, cy, w, rot)
+
+    def _camera_edit_finished(self):
+        self._keys_changed()
+        self.commit()
 
     def _camera_spin_changed(self):
         if self._updating or self.scene is None:
             return
-        self.project.set_key(self.t, self.cam_x.value(), self.cam_y.value(), self.cam_w.value())
-        self._keys_changed()
+        self._apply_camera(self.cam_x.value(), self.cam_y.value(), self.cam_w.value(), self.cam_rot.value())
+        self.commit()
 
     def _keys_changed(self):
         self._refresh_time()
@@ -507,16 +729,18 @@ class MainWindow(QMainWindow):
                 self, "Replace camera path?",
                 "This replaces your camera keyframes with an automatic path that follows the music.") != QMessageBox.Yes:
             return
-        self.project.keys = auto_camera(self.score, self.project.settings)
+        self.project.channels = auto_camera(self.score, self.project.settings)
         self.project.keys_edited = False
+        self.timeline.selected = set()
         self._keys_changed()
+        self.commit()
 
     def editor_fit(self):
         if self.scene is None:
             return
         s = self.scene
         scale = self.editor.viewport().width() / max(s.score.width, 1.0)
-        if self.project.settings.layout == "horizontal":
+        if self.project.settings.measures_per_line == 0:
             scale = min(scale, self.editor.viewport().height() / max(s.score.height, 1.0))
         self.editor.resetTransform()
         self.editor.scale(scale, scale)
@@ -525,9 +749,9 @@ class MainWindow(QMainWindow):
         self.editor_to_camera()
 
     def editor_to_camera(self):
-        rect = self.project.camera_rect(self.t)
-        if rect:
-            self.editor.centerOn(QRectF(*rect).center())
+        pose = self.project.camera_pose(self.t)
+        if pose:
+            self.editor.centerOn(QPointF(pose[0], pose[1]))
 
     # ================================================================== settings
     def _sync_settings_to_ui(self):
@@ -542,7 +766,10 @@ class MainWindow(QMainWindow):
         self.sp_look.setEnabled(s.ghost > 0)
         self.sp_offset.setValue(s.offset)
         self.sp_tail.setValue(s.tail)
-        self.cb_layout.setCurrentIndex(self.cb_layout.findData(s.layout))
+        self.sp_mpl.setValue(s.measures_per_line if s.measures_per_line > 0 else int(self.cfg.value("measures_per_line", 4)))
+        self.sp_mpl.setEnabled(True)
+        self.font_box.setCurrentFont(QFont(s.font))
+        self.font_box.lineEdit().setText(s.font)
         self.sp_w.setValue(s.width)
         self.sp_h.setValue(s.height)
         self.cb_fps.setCurrentText(str(s.fps))
@@ -574,6 +801,7 @@ class MainWindow(QMainWindow):
             self.scene.refresh()
             self.timeline.duration = max(self.end_time(), 1.0)
             self._refresh_time()
+            self.commit()
 
     def _res_preset(self):
         size = RESOLUTIONS.get(self.cb_res.currentText())
@@ -584,18 +812,34 @@ class MainWindow(QMainWindow):
             self._updating = False
             self._settings_changed()
 
-    def _layout_changed(self):
-        layout = self.cb_layout.currentData()
-        if layout == self.project.settings.layout or self.scene is None:
+    def _layout_changed(self, n: int):
+        """Change the number of measures per line (0: the whole score on one line): re-engrave, and carry
+        the camera and the edits over to the new layout."""
+        s = self.project.settings
+        if self._updating or self.scene is None or (n == s.measures_per_line and self.project.line_starts is None):
             return
-        if self.project.keys_edited and QMessageBox.question(
-                self, "Change layout?", "Switching layout re-engraves the score and resets the camera path. Continue?"
-        ) != QMessageBox.Yes:
-            self._sync_settings_to_ui()
+        old = self.score
+        s.measures_per_line = n
+        s.layout = "horizontal" if n == 0 else "pages"
+        if n:
+            self.cfg.setValue("measures_per_line", n)
+        self.project.line_starts = None
+        self._sync_settings_to_ui()
+        if self.load_score(old_score=old, fresh=False):
+            self.commit()
+
+    def _font_changed(self, family: str):
+        if self._updating or not family:
             return
-        self.project.settings.layout = layout
-        self.project.keys, self.project.keys_edited, self.project.overrides = [], False, {}
-        self.load_score()
+        s = self.project.settings
+        if family == s.font:
+            return
+        s.font = family
+        if self.scene:
+            self.scene.refresh()
+            self.editor.viewport().update()
+            self.preview.view.viewport().update()
+        self.commit()
 
     def _pick_color(self, which):
         s = self.project.settings
@@ -606,10 +850,13 @@ class MainWindow(QMainWindow):
         self._sync_settings_to_ui()
         if self.scene:
             if which == "ink":
-                self.load_score()  # ink is baked into the vector layers
+                old = self.score
+                if self.load_score(old_score=old, fresh=False):  # ink is baked into the vector layers
+                    self.commit()
             else:
                 self.scene.refresh()
                 self.editor.viewport().update()
+                self.commit()
 
     def _audio_changed(self):
         i = self.cb_audio.currentIndex()
@@ -626,23 +873,64 @@ class MainWindow(QMainWindow):
         self._sync_settings_to_ui()
         if self.scene:
             self._build_audio()
+            self.commit()
 
-    # ================================================================== note selection
+    # ================================================================== undo / redo
+    def commit(self):
+        """Record the current project state as an undo step (nothing happens if it did not change)."""
+        if self.scene is None:
+            return
+        if self.history.push(self.project.snapshot()):
+            self._update_enabled()
+        self._update_title()
+
+    def undo(self):
+        if self.history.can_undo():
+            self._apply_state(self.history.undo())
+
+    def redo(self):
+        if self.history.can_redo():
+            self._apply_state(self.history.redo())
+
+    def _apply_state(self, state: str):
+        before = self._layout_signature()
+        self.pause()
+        self.project.restore(state)
+        if self._layout_signature() != before:   # the lines were broken differently: engrave again
+            self.load_score(fresh=False)
+        else:
+            self.scene.refresh()
+            self.timeline.set_data(self.project, self.score, total_duration(self.scene, self.project))
+            self._refresh_time(follow=False)
+        self._sync_settings_to_ui()
+        self.scene.clearSelection()
+        self._update_selection_panel()
+        self._update_enabled()
+        self._update_title()
+
+    # ================================================================== selection
     def _selection_changed(self):
         if self._reselecting:   # Qt deselects items that become hidden; the panel keeps its elements
             return
         self._sel_units = self.scene.selected_units() if self.scene else []
+        self._sel_measures = self.scene.selected_measures() if self.scene else []
         self._update_selection_panel()
 
     def _update_selection_panel(self):
-        units = self._sel_units
+        units, measures = self._sel_units, self._sel_measures
         self._updating = True
-        self.tabs.setTabText(3, f"Selection ({len(units)})" if units else "Selection")
+        n = len(units) + len(measures)
+        self.tabs.setTabText(3, f"Selection ({n})" if n else "Selection")
         static = [u for u in units if u.static]
         self.chk_timed.setVisible(bool(static))
+        movable = [u for u in units if u.kind not in FIXED_KINDS]
+        self.lbl_geom.setVisible(bool(units))
+        self.btn_reset_geom.setVisible(any(u.uid in self.project.transforms for u in units))
         if not units:
-            self.lbl_sel.setText(SELECT_HINT)
             self.sp_note.setValue(0.0)
+            self.lbl_sel.setText(SELECT_HINT if not measures else
+                                 f"{len(measures)} measure{'s' if len(measures) != 1 else ''} selected "
+                                 f"(from {measures[0] + 1} to {measures[-1] + 1}).")
         else:
             u = units[0]
             self.chk_timed.setChecked(bool(static) and all(s.uid in self.project.timed for s in static))
@@ -652,6 +940,14 @@ class MainWindow(QMainWindow):
             else:
                 self.lbl_sel.setText(f"{len(units)} selected — {u.kind} first heard at {fmt(u.time)} (XML timing)")
             self.sp_note.setValue(self.project.overrides.get(u.uid, 0.0))
+        # measures: which categories are shown
+        self.grp_measures.setVisible(bool(measures))
+        if measures:
+            for cat, cb in self.cat_boxes.items():
+                hidden = [cat in self.project.hidden.get(m, ()) for m in measures]
+                cb.setCheckState(Qt.Unchecked if all(hidden) else Qt.Checked if not any(hidden) else Qt.PartiallyChecked)
+            starts = set(self.score.line_starts[1:])
+            self.btn_line_up.setVisible(any(m in starts for m in measures))
         self._updating = False
 
     def _retime_selection(self, change):
@@ -669,6 +965,7 @@ class MainWindow(QMainWindow):
         self._reselecting = False
         self._update_selection_panel()
         self._refresh_time(follow=False)
+        self.commit()
 
     def _note_offset_changed(self, v):
         def change(u):
@@ -682,6 +979,52 @@ class MainWindow(QMainWindow):
 
     def _timed_toggled(self, on):
         self._retime_selection(lambda u: u.static and (self.project.timed.add if on else self.project.timed.discard)(u.uid))
+
+    def _geometry_changed(self):
+        self._update_selection_panel()
+        self.editor.viewport().update()
+
+    def _reset_geometry(self):
+        if not self.scene:
+            return
+        for u in self._sel_units:
+            self.project.transforms.pop(u.uid, None)
+        self.scene.refresh()
+        self._update_selection_panel()
+        self.editor.viewport().update()
+        self.commit()
+
+    def _category_clicked(self, cat: str):
+        """Show or hide a category of engravings in the selected measures."""
+        if self._updating or not self.scene:
+            return
+        hide = self.cat_boxes[cat].checkState() == Qt.Unchecked
+        for m in self._sel_measures:
+            cats = self.project.hidden.setdefault(m, set())
+            (cats.add if hide else cats.discard)(cat)
+            if not cats:
+                self.project.hidden.pop(m, None)
+        self._reselecting = True
+        self.scene.refresh()
+        self._reselecting = False
+        self._refresh_time(follow=False)
+        self.editor.viewport().update()
+        self._update_selection_panel()
+        self.commit()
+
+    def move_lines_up(self):
+        """Merge each selected line start with the line before it: the whole line joins the previous one."""
+        if not self.scene:
+            return
+        starts = list(self.score.line_starts)
+        drop = {m for m in self._sel_measures if m in starts[1:]}
+        if not drop:
+            return
+        old = self.score
+        self.project.line_starts = [m for m in starts if m not in drop]
+        self.project.settings.layout = "pages" if len(self.project.line_starts) > 1 else "horizontal"
+        if self.load_score(old_score=old, fresh=False):
+            self.commit()
 
     # ================================================================== output
     def _audio_for_render(self):
@@ -734,7 +1077,7 @@ class MainWindow(QMainWindow):
             self._refresh_time()
 
     def save_frame(self):
-        if self.scene is None or not self.project.keys:
+        if self.scene is None or not self.project.has_keys():
             return
         path, _ = QFileDialog.getSaveFileName(self, "Save frame", str(Path(self.project.xml_path).with_suffix(".png")),
                                               "PNG image (*.png)")
@@ -752,11 +1095,6 @@ class MainWindow(QMainWindow):
         img.save(path)
         self.status.showMessage(f"Saved {path}", 5000)
 
-    def closeEvent(self, e):
-        self.pause()
-        super().closeEvent(e)
-
-
 def main():
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
@@ -769,9 +1107,9 @@ def main():
             win.project = Project.load(arg)
             win.project_path = str(arg)
             win._sync_settings_to_ui()
+            win.load_score()
         else:
-            win.project.xml_path = str(arg)
-        win.load_score()
+            win.open_xml_path(str(arg))
     sys.exit(app.exec())
 
 

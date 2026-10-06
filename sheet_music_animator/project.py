@@ -8,21 +8,47 @@ from pathlib import Path
 from .engraver import NOTE_KINDS, REST_KINDS, Score
 
 EASES = ("smooth", "linear", "hold")
+CHANNELS = ("pos", "size", "rot")
+CHANNEL_LABELS = {"pos": "Position", "size": "Frame size", "rot": "Rotation"}
+
+# Categories of engravings that can be switched off per measure: name -> SVG classes that make them up.
+# A class that is a whole element (a fingering, a dynamic) hides that element; a class inside a
+# note (an articulation, an accidental) is cut out of it.
+CATEGORIES = {
+    "Fingerings": ("fing",),
+    "Tuplet numbers and brackets": ("tupletNum", "tupletBracket", "tuplet"),
+    "Articulations": ("artic",),
+    "Accidentals": ("accid",),
+    "Dots": ("dots",),
+    "Dynamics": ("dynam",),
+    "Hairpins": ("hairpin",),
+    "Directions and text": ("dir", "tempo"),
+    "Slurs": ("slur",),
+    "Ties": ("tie", "lv"),
+    "Octave lines (8va)": ("octave",),
+    "Pedal marks": ("pedal",),
+    "Arpeggios": ("arpeg",),
+    "Ornaments and fermatas": ("trill", "mordent", "turn", "ornam", "fermata"),
+    "Measure numbers": ("mNum",),
+}
+# Engravings that cannot be moved or resized: noteheads and note tails (the note itself) and beams.
+FIXED_KINDS = {"note", "chord", "beam", "beamSpan", "fTrem", "bTrem"}
 
 
-@dataclass
-class CameraKey:
+@dataclass(eq=False)
+class Key:
+    """A keyframe on one camera channel."""
     t: float
-    cx: float
-    cy: float
-    w: float            # width in page units; height follows from the output aspect ratio
-    ease: str = "smooth"  # how the camera travels from this key to the next
+    v: list                 # pos: [cx, cy]   size: [width in page units]   rot: [degrees, clockwise]
+    ease: str = "smooth"    # how the value travels from this key to the next
 
 
 @dataclass
 class Settings:
-    layout: str = "pages"        # "pages" (systems stacked) or "horizontal" (one long line)
-    reveal: str = "fade"         # "fade" (notes fade/wipe in) or "instant" (notes pop in at their time)
+    layout: str = "pages"        # "pages" (lines stacked) or "horizontal" (one long line); see measures_per_line
+    measures_per_line: int = 4   # measures in each line (0 = the whole score on one line)
+    font: str = "Times New Roman"   # font of all text in the score
+    reveal: str = "instant"      # "fade" (notes fade/wipe in) or "instant" (notes pop in at their time)
     fade: float = 0.25           # seconds a note takes to fade in
     ghost: float = 0.0           # opacity of notes that have not played yet (0 = hidden)
     lookahead: int = 4           # only this many measures after the playhead show ghost notes (0 = all)
@@ -42,58 +68,118 @@ class Settings:
         return self.width / self.height
 
 
+def _blank_channels():
+    return {c: [] for c in CHANNELS}
+
+
+def _interp(keys, t, kind):
+    """Value list of a channel at time t (None for an empty channel)."""
+    if not keys:
+        return None
+    if t <= keys[0].t:
+        return list(keys[0].v)
+    if t >= keys[-1].t:
+        return list(keys[-1].v)
+    lo, hi = 0, len(keys) - 1
+    while hi - lo > 1:
+        mid = (lo + hi) // 2
+        lo, hi = (mid, hi) if keys[mid].t <= t else (lo, mid)
+    a, b = keys[lo], keys[hi]
+    if a.ease == "hold":
+        return list(a.v)
+    u = (t - a.t) / max(b.t - a.t, 1e-9)
+    if a.ease == "smooth":
+        u = u * u * (3 - 2 * u)
+    if kind == "size" and a.v[0] > 0 and b.v[0] > 0:     # zoom is geometric
+        return [a.v[0] * (b.v[0] / a.v[0]) ** u]
+    return [x + (y - x) * u for x, y in zip(a.v, b.v)]
+
+
 @dataclass
 class Project:
     xml_path: str = ""
     settings: Settings = field(default_factory=Settings)
-    keys: list[CameraKey] = field(default_factory=list)
+    channels: dict[str, list[Key]] = field(default_factory=_blank_channels)
     overrides: dict[int, float] = field(default_factory=dict)   # unit uid -> extra seconds
     keys_edited: bool = False
     timed: set[int] = field(default_factory=set)   # clefs, barlines... (static units) that follow the music
+    hidden: dict[int, set[str]] = field(default_factory=dict)   # measure index -> hidden CATEGORIES
+    transforms: dict[int, list[float]] = field(default_factory=dict)   # unit uid -> [dx, dy, scale]
+    line_starts: list[int] | None = None   # measure index that starts each line (None: every measures_per_line)
 
     # ---- camera ---------------------------------------------------------------------
-    def camera_at(self, t: float):
-        """(cx, cy, w) of the camera at time t."""
-        ks = self.keys
-        if not ks:
-            return None
-        if t <= ks[0].t:
-            return ks[0].cx, ks[0].cy, ks[0].w
-        if t >= ks[-1].t:
-            return ks[-1].cx, ks[-1].cy, ks[-1].w
-        lo, hi = 0, len(ks) - 1
-        while hi - lo > 1:
-            mid = (lo + hi) // 2
-            lo, hi = (mid, hi) if ks[mid].t <= t else (lo, mid)
-        a, b = ks[lo], ks[hi]
-        if a.ease == "hold":
-            return a.cx, a.cy, a.w
-        u = (t - a.t) / max(b.t - a.t, 1e-9)
-        if a.ease == "smooth":
-            u = u * u * (3 - 2 * u)
-        return (a.cx + (b.cx - a.cx) * u, a.cy + (b.cy - a.cy) * u,
-                a.w * (b.w / a.w) ** u if a.w > 0 and b.w > 0 else a.w)
+    def has_keys(self) -> bool:
+        return bool(self.channels["pos"] and self.channels["size"])
 
-    def camera_rect(self, t: float):
-        """(x, y, w, h) of the camera window at time t in page units."""
+    def camera_at(self, t: float):
+        """(cx, cy, w, rotation) of the camera at time t, or None while it has no keyframes."""
+        pos, size = _interp(self.channels["pos"], t, "pos"), _interp(self.channels["size"], t, "size")
+        if pos is None or size is None:
+            return None
+        rot = _interp(self.channels["rot"], t, "rot")
+        return pos[0], pos[1], size[0], rot[0] if rot else 0.0
+
+    def camera_pose(self, t: float):
+        """(cx, cy, w, h, rotation in degrees) of the camera window at time t in page units."""
         c = self.camera_at(t)
         if c is None:
             return None
-        cx, cy, w = c
-        h = w / self.settings.aspect
+        return c[0], c[1], c[2], c[2] / self.settings.aspect, c[3]
+
+    def camera_rect(self, t: float):
+        """(x, y, w, h) of the camera window at time t, ignoring its rotation."""
+        c = self.camera_pose(t)
+        if c is None:
+            return None
+        cx, cy, w, h, _ = c
         return cx - w / 2, cy - h / 2, w, h
 
-    def set_key(self, t: float, cx: float, cy: float, w: float, snap: float = 0.02):
-        """Create (or update the key within `snap` seconds of t)."""
+    def set_camera(self, t: float, cx: float, cy: float, w: float, rot: float = 0.0,
+                   snap: float = 0.02, create: bool = True) -> list:
+        """Store the camera pose at time t.  Only the channels whose value differs from what they
+        evaluate to now get a keyframe (an existing key within `snap` seconds is updated), so moving the
+        camera does not touch the size or rotation channels.  With create=False only existing keys are
+        updated.  Returns the keys that were set."""
+        cur = self.camera_at(t)
+        wanted = {"pos": [cx, cy], "size": [w], "rot": [rot]}
+        now = {"pos": None, "size": None, "rot": [0.0]}
+        if cur is not None:
+            now = {"pos": [cur[0], cur[1]], "size": [cur[2]], "rot": [cur[3]]}
+        out = []
+        for ch in CHANNELS:
+            keys = self.channels[ch]
+            if now[ch] is not None and all(abs(a - b) < 1e-6 for a, b in zip(now[ch], wanted[ch])):
+                continue
+            existing = next((k for k in keys if abs(k.t - t) <= snap), None)
+            if existing is not None:
+                existing.v = list(wanted[ch])
+                out.append(existing)
+            elif create:
+                k = Key(t, list(wanted[ch]))
+                keys.append(k)
+                keys.sort(key=lambda q: q.t)
+                out.append(k)
+        if out:
+            self.keys_edited = True
+        return out
+
+    def add_key(self, channel: str, t: float, snap: float = 0.02):
+        """A keyframe on `channel` at t holding the value there now (or the existing key)."""
+        keys = self.channels[channel]
+        existing = next((k for k in keys if abs(k.t - t) <= snap), None)
+        if existing is not None:
+            return existing
+        cur = self.camera_at(t)
+        if cur is None:
+            return None
+        k = Key(t, {"pos": [cur[0], cur[1]], "size": [cur[2]], "rot": [cur[3]]}[channel])
+        keys.append(k)
+        keys.sort(key=lambda q: q.t)
         self.keys_edited = True
-        for k in self.keys:
-            if abs(k.t - t) <= snap:
-                k.cx, k.cy, k.w = cx, cy, w
-                return k
-        k = CameraKey(t, cx, cy, w)
-        self.keys.append(k)
-        self.keys.sort(key=lambda k: k.t)
         return k
+
+    def all_keys(self):
+        return [(ch, k) for ch in CHANNELS for k in self.channels[ch]]
 
     # ---- note reveal -------------------------------------------------------------------
     def start_of(self, unit) -> float:
@@ -138,35 +224,73 @@ class Project:
         return s.ghost + (1 - s.ghost) * a, wipe
 
     # ---- persistence -----------------------------------------------------------------------
+    def to_dict(self) -> dict:
+        return {"version": 2, "xml_path": self.xml_path, "settings": asdict(self.settings),
+                "channels": {ch: [{"t": k.t, "v": k.v, "ease": k.ease} for k in self.channels[ch]] for ch in CHANNELS},
+                "overrides": {str(k): v for k, v in sorted(self.overrides.items())},
+                "keys_edited": self.keys_edited, "timed": sorted(self.timed),
+                "hidden": {str(m): sorted(c) for m, c in sorted(self.hidden.items()) if c},
+                "transforms": {str(u): list(v) for u, v in sorted(self.transforms.items())},
+                "line_starts": self.line_starts}
+
+    def snapshot(self) -> str:
+        return json.dumps(self.to_dict(), sort_keys=True)
+
+    def load_dict(self, d: dict) -> None:
+        """Replace this project's contents (in place, so everything holding a reference stays valid)."""
+        known = Settings.__dataclass_fields__
+        st = {k: v for k, v in d.get("settings", {}).items() if k in known}
+        if d.get("version", 1) < 2:   # older projects: Verovio chose the breaks of the stacked layout
+            st["measures_per_line"] = 0 if st.get("layout") == "horizontal" else -1
+        self.xml_path = d.get("xml_path", "")
+        self.settings = Settings(**st)
+        self.channels = _blank_channels()
+        if "channels" in d:
+            for ch in CHANNELS:
+                self.channels[ch] = [Key(k["t"], list(k["v"]), k.get("ease", "smooth")) for k in d["channels"].get(ch, [])]
+        else:   # version 1: one list of keys that carry position and size together
+            for k in d.get("keys", []):
+                self.channels["pos"].append(Key(k["t"], [k["cx"], k["cy"]], k.get("ease", "smooth")))
+                self.channels["size"].append(Key(k["t"], [k["w"]], k.get("ease", "smooth")))
+        self.overrides = {int(k): v for k, v in d.get("overrides", {}).items()}
+        self.keys_edited = d.get("keys_edited", False)
+        self.timed = {int(u) for u in d.get("timed", [])}
+        self.hidden = {int(m): set(c) for m, c in d.get("hidden", {}).items()}
+        self.transforms = {int(u): list(v) for u, v in d.get("transforms", {}).items()}
+        self.line_starts = d.get("line_starts")
+
+    def restore(self, snapshot: str) -> None:
+        self.load_dict(json.loads(snapshot))
+
     def save(self, path):
-        data = {"version": 1, "xml_path": self.xml_path, "settings": asdict(self.settings),
-                "keys": [asdict(k) for k in self.keys],
-                "overrides": {str(k): v for k, v in self.overrides.items()},
-                "keys_edited": self.keys_edited, "timed": sorted(self.timed)}
-        Path(path).write_text(json.dumps(data, indent=1), encoding="utf8")
+        Path(path).write_text(json.dumps(self.to_dict(), indent=1), encoding="utf8")
 
     @classmethod
     def load(cls, path) -> "Project":
-        d = json.loads(Path(path).read_text(encoding="utf8"))
-        known = Settings.__dataclass_fields__
-        p = cls(xml_path=d.get("xml_path", ""),
-                settings=Settings(**{k: v for k, v in d.get("settings", {}).items() if k in known}),
-                keys=[CameraKey(**k) for k in d.get("keys", [])],
-                overrides={int(k): v for k, v in d.get("overrides", {}).items()},
-                keys_edited=d.get("keys_edited", False),
-                timed={int(u) for u in d.get("timed", [])})
+        p = cls()
+        p.load_dict(json.loads(Path(path).read_text(encoding="utf8")))
         return p
 
 
 # --------------------------------------------------------------------------------------------
-def auto_camera(score: Score, settings: Settings) -> list[CameraKey]:
+@dataclass
+class CameraKey:
+    """Used while building the automatic path: position and size of one step."""
+    t: float
+    cx: float
+    cy: float
+    w: float
+    ease: str = "smooth"
+
+
+def _auto_keys(score: Score, settings: Settings) -> list:
     """A sensible starting camera path that follows the music.
 
     The frame is `follow_width` wide and tracks "now" along each system (keeping the
     playing position ~25% from the left); between systems it glides to the next one.
     If the frame is as wide as a system it simply frames the whole system instead.
     """
-    keys: list[CameraKey] = []
+    keys: list = []
     if not score.systems:
         return keys
     # Never leave a system before its last note has been on screen for a moment (`hold`, or most of
@@ -216,3 +340,15 @@ def auto_camera(score: Score, settings: Settings) -> list[CameraKey]:
         keys.append(CameraKey(score.duration, keys[-1].cx, keys[-1].cy, keys[-1].w))
     keys.sort(key=lambda k: k.t)
     return keys
+
+
+def auto_camera(score: Score, settings: Settings) -> dict:
+    """The automatic camera path as keyframe channels (position changes often, frame size rarely)."""
+    out = _blank_channels()
+    last_w = None
+    for k in _auto_keys(score, settings):
+        out["pos"].append(Key(k.t, [k.cx, k.cy], k.ease))
+        if last_w is None or abs(k.w - last_w) > 1.0:
+            out["size"].append(Key(k.t, [k.w], "linear" if last_w is not None else k.ease))
+            last_w = k.w
+    return out
