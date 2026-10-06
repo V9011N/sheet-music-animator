@@ -20,6 +20,8 @@ class SvgItem(QGraphicsItem):
         self._rect = QRectF(*rect)
         self._renderer = QSvgRenderer(QByteArray(svg))
         self.wipe = 1.0
+        self.alpha = 1.0     # opacity the scene gave this item (also set with setOpacity)
+        self.ghost = 0.0     # opacity of the part that has not been revealed yet
         self.setAcceptedMouseButtons(Qt.NoButton)
 
     def boundingRect(self):
@@ -28,6 +30,11 @@ class SvgItem(QGraphicsItem):
     def paint(self, painter, option, widget=None):
         r = self._rect
         if self.wipe < 1.0:  # left-to-right reveal
+            if self.ghost > 0:   # the unrevealed rest stays faintly visible
+                painter.save()
+                painter.setOpacity(painter.opacity() * min(self.ghost / max(self.alpha, 1e-6), 1.0))
+                self._renderer.render(painter, r)
+                painter.restore()
             painter.save()
             painter.setClipRect(QRectF(r.left(), r.top(), r.width() * self.wipe, r.height()))
             self._renderer.render(painter, r)
@@ -81,13 +88,13 @@ class SheetScene(QGraphicsScene):
                 continue
             self._state[u.uid] = state
             alpha, wipe = state
-            it.wipe = wipe
+            it.wipe, it.alpha, it.ghost = wipe, alpha, proj.settings.ghost
             if it.cacheMode() != QGraphicsItem.NoCache:
                 # The editor and the preview both draw these items; Qt keeps one pixmap per view and
                 # can leave a stale one behind (missing stems/beams/slurs), so drop them all on change.
                 it.setCacheMode(QGraphicsItem.NoCache)
                 it.setCacheMode(QGraphicsItem.DeviceCoordinateCache)
-            it.setVisible(alpha > 0.002 and wipe > 0)
+            it.setVisible(alpha > 0.002 and (wipe > 0 or it.ghost > 0))
             it.setOpacity(alpha)
             it.update()
 
