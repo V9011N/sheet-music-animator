@@ -81,11 +81,15 @@ class SheetScene(QGraphicsScene):
                 continue
             self._state[u.uid] = state
             alpha, wipe = state
+            it.wipe = wipe
+            if it.cacheMode() != QGraphicsItem.NoCache:
+                # The editor and the preview both draw these items; Qt keeps one pixmap per view and
+                # can leave a stale one behind (missing stems/beams/slurs), so drop them all on change.
+                it.setCacheMode(QGraphicsItem.NoCache)
+                it.setCacheMode(QGraphicsItem.DeviceCoordinateCache)
             it.setVisible(alpha > 0.002 and wipe > 0)
             it.setOpacity(alpha)
-            if it.wipe != wipe:
-                it.wipe = wipe
-                it.update()
+            it.update()
 
     def set_cache(self, on: bool):
         """Pixmap caching keeps the editor fast; turn it off while rendering for pure vector output."""

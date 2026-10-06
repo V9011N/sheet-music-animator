@@ -640,10 +640,17 @@ class MainWindow(QMainWindow):
         dlg.setMinimumDuration(0)
         dlg.setWindowTitle("Rendering")
 
+        fps, t_before, shown = self.project.settings.fps, self.t, QElapsedTimer()
+        shown.start()
+
         def progress(done, total):
             dlg.setMaximum(max(total, 1))
             dlg.setValue(done)
             dlg.setLabelText(f"Rendering frame {done} of {total}")
+            if shown.elapsed() > 100:   # let the camera window, preview and timeline follow the render
+                shown.restart()
+                self.t = min(done / fps, self.end_time())
+                self._refresh_time()
             QApplication.processEvents()
             return not dlg.wasCanceled()
 
@@ -659,6 +666,7 @@ class MainWindow(QMainWindow):
                 self.status.showMessage(f"Rendered {path}", 8000)
         finally:
             self.scene.set_cache(True)
+            self.t = t_before
             self._refresh_time()
 
     def save_frame(self):

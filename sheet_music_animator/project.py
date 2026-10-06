@@ -5,7 +5,7 @@ import json
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
-from .engraver import Score
+from .engraver import NOTE_KINDS, REST_KINDS, Score
 
 EASES = ("smooth", "linear", "hold")
 
@@ -160,15 +160,23 @@ def auto_camera(score: Score, settings: Settings) -> list[CameraKey]:
     keys: list[CameraKey] = []
     if not score.systems:
         return keys
-    lead, glide = 0.2, 0.9       # arrive `lead` s before the next system's first note, gliding for `glide` s
+    # Stay on a system until `hold` s after its last note starts, then glide for `glide` s,
+    # arriving `lead` s before the next system's first note (squeezing the glide if that is too late).
+    lead, glide, hold, min_glide = 0.15, 0.6, 0.4, 0.25
     paged = settings.layout == "pages"
+    last_on: dict[int, float] = {}
+    for u in score.units:
+        if u.kind in NOTE_KINDS | REST_KINDS:
+            last_on[u.system] = max(last_on.get(u.system, 0.0), u.time)
     for i, s in enumerate(score.systems):
         x, y, w, h = s.rect
         cy = y + h / 2
         fw = settings.follow_width
         nxt = score.systems[i + 1].start if i + 1 < len(score.systems) else score.duration
         arrive = 0.0 if i == 0 else max(s.start - lead, 0.0)
-        leave = max(nxt - lead - glide, arrive + 0.02)
+        leave = max(last_on.get(i, s.start) + hold, nxt - lead - glide, arrive + 0.02)
+        if i + 1 < len(score.systems):   # next system's arrival key is placed by its own iteration
+            leave = min(leave, max(nxt - lead - min_glide, arrive + 0.02))
         if fw >= w * 0.98:   # whole system fits
             fw = max(w * 1.03, h * settings.aspect * 1.05)
             keys.append(CameraKey(arrive, x + w / 2, cy, fw))
