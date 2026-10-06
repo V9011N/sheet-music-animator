@@ -62,6 +62,9 @@ class Unit:
     end: float           # notes: stops sounding; spanning shapes: last note they cover
     system: int
     wipe: bool = False
+    # Beams, tuplets, tremolos: (member uid, member time, fraction of rect width to show once that
+    # member has appeared) so the shape grows note by note instead of all at once.
+    steps: tuple = ()
 
 
 @dataclass
@@ -418,6 +421,28 @@ class _Builder:
         x0, y0, x1, y1 = _pad(_xf_box(box, self.m), pad)
         return (x0, y0, x1 - x0, y1 - y0)
 
+    def _stem_x(self, rec):
+        """Page x where a bundle (beam...) reaches this member: its stem, else the right edge."""
+        for e in rec["el"].iter(_G):
+            if "stem" in _classes(e):
+                b = self.calc.box(e)
+                if b:
+                    return _xf_box(b, self.m)[2]
+        b = rec["box"]
+        return None if b is None else _xf_box(b, self.m)[2]
+
+    def _steps(self, r, rect):
+        pts = sorted((m["time"], x, m["n"]) for m in r["members"]
+                     if m["time"] is not None and (x := self._stem_x(m)) is not None)
+        if len(pts) < 2:
+            return ()
+        steps, reach = [], rect[0]
+        for i, (t, x, uid) in enumerate(pts):
+            reach = max(reach, x)
+            frac = 1.0 if i == len(pts) - 1 else min(max((reach - rect[0]) / max(rect[2], 1e-6), 0.0), 1.0)
+            steps.append((uid, t, frac))
+        return tuple(steps)
+
     def _make_units(self):
         out = []
         for r in self.recs:
@@ -427,7 +452,8 @@ class _Builder:
             span = r["end"] - r["time"]
             out.append(Unit(uid=r["n"], kind=r["kind"], svg=self._doc(r["el"], rect), rect=rect,
                             time=r["time"], end=r["end"], system=r["system"],
-                            wipe=r["kind"] in WIPE_KINDS and span > 0.12))
+                            wipe=r["kind"] in WIPE_KINDS and span > 0.12,
+                            steps=self._steps(r, rect) if r["members"] else ()))
         return out
 
     def _make_static(self, systems, score):

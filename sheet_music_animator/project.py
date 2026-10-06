@@ -97,18 +97,35 @@ class Project:
     def start_of(self, unit) -> float:
         return unit.time + self.settings.offset + self.overrides.get(unit.uid, 0.0)
 
+    def _ease(self, dt: float) -> float:
+        """0..1 progress of a note's appearance `dt` seconds after its start."""
+        s = self.settings
+        if s.reveal == "instant" or s.fade <= 0:
+            return 1.0
+        a = min(dt / s.fade, 1.0)
+        return a * a * (3 - 2 * a)
+
+    def _step_wipe(self, unit, t: float) -> float:
+        """Beams/tuplets grow up to the latest member note that has been revealed."""
+        wipe, prev = 0.0, 0.0
+        for uid, mtime, frac in unit.steps:
+            dm = t - (mtime + self.settings.offset + self.overrides.get(uid, 0.0))
+            if dm >= 0:
+                wipe = max(wipe, prev + (frac - prev) * self._ease(dm))
+            prev = frac
+        return wipe
+
     def reveal(self, unit, t: float):
         """(opacity, wipe fraction) of a unit at time t."""
         s = self.settings
         dt = t - self.start_of(unit)
         if dt < 0:
             return s.ghost, 0.0
-        if s.reveal == "instant":
-            return 1.0, 1.0
-        a = 1.0 if s.fade <= 0 else min(dt / s.fade, 1.0)
-        a = a * a * (3 - 2 * a)
+        a = self._ease(dt)
         wipe = 1.0
-        if unit.wipe:
+        if unit.steps:
+            wipe = self._step_wipe(unit, t)
+        elif unit.wipe and s.reveal != "instant":   # slurs, ties... appear whole when instant
             wipe = min(dt / max(unit.end - unit.time, 0.05), 1.0)
         return s.ghost + (1 - s.ghost) * a, wipe
 

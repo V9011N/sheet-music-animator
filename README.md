@@ -22,7 +22,7 @@ python -m venv .venv
 | Camera | Drag the orange window in the editor to move it, drag a corner to resize (aspect ratio is locked to the output size). Any change at the playhead creates or updates a keyframe. |
 | Keyframes | `K` or double-click the Camera lane to add one; drag a diamond to retime it; right-click for easing (smooth / linear / hold) or delete; `Delete` removes the selected one. |
 | Auto camera | **Follow music** (Camera tab) builds a camera path that tracks the music and glides from system to system. "Follow-music width" sets the zoom. |
-| Look & timing | Note reveal (fade in or appear instantly), fade-in length, a faint "ghost" of unplayed notes, global note shift (for audio sync), page layout (stacked systems or one long line), ink/paper colours. |
+| Look & timing | Note reveal (fade in or appear instantly; beams grow note by note, slurs appear whole when instant), fade-in length, a faint "ghost" of unplayed notes, global note shift (for audio sync), page layout (stacked systems or one long line), ink/paper colours. |
 | Fix one note's timing | Click a note (or drag a box), then set *Reveal earlier / later* on the Selection tab. |
 | Output | Resolution, frame rate, audio (built-in piano synth, your own audio file, or none) → **Render video…** or **Save current frame as PNG…**. |
 | Projects | `Ctrl+S` saves a `.smanim` file (camera keys, timing tweaks, settings). |
