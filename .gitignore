@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+.scratch*
+# sample scores and render output stay local
+*.mxl
+*.musicxml
+*.mp4
+*.wav
