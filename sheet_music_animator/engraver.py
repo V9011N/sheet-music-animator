@@ -19,7 +19,7 @@ import json
 import math
 import re
 import zipfile
-from bisect import bisect_right
+from bisect import bisect_left, bisect_right
 from dataclasses import dataclass, field
 from pathlib import Path as FsPath
 
@@ -570,7 +570,8 @@ class _Builder:
                         self._unit(p, "ledger", si)
             elif c & STATIC:
                 if self._drawable(ch):
-                    self._unit(ch, next(iter(c & STATIC)), si, static=True)
+                    mid = parent == "layer"   # a clef/key/meter change inside the music, not at the start of the staff
+                    self._unit(ch, next(iter(c & STATIC)), si, static=not mid, mid=mid)
             elif c & STRUCTURE:
                 found += self._walk(ch, next(iter(c & STRUCTURE)), si)
             elif parent in ("measure", "layer") and self._drawable(ch):
@@ -587,8 +588,8 @@ class _Builder:
             elif c & BUNDLES:
                 members += self._bundle(ch, si, next(iter(c & BUNDLES)))
             elif c & STATIC:
-                if self._drawable(ch):
-                    self._unit(ch, next(iter(c & STATIC)), si, static=True)
+                if self._drawable(ch):   # a clef change inside a beam
+                    self._unit(ch, next(iter(c & STATIC)), si, mid=True)
             elif _tag(ch) in DRAWABLE or (_tag(ch) == "g" and self._drawable(ch)):
                 loose.append(ch)
         if loose:  # beam polygons, tuplet brackets ... become one unit of their own
@@ -600,7 +601,7 @@ class _Builder:
             self._unit(wrap, kind, si)["members"] = members
         return members
 
-    def _unit(self, el, kind, si, static=False):
+    def _unit(self, el, kind, si, static=False, mid=False):
         el.set("data-unit", str(len(self.recs)))
         if kind in NOTE_KINDS:
             ids = [e.get("id") for e in el.iter(_G) if "note" in _classes(e)] if kind == "chord" \
@@ -610,7 +611,7 @@ class _Builder:
         else:
             ids = []
         rec = {"n": len(self.recs), "el": el, "kind": kind, "box": self.calc.box(el), "system": si,
-               "ids": ids, "members": [], "time": None, "end": None, "static": static}
+               "ids": ids, "members": [], "time": None, "end": None, "static": static, "mid": mid}
         self.recs.append(rec)
         return rec
 
@@ -652,6 +653,10 @@ class _Builder:
                 r["time"] = r["end"] = 0.0
                 continue
             xs = [p[0] for p in a]
+            if r["mid"]:   # a change inside the music takes effect with the note that follows it
+                i = bisect_left(xs, r["box"][0])
+                r["time"] = r["end"] = a[min(i, len(a) - 1)][1]
+                continue
             if r["kind"] == "arpeg":   # the wavy line sits just left of the chord it rolls: it appears with that chord
                 b = r["box"]
                 nxt = [c for c in chords[r["system"]] if c[0] >= b[0] and c[1] <= b[3] and b[1] <= c[2]]

@@ -23,7 +23,7 @@ python -m venv .venv
 | Keyframes | `K` or double-click the Camera lane to add one; drag a diamond to retime it; right-click for easing (smooth / linear / hold) or delete; `Delete` removes the selected one. |
 | Auto camera | **Follow music** (Camera tab) builds a camera path that tracks the music and glides from system to system. "Follow-music width" sets the zoom. |
 | Look & timing | Note reveal (fade in or appear instantly; beams grow note by note, slurs appear whole when instant), fade-in length, a faint "ghost" of unplayed notes (only a few measures ahead of the playhead, so long pieces stay fast), global note shift (for audio sync), page layout (stacked systems or one long line), ink/paper colours. |
-| Fix one element's timing | Click any engraved element (note, rest, beam, slur, arpeggio, clef, barline, …) or drag a box around several, then set *Reveal earlier / later* on the Selection tab. Clefs, key/time signatures, barlines, brackets and measure numbers are always visible until you tick *Reveal with the music* or give them a time. |
+| Fix one element's timing | Click any engraved element (note, rest, beam, slur, arpeggio, clef, barline, …) or drag a box around several, then set *Reveal earlier / later* on the Selection tab. Clefs, key/time signatures, barlines, brackets and measure numbers at the start of a staff are always visible until you tick *Reveal with the music* or give them a time; clef changes inside the music appear with the note that follows them. |
 | Output | Resolution, frame rate, audio (built-in piano synth, your own audio file, or none) → **Render video…** or **Save current frame as PNG…**. |
 | Projects | `Ctrl+S` saves a `.smanim` file (camera keys, timing tweaks, settings). |
 
@@ -46,4 +46,4 @@ Staves that MuseScore hid because they are empty (`print-object="no"` in the exp
 
 * Notes are engraved by Verovio, so the layout is Verovio's, not your notation program's.
 * Only the first page is used; Verovio is asked for one tall page, which is plenty for typical pieces.
-* Clefs/key/time signatures, barlines and the like are always visible unless you time them in the Selection tab.
+* Clefs/key/time signatures at the start of a staff, barlines and the like are always visible unless you time them in the Selection tab.
