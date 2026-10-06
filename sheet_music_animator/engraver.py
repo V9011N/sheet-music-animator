@@ -45,6 +45,7 @@ WIPE_KINDS = {"beam", "tuplet", "slur", "tie", "hairpin", "pedal", "octave", "br
               "beamSpan", "gliss", "lv", "fTrem", "bTrem"}
 DRAWABLE = {"path", "use", "polygon", "polyline", "rect", "ellipse", "text", "line"}
 CSS = "ellipse,path,polygon,polyline,rect{stroke:currentColor}"
+CROSS_STAFF_SPACING = 20   # Verovio's default is 12; cross-staff beams then run into the notes of the staff below
 POSITION_TOLERANCE = 160.0  # how far left of a control event a note may sit and still "start" it
 
 LAYOUTS = {
@@ -291,25 +292,133 @@ def hidden_staves(path) -> dict[str, set[int]]:
     return hidden
 
 
-def _hide_staves(tk, hidden) -> set[str] | None:
-    """Verovio ignores print-object="no".  Mark the hidden staves invisible (re-loading the score
-    through MEI) and return the xml:ids of those <staff> elements so that `_remove_hidden_staves`
-    can take them out of the SVG.  Only staves holding nothing but rests are touched, so no notes are lost."""
+def has_cross_staff(path) -> bool:
+    """True when some voice of the MusicXML moves between staves of its part (cross-staff notes)."""
+    root = _read_musicxml(path)
+    if root is None or root.tag != "score-partwise":
+        return False
+    for m in root.iterfind("part/measure"):
+        staves: dict[str, set[str]] = {}
+        for n in m.findall("note"):
+            staves.setdefault(n.findtext("voice") or "1", set()).add(n.findtext("staff") or "1")
+        if any(len(v) > 1 for v in staves.values()):
+            return True
+    return False
+
+
+def _local(el) -> str:
+    return el.tag.rsplit("}", 1)[-1] if isinstance(el.tag, str) else ""
+
+
+def _layer_events(layer):
+    """(time in ppq, element) of the notes, rests and clefs of a MEI layer, in order."""
+    out, t = [], 0
+
+    def walk(el):
+        nonlocal t
+        for c in el:
+            tag = _local(c)
+            if tag in ("beam", "tuplet", "bTrem", "fTrem", "graceGrp"):
+                walk(c)
+            elif tag == "chord":
+                notes = [n for n in c if _local(n) == "note"]
+                out.extend((t, n) for n in notes)
+                t += int(c.get("dur.ppq") or (notes[0].get("dur.ppq") if notes else 0) or 0)
+            elif tag in ("note", "rest", "space"):
+                out.append((t, c))
+                t += int(c.get("dur.ppq") or 0)
+            elif tag == "clef":
+                out.append((t, c))
+    walk(layer)
+    return out
+
+
+def _clef_attrs(el):
+    return {k: v for k, v in el.attrib.items() if k in ("shape", "line", "dis", "dis.place")}
+
+
+def _fix_cross_staff_clefs(root) -> bool:
+    """Verovio positions a cross-staff note with the clef that its target staff had at the start of the
+    measure unless that staff has a layer with the same number as the note's own layer.  A note that
+    crosses into a staff after a mid-measure clef change (right hand moving down into a bass staff that
+    just changed back from treble) then lands on the wrong lines.  Give such staves an otherwise empty,
+    invisible layer holding the clef that is really in effect."""
+    ns = {"m": MEI_NS}
+    state: dict[str, dict] = {}
+    changed = False
+
+    def take_scoredef(sd):
+        for sdef in sd.iterfind(".//m:staffDef", ns):
+            clef = sdef.find("m:clef", ns)
+            if clef is not None:
+                state[sdef.get("n")] = _clef_attrs(clef)
+
+    for el in root.iter():
+        tag = _local(el)
+        if tag == "scoreDef":
+            take_scoredef(el)
+            continue
+        if tag != "measure":
+            continue
+        staves = {st.get("n"): st for st in el.findall("m:staff", ns)}
+        clefs: dict[str, list] = {n: [] for n in staves}      # (time, attrs) of the clef changes in each staff
+        events = {}
+        for n, st in staves.items():
+            for lay in st.findall("m:layer", ns):
+                ev = _layer_events(lay)
+                events[(n, lay.get("n"))] = ev
+                clefs[n] += [(t, _clef_attrs(c)) for t, c in ev if _local(c) == "clef"]
+        wanted: dict[tuple, list] = {}                        # (target staff, layer) -> clefs needed
+        for (n, lay_n), ev in events.items():
+            for t, note in ev:
+                tgt = note.get("staff")
+                if _local(note) == "note" and tgt and tgt != n and tgt in staves:
+                    if all(lay.get("n") != lay_n for lay in staves[tgt].findall("m:layer", ns)):
+                        now = state.get(tgt, {})
+                        for ct, attrs in sorted(clefs[tgt], key=lambda c: c[0]):
+                            if ct <= t:
+                                now = attrs
+                        wanted.setdefault((tgt, lay_n), []).append(now)
+        for (tgt, lay_n), nows in wanted.items():
+            if not nows[0]:
+                continue
+            layer = etree.Element(f"{{{MEI_NS}}}layer", n=lay_n)
+            etree.SubElement(layer, f"{{{MEI_NS}}}clef", visible="false", **nows[0])
+            staves[tgt].insert(0, layer)
+            changed = True
+        for n in staves:
+            if clefs[n]:
+                state[n] = max(clefs[n], key=lambda c: c[0])[1]
+    return changed
+
+
+def _adjust_mei(tk, path, hidden, cross) -> set[str]:
+    """Work around Verovio's MusicXML import by re-loading the score through MEI:
+    * hidden staves (print-object="no"): marked invisible, their xml:ids returned so that
+      `_remove_hidden_staves` can take them out of the SVG afterwards (only rest-only staves are touched);
+    * cross-staff clefs (see `_fix_cross_staff_clefs`).
+    Returns the ids of the hidden <staff> elements."""
     ns = {"m": MEI_NS}
     root = etree.fromstring(tk.getMEI().encode("utf8"))
+    changed = _fix_cross_staff_clefs(root) if cross else False
     ids: set[str] = set()
-    for measure in root.iterfind(".//m:measure", ns):
-        gone = hidden.get(measure.get("n"), set())
-        for staff in measure.findall("m:staff", ns):
-            sid = staff.get(XML_ID)
-            if sid and int(staff.get("n", 0)) in gone and not staff.xpath(".//m:note", namespaces=ns):
-                staff.set("visible", "false")
-                ids.add(sid)
-            elif staff.get("visible") == "false":
-                del staff.attrib["visible"]   # Verovio's import switches off *every* staff of such a measure
-    if ids and tk.loadData(etree.tostring(root, encoding="unicode")):
-        return ids
-    return None
+    if hidden:
+        for measure in root.iterfind(".//m:measure", ns):
+            gone = hidden.get(measure.get("n"), set())
+            for staff in measure.findall("m:staff", ns):
+                sid = staff.get(XML_ID)
+                if sid and int(staff.get("n", 0)) in gone and not staff.xpath(".//m:note", namespaces=ns):
+                    staff.set("visible", "false")
+                    ids.add(sid)
+                elif staff.get("visible") == "false":
+                    del staff.attrib["visible"]   # Verovio's import switches off *every* staff of such a measure
+        changed = changed or bool(ids)
+    if not changed:
+        return set()
+    if not tk.loadData(etree.tostring(root, encoding="unicode")):
+        tk.loadFile(str(path))   # could not be applied: keep the plain import
+        return set()
+    return ids
 
 
 def _scale_y(d: str, top: float, k: float) -> str:
@@ -375,13 +484,13 @@ def engrave(path, layout: str = "pages", ink: str = "#000000", progress=None) ->
     opts = {"scale": 40, "svgViewBox": True, "header": "none", "footer": "none",
             "pageMarginLeft": 40, "pageMarginRight": 40, "pageMarginTop": 60, "pageMarginBottom": 60}
     opts.update(LAYOUTS[layout])
+    hidden, cross = hidden_staves(path), has_cross_staff(path)
+    if cross:   # a beam that crosses between staves is not taken into account when Verovio spaces the staves
+        opts["spacingStaff"] = CROSS_STAFF_SPACING
     tk.setOptions(opts)
     if not tk.loadFile(str(path)):
         raise ValueError(f"Verovio could not read {path}")
-    hidden = hidden_staves(path)
-    hidden_ids = _hide_staves(tk, hidden) if hidden else None
-    if hidden and hidden_ids is None:
-        tk.loadFile(str(path))   # could not be applied: keep the plain import
+    hidden_ids = _adjust_mei(tk, path, hidden, cross) if hidden or cross else set()
     svg = tk.renderToSVG(1)
     timemap = tk.renderToTimemap({"includeRests": True, "includeMeasures": True})
     timemap = json.loads(timemap) if isinstance(timemap, str) else timemap
