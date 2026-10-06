@@ -42,7 +42,10 @@ STATIC = {"clef", "keySig", "meterSig", "barLine", "mNum", "space", "grpSym", "l
           "sb", "pb", "pageMilestone", "systemMilestone", "scoreDef", "staffDef", "ending"}
 # Units that grow from left to right over their span instead of just fading in.
 WIPE_KINDS = {"beam", "tuplet", "slur", "tie", "hairpin", "pedal", "octave", "bracketSpan",
-              "beamSpan", "gliss", "lv", "fTrem", "bTrem"}
+              "beamSpan", "gliss", "lv", "fTrem", "bTrem", "dir", "dynam"}
+# Lines that run along the music (8va, hairpins, "cresc. - - -") grow note by note, even when notes appear instantly;
+# slurs and ties appear whole.
+LINE_KINDS = {"hairpin", "pedal", "octave", "bracketSpan", "gliss", "dir", "dynam"}
 DRAWABLE = {"path", "use", "polygon", "polyline", "rect", "ellipse", "text", "line"}
 CSS = "ellipse,path,polygon,polyline,rect{stroke:currentColor}"
 CROSS_STAFF_SPACING = 20   # Verovio's default is 12; cross-staff beams then run into the notes of the staff below
@@ -322,6 +325,7 @@ def _layer_events(layer):
                 walk(c)
             elif tag == "chord":
                 notes = [n for n in c if _local(n) == "note"]
+                out.append((t, c))
                 out.extend((t, n) for n in notes)
                 t += int(c.get("dur.ppq") or (notes[0].get("dur.ppq") if notes else 0) or 0)
             elif tag in ("note", "rest", "space"):
@@ -331,6 +335,47 @@ def _layer_events(layer):
                 out.append((t, c))
     walk(layer)
     return out
+
+
+_TEXT_STYLE = ("font-size", "font-family", "font-weight", "font-style", "fill")
+_TEXT_POS = ("x", "y", "dx", "dy")
+# Leipzig (Verovio's music font) glyphs that occur in text, with a plain-text stand-in
+_TEXT_GLYPHS = {"\ueca5": "\u2669", "\ueca7": "\u266a"}   # SMuFL metronome marks: quarter, eighth
+
+
+def _flatten_text(root) -> None:
+    """Qt's SVG renderer drops text whose <tspan>s are nested (Verovio nests them 3 deep): rebuild
+    every <text> as a flat list of <tspan>s that carry the inherited font attributes."""
+    for text in list(root.iter(f"{{{SVG_NS}}}text")):
+        if not any(_tag(c) == "tspan" and any(_tag(g) == "tspan" for g in c) for c in text):
+            continue
+        leaves = []
+
+        def walk(el, style, pos):
+            for ch in el:
+                if _tag(ch) != "tspan":
+                    continue
+                st = dict(style, **{k: ch.get(k) for k in _TEXT_STYLE if ch.get(k)})
+                ps = dict(pos, **{k: ch.get(k) for k in _TEXT_POS if ch.get(k)})
+                if any(_tag(g) == "tspan" for g in ch):
+                    walk(ch, st, ps)
+                    pos.clear()
+                else:
+                    leaves.append((st, ps, ch.text or ""))
+                    pos.clear()
+        walk(text, {}, {})
+        for i, (_, _, string) in enumerate(leaves):
+            # Verovio writes "[♩ = 104]" as "[", "]", ♩, "= 104": put the bracket back at the end
+            if string.strip() == "]" and i + 1 < len(leaves) and any("[" in l[2] for l in leaves[:i]):
+                leaves.append(leaves.pop(i))
+                break
+        for ch in list(text):
+            text.remove(ch)
+        for st, ps, string in leaves:
+            ts = etree.SubElement(text, f"{{{SVG_NS}}}tspan", **st, **ps)
+            ts.text = "".join(_TEXT_GLYPHS.get(c, c) for c in string)
+            if st.get("font-family") == "Leipzig" and string and string[0] in _TEXT_GLYPHS:
+                ts.set("font-family", "serif")
 
 
 def _clef_attrs(el):
@@ -392,6 +437,69 @@ def _fix_cross_staff_clefs(root) -> bool:
     return changed
 
 
+def _merge_slur_chains(root) -> bool:
+    """MuseScore exports one long slur of a voice that moves between staves as a chain of short slurs
+    (start 1, start 2, stop 1, stop 2, start 1 ...) and Verovio draws each of them.  Slurs that
+    interleave within one voice (A starts, B starts, A ends, B ends) are merged into one, and so are slurs that
+    continue such a chain on the very note where it stopped."""
+    ns = {"m": MEI_NS}
+    pos: dict[str, tuple] = {}
+    voice: dict[str, tuple] = {}
+    slurs = []
+    for mi, measure in enumerate(root.iterfind(".//m:measure", ns)):
+        for lay in measure.iterfind("m:staff/m:layer", ns):
+            for t, el in _layer_events(lay):
+                if el.get(XML_ID):
+                    pos[el.get(XML_ID)] = (mi, t)
+                    voice[el.get(XML_ID)] = (lay.get("n"), el.get("staff") or lay.getparent().get("n"))
+        slurs += [s for s in measure.findall("m:slur", ns)]
+    items = []
+    for sl in slurs:
+        a, b = (sl.get("startid") or "").lstrip("#"), (sl.get("endid") or "").lstrip("#")
+        if a in pos and b in pos and pos[a] != pos[b]:
+            if voice[a][0] == voice[b][0]:   # both ends in the same voice
+                items.append({"el": sl, "a": pos[a], "b": pos[b], "aid": a, "bid": b, "grp": len(items),
+                              "voice": voice[a][0]})
+    if len(items) < 2:
+        return False
+
+    def union(i, j):
+        gi, gj = items[i]["grp"], items[j]["grp"]
+        for it in items:
+            if it["grp"] == gj:
+                it["grp"] = gi
+    for i, A in enumerate(items):
+        for j, B in enumerate(items):
+            if i != j and A["voice"] == B["voice"] and A["a"] < B["a"] < A["b"] < B["b"]:
+                union(i, j)
+    merged = False
+    again = True
+    while again:
+        again = False
+        for grp in {it["grp"] for it in items}:
+            members = [it for it in items if it["grp"] == grp]
+            if len(members) < 2:
+                continue
+            last = max(members, key=lambda it: it["b"])
+            for it in items:
+                if it["grp"] != grp and it["aid"] == last["bid"] and it["b"] > last["b"] and it["voice"] == last["voice"]:
+                    union(items.index(last), items.index(it))
+                    again = True
+                    break
+            if again:
+                break
+    for grp in {it["grp"] for it in items}:
+        members = sorted((it for it in items if it["grp"] == grp), key=lambda it: it["a"])
+        if len(members) < 2:
+            continue
+        first, last = members[0], max(members, key=lambda it: it["b"])
+        first["el"].set("endid", "#" + last["bid"])
+        for it in members[1:]:
+            it["el"].getparent().remove(it["el"])
+        merged = True
+    return merged
+
+
 def _adjust_mei(tk, path, hidden, cross) -> set[str]:
     """Work around Verovio's MusicXML import by re-loading the score through MEI:
     * hidden staves (print-object="no"): marked invisible, their xml:ids returned so that
@@ -401,6 +509,8 @@ def _adjust_mei(tk, path, hidden, cross) -> set[str]:
     ns = {"m": MEI_NS}
     root = etree.fromstring(tk.getMEI().encode("utf8"))
     changed = _fix_cross_staff_clefs(root) if cross else False
+    if cross:
+        changed = _merge_slur_chains(root) or changed
     ids: set[str] = set()
     if hidden:
         for measure in root.iterfind(".//m:measure", ns):
@@ -574,7 +684,8 @@ class _Builder:
                     self._unit(ch, next(iter(c & STATIC)), si, static=not mid, mid=mid)
             elif c & STRUCTURE:
                 found += self._walk(ch, next(iter(c & STRUCTURE)), si)
-            elif parent in ("measure", "layer") and self._drawable(ch):
+            elif (parent in ("measure", "layer") or "spanning" in c) and self._drawable(ch):
+                # "spanning": the part of a slur/8va/hairpin... that continues on the next system
                 kind = next((k for k in (ch.get("class") or "g").split() if k != "autogenerated"), "g")
                 self._unit(ch, kind, si)
         return found
@@ -638,6 +749,7 @@ class _Builder:
                     anchors[r["system"]].append((x, r["time"]))
         for a in anchors:
             a.sort()
+        self.anchors = anchors
         chords = [[] for _ in range(nsys)]   # per system: (x, y0, y1, time) of every note, for arpeggio signs
         for r in self.recs:
             if r["kind"] in NOTE_KINDS and r["time"] is not None and r["box"] is not None:
@@ -681,6 +793,7 @@ class _Builder:
 
     # -- svg documents -------------------------------------------------------------------
     def _doc(self, el, rect):
+        _flatten_text(el)
         hrefs = {(u.get(_HREF) or "").lstrip("#") for u in el.iter(_USE)}
         defs = b"".join(self.defs_xml[h] for h in hrefs if h in self.defs_xml)
         x, y, w, h = rect
@@ -716,6 +829,29 @@ class _Builder:
             steps.append((uid, t, frac))
         return tuple(steps)
 
+    def _line_steps(self, r, rect):
+        """Like `_steps`, for lines without member notes: reveal up to the latest note under the line."""
+        a = self.anchors[r["system"]]
+        if not a or r["box"] is None:
+            return ()
+        b = r["box"]
+        xs = [p[0] for p in a]
+        i0 = max(bisect_right(xs, b[0] + POSITION_TOLERANCE) - 1, 0)
+        i1 = max(bisect_right(xs, b[2] - POSITION_TOLERANCE) - 1, i0)
+        steps, last_t = [], None
+        for x, t in a[i0:i1 + 1]:
+            if t == last_t:
+                continue
+            last_t = t
+            px = _xf_box((x, 0, x, 0), self.m)[0]
+            steps.append([-1, t, min(max((px + 120 - rect[0]) / max(rect[2], 1e-6), 0.0), 1.0)])
+        if len(steps) < 2:
+            return ()
+        steps[-1][2] = 1.0
+        for i in range(1, len(steps)):
+            steps[i][2] = max(steps[i][2], steps[i - 1][2])
+        return tuple(tuple(st) for st in steps)
+
     def _make_units(self):
         out = []
         for r in self.recs:
@@ -726,7 +862,8 @@ class _Builder:
             out.append(Unit(uid=r["n"], kind=r["kind"], svg=self._doc(r["el"], rect), rect=rect,
                             time=r["time"], end=r["end"], system=r["system"],
                             wipe=r["kind"] in WIPE_KINDS and span > 0.12, static=r["static"],
-                            steps=self._steps(r, rect) if r["members"] else ()))
+                            steps=self._steps(r, rect) if r["members"] else
+                            self._line_steps(r, rect) if r["kind"] in LINE_KINDS and span > 0.12 else ()))
         return out
 
     def _make_static(self, systems, score):
