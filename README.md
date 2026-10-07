@@ -27,7 +27,7 @@ python -m venv .venv
 | Select | Click any engraved element, or click the white space of a measure (`Shift+click` for a range, `Ctrl+click` to add). |
 | Fix one element | With elements selected, the Selection tab sets *Reveal earlier / later*. Everything except noteheads, stems/flags and beams can be **dragged** to move it and resized by dragging a corner handle (*Reset position* undoes it). Clefs, key/time signatures, barlines… at the start of a staff are always visible until you tick *Reveal with the music* or give them a time. |
 | Hide things in measures | With measures selected, the Selection tab has a drop-down of categories (fingerings, tuplet numbers, articulations, dynamics, slurs, …) that can be switched off for those measures. |
-| Change the line breaks | Select the first measure of a line and press *Move this line up*: the whole line joins the previous one. The canvas and the camera keys follow. |
+| Change the line breaks | Select the first measure of a line and press *Move this line up*: the whole line joins the previous one. Select a measure in the middle of a line and press *Move from here to the next line*: it and the measures after it on that line move to the start of the next line (a new line is made after the last one) and get their own clefs, key signature and bracket. The canvas (width and height) and the camera keys follow. |
 | Output | Resolution, frame rate, audio (built-in piano synth, your own audio file, or none) → **Render video…** or **Save current frame as PNG…**. |
 | Projects | `Ctrl+S` saves a `.smanim` file (camera keys, timing tweaks, hidden categories, moved elements, line breaks, settings). |
 

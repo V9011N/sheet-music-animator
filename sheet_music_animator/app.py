@@ -1,6 +1,7 @@
 """Main window."""
 from __future__ import annotations
 
+from bisect import bisect_right
 import sys
 import tempfile
 import time
@@ -369,6 +370,11 @@ class MainWindow(QMainWindow):
         self.btn_line_up = QPushButton("Move this line up to the previous line")
         self.btn_line_up.clicked.connect(self.move_lines_up)
         gl.addWidget(self.btn_line_up)
+        self.btn_line_down = QPushButton("Move from here to the next line")
+        self.btn_line_down.setToolTip("This measure and the ones after it on its line move to the start of the next "
+                                      "line (a new line is made after the last one)")
+        self.btn_line_down.clicked.connect(self.move_measures_down)
+        gl.addWidget(self.btn_line_down)
         self.grp_measures.setVisible(False)
         f.addRow(self.lbl_sel)
         f.addRow(self.chk_timed)
@@ -948,6 +954,7 @@ class MainWindow(QMainWindow):
                 cb.setCheckState(Qt.Unchecked if all(hidden) else Qt.Checked if not any(hidden) else Qt.PartiallyChecked)
             starts = set(self.score.line_starts[1:])
             self.btn_line_up.setVisible(any(m in starts for m in measures))
+            self.btn_line_down.setVisible(any(m not in self.score.line_starts for m in measures))
         self._updating = False
 
     def _retime_selection(self, change):
@@ -1024,6 +1031,32 @@ class MainWindow(QMainWindow):
         self.project.line_starts = [m for m in starts if m not in drop]
         self.project.settings.layout = "pages" if len(self.project.line_starts) > 1 else "horizontal"
         if self.load_score(old_score=old, fresh=False):
+            self.commit()
+
+    def move_measures_down(self):
+        """The selected measure, and every measure after it on its line, move to the start of the next line;
+        after the last line a new one is made.  The system's clefs, key signature and bracket are engraved
+        by Verovio at the start of every line."""
+        if not self.scene:
+            return
+        starts = list(self.score.line_starts)
+        first: dict[int, int] = {}   # line -> its first selected measure that is not the line's first
+        for m in self._sel_measures:
+            li = bisect_right(starts, m) - 1
+            if m != starts[li]:
+                first[li] = min(m, first.get(li, m))
+        if not first:
+            return
+        for li in sorted(first, reverse=True):   # from the last line up, so the line numbers stay valid
+            if li + 1 < len(starts):
+                starts[li + 1] = first[li]
+            else:
+                starts.append(first[li])
+        old = self.score
+        self.project.line_starts = starts
+        self.project.settings.layout = "pages"
+        if self.load_score(old_score=old, fresh=False):
+            self._sync_settings_to_ui()
             self.commit()
 
     # ================================================================== output
