@@ -28,7 +28,10 @@ python -m venv .venv
 | Fix one element | With elements selected, the Selection tab sets *Reveal earlier / later*. Everything except noteheads, stems/flags and beams can be **dragged** to move it and resized by dragging a corner handle (*Reset position* undoes it). Clefs, key/time signatures, barlines… at the start of a staff are always visible until you tick *Reveal with the music* or give them a time. |
 | Hide things in measures | With measures selected, the Selection tab has a drop-down of categories (fingerings, tuplet numbers, articulations, dynamics, slurs, …) that can be switched off for those measures. |
 | Change the line breaks | Select the first measure of a line and press *Move this line up*: the whole line joins the previous one. Select a measure in the middle of a line and press *Move from here to the next line*: it and the measures after it on that line move to the start of the next line (a new line is made after the last one) and get their own clefs, key signature and bracket. The canvas (width and height) and the camera keys follow. |
-| Output | Resolution, frame rate, audio (built-in piano synth, your own audio file, or none) → **Render video…** or **Save current frame as PNG…**. |
+| Fit to a recording | Output tab → **Fit the score to a recording…**. The app listens to the recording (any audio file) and moves every note of the score to where it is played, then uses the recording as the soundtrack. Keyframes already placed move along with the music. **Use the score's own timing** goes back. |
+| Produced look | **Effects** tab → *Produced look*: an animated backdrop (sky gradient, drifting mist, wind-blown snow, dark corners), notes that light up when they sound (right hand cyan, left hand amber, with a bloom), camera shake / zoom punch on loud dynamics and accents, a title card, side fades, a spotlight on chosen measures and a fade to black. The **mood** (calm → storm), **hush** and **snow lift** automation lanes appear in the timeline while it is on. *Show the effects in the camera view* previews it. |
+| Presets | Effects tab → **Apply preset** → *Winter Wind (storm)* sets all of the above, and the camera, from the measure numbers of the score (align the score to its recording first). |
+| Output | Resolution, frame rate, audio (built-in piano synth, your own audio file, or none) → **Render video…** or **Save current frame as PNG…**. With the produced look on, a render uses one process per slice of the video (set how many in the Output tab; you can render just a part to try things out). |
 | Projects | `Ctrl+S` saves a `.smanim` file (camera keys, timing tweaks, hidden categories, moved elements, line breaks, settings). |
 
 Staves that MuseScore hid because they are empty (`print-object="no"` in the exported MusicXML) stay hidden for those systems; Verovio ignores this itself, so the animator removes them.
@@ -43,11 +46,50 @@ Staves that MuseScore hid because they are empty (`print-object="no"` in the exp
   exporter all draw this same scene, so the preview is exactly what is rendered.
 * `export.py` – draws the camera rectangle for every frame and pipes raw frames to ffmpeg
   (bundled through `imageio-ffmpeg`). A 2-minute piece at 1080p/30 renders in about half a minute.
+* `analysis.py` – loudness of a recording, and the alignment of the score to it: semitone-resolved
+  features of the recording and of the score (with per-pitch onset detectors) are matched by dynamic time
+  warping, coarse then fine, and every note onset is then snapped to the strongest attack of its own
+  pitches (Viterbi over candidate attacks).  Checked against the note timing the first Winter Wind
+  renderer had worked out for Kissin's recording (with its note list standing in for the score), 80% of
+  the notes agree within 30 ms and 96% within 120 ms.
+* `effects.py` – `EffectTracks` (everything that varies with time: wind from loudness and note density,
+  shake/punch/flash from dynamics and accents, mood, vignette, fades) and `Compositor` (backdrop, snow,
+  the score's ink as an alpha mask drawn by Qt, per-note light-up with bloom, spotlight, title).
+  `effects_ui.py` is its tab; `presets.py` holds the looks.
+* `export.py` – besides the plain renderer, `EffectsRenderer` makes one finished frame and
+  `render_video_parallel` renders slices of the video in separate processes and joins them.
+* `cli.py` – the same pipeline without a window (see below).
 * `audio.py` – a small additive piano synth driven by the notes in the file, so there is sound
   without a soundfont. Supply your own recording in the Output tab for anything better.
+
+## Recreating the Winter Wind video
+
+The "Winter Wind" look (calm Lento introduction, storm from bar 5, lit-up notes, shake on the loud chords,
+final spotlight on bar 96) is a preset. You need the MusicXML of the piece (96 measures) and the recording.
+
+* In the editor: **Open MusicXML…** (4 measures per line) → Output tab: **Fit the score to a recording…** →
+  Effects tab: **Apply preset** → look at it with *Show the effects in the camera view* → **Render video…**.
+* Or in one command: see below. Apply the preset *after* fitting; it places its cues by measure number.
+
+## Rendering without the editor
+
+```
+python -m sheet_music_animator.cli render "Winter Wind.mxl" --audio recording.mp3 --align --preset winter_wind --out winter_wind.mp4
+```
+
+`--align` fits the score to the recording, `--preset` applies a look, `--start/--end` render only a part,
+`--workers N` sets the number of processes, `--save-project x.smanim` keeps the result for the editor.
+An existing `.smanim` project can be rendered the same way.
 
 ## Known limits
 
 * Notes are engraved by Verovio, so the layout is Verovio's, not your notation program's.
 * Only the first page is used; the lines are stacked on one tall page (or laid out on a single line).
 * Clefs/key/time signatures at the start of a staff, barlines and the like are always visible unless you time them in the Selection tab.
+* Fitting a score to a recording works best for piano-like music; very free rubato or a recording that
+  differs from the score (cuts, repeats taken differently) can leave stretches off by a few tenths of a
+  second.  Check the timeline density and the lit-up notes, and nudge single notes in the Selection tab.
+* Rendering with the produced look takes time: about 0.05 s of compositing per 1080p frame, and the
+  processes share the machine's memory bandwidth, so a render tops out around 35-40 frames per second
+  however many cores there are (a 3.5-minute 60 fps video: roughly 6 minutes; 1080p30 or 720p60 is
+  2-4 times quicker). Try things out with *Render only from … to …* first.

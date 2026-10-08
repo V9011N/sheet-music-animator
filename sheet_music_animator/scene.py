@@ -7,7 +7,7 @@ from bisect import bisect_left, bisect_right
 from PySide6.QtCore import QByteArray, QPointF, QRectF, Qt, Signal
 from PySide6.QtGui import QBrush, QColor, QPainter, QPainterPath, QPen, QPicture, QMouseEvent, QPolygonF, QPixmap, QPixmapCache, QTransform
 from PySide6.QtSvg import QSvgRenderer
-from PySide6.QtWidgets import (QGraphicsItem, QGraphicsScene, QGraphicsView, QStyle, QWidget)
+from PySide6.QtWidgets import (QGraphicsItem, QGraphicsScene, QGraphicsView, QLabel, QStyle, QWidget)
 
 from .engraver import FONT_TOKEN, NOTE_KINDS, REST_KINDS, Score
 from .project import CATEGORIES, FIXED_KINDS, Project
@@ -102,7 +102,7 @@ class SvgItem(QGraphicsItem):
                 self._draw_lowres(painter, r, lod)
             else:
                 self._draw(painter)
-        if option.state & QStyle.State_Selected:
+        if option.state & QStyle.State_Selected and not getattr(self.scene(), "rendering", False):
             lod = max(option.levelOfDetailFromTransform(painter.worldTransform()), 1e-9)
             self._lod = lod
             box = r.adjusted(10, 10, -10, -10)
@@ -190,7 +190,7 @@ class MeasureItem(QGraphicsItem):
         return path
 
     def paint(self, painter, option, widget=None):
-        if option.state & QStyle.State_Selected:
+        if option.state & QStyle.State_Selected and not getattr(self.scene(), "rendering", False):
             painter.setPen(QPen(QColor("#2f7bff"), 0))
             painter.setBrush(QColor(47, 123, 255, 45))
             painter.drawRect(self._rect)
@@ -240,6 +240,7 @@ class SheetScene(QGraphicsScene):
             self.addItem(it)
             self.items_by_uid[u.uid] = it
             self._items.append(it)
+        self.rendering = False       # while a frame is rendered selection marks are not drawn
         self._state: list[tuple | None] = [None] * len(self._items)
         self._cat_hidden = [False] * len(self._items)   # hidden by a category of its measure
         self._measure_times = [t for t, _ in score.measures]
@@ -625,6 +626,9 @@ class PreviewWidget(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.view = PreviewView(self)
+        self.label = QLabel(self)            # shows a finished frame (with effects) instead of the live view
+        self.label.setScaledContents(True)
+        self.label.hide()
         self.aspect = 16 / 9
         self.setMinimumSize(240, 135)
         self.setStyleSheet("background:#111;")
@@ -641,4 +645,17 @@ class PreviewWidget(QWidget):
         vw = min(w, int(h * self.aspect))
         vh = int(vw / self.aspect)
         self.view.setGeometry((w - vw) // 2, (h - vh) // 2, vw, vh)
+        self.label.setGeometry(self.view.geometry())
         self.view._apply()
+
+    def show_image(self, image):
+        """Show a QImage in place of the live view (None: back to the live view)."""
+        if image is None:
+            if self.label.isVisible():
+                self.label.hide()
+                self.view.show()
+            return
+        self.label.setPixmap(QPixmap.fromImage(image))
+        if not self.label.isVisible():
+            self.view.hide()
+            self.label.show()

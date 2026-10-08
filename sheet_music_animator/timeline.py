@@ -6,10 +6,11 @@ from PySide6.QtGui import QColor, QFont, QPainter, QPen, QPolygonF
 from PySide6.QtWidgets import QMenu, QWidget
 
 from .engraver import NOTE_KINDS
-from .project import CHANNEL_LABELS, CHANNELS, EASES, Project
+from .project import CAMERA_CHANNELS, CHANNEL_LABELS, CHANNELS, EASES, EFFECT_CHANNELS, Project
 
 GUTTER, RULER_H, NOTES_H, CAM_H = 84, 24, 30, 26
-CHANNEL_COLORS = {"pos": "#ff9f1a", "size": "#34c759", "rot": "#bf5af2"}
+CHANNEL_COLORS = {"pos": "#ff9f1a", "size": "#34c759", "rot": "#bf5af2",
+                  "mood": "#5ac8fa", "hush": "#8e8e93", "lift": "#ffd60a"}
 STEPS = (0.1, 0.25, 0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300, 600)
 
 
@@ -24,6 +25,7 @@ class Timeline(QWidget):
     keysEditFinished = Signal()          # a drag or an edit of keyframes is complete (for undo)
     addKeyRequested = Signal(str, float)
     channelsChanged = Signal()
+    selectionChanged = Signal()           # the set of selected keyframes changed
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -34,7 +36,7 @@ class Timeline(QWidget):
         self.view_start, self.view_span = 0.0, 10.0
         self.selected: set = set()    # the selected Keys (of any channel)
         self._anchor = None           # (channel, key) of the last plain/ctrl click, for shift-click ranges
-        self.visible_channels = [c for c in CHANNELS]
+        self.visible_channels = list(CAMERA_CHANNELS)
         self._drag = None
         self._panning = None
         self._density: list[int] = []
@@ -83,6 +85,7 @@ class Timeline(QWidget):
         if self.project:
             self.selected = {k for ch in self.visible_channels for k in self.project.channels[ch]}
             self.update()
+            self.selectionChanged.emit()
 
     # ---- coordinate helpers -------------------------------------------------------------------------
     def _x(self, t):
@@ -191,6 +194,9 @@ class Timeline(QWidget):
                     p.setBrush(QColor("#ffffff") if k in self.selected else color)
                     p.setPen(QPen(color.darker(220), 1))
                     p.drawPolygon(poly)
+                    if ch in EFFECT_CHANNELS:   # the value of an automation key
+                        p.setPen(dim)
+                        p.drawText(QPointF(x + 8, cy - 5), f"{k.v[0]:.2f}")
 
         # playhead
         x = self._x(self.t)
@@ -214,6 +220,12 @@ class Timeline(QWidget):
         return pos.x() < GUTTER and self._lane_y(0) <= pos.y() <= self._lane_y(0) + CAM_H
 
     def mousePressEvent(self, e):
+        before = set(self.selected)
+        self._press(e)
+        if self.selected != before:
+            self.selectionChanged.emit()
+
+    def _press(self, e):
         self.setFocus()
         pos = e.position()
         if e.button() == Qt.MiddleButton:
@@ -350,6 +362,7 @@ class Timeline(QWidget):
         self.keysChanged.emit()
         self.keysEditFinished.emit()
         self.update()
+        self.selectionChanged.emit()
 
     def keyPressEvent(self, e):
         if e.key() in (Qt.Key_Delete, Qt.Key_Backspace):

@@ -8,8 +8,14 @@ from pathlib import Path
 from .engraver import NOTE_KINDS, REST_KINDS, Score
 
 EASES = ("smooth", "linear", "hold")
-CHANNELS = ("pos", "size", "rot")
-CHANNEL_LABELS = {"pos": "Position", "size": "Frame size", "rot": "Rotation"}
+CAMERA_CHANNELS = ("pos", "size", "rot")
+# Automation of the look (0..1): how stormy it is, how hushed (a dimming before the storm), and how strongly
+# the snow is lifted upwards (the finale).  Keyframed on the timeline like the camera.
+EFFECT_CHANNELS = ("mood", "hush", "lift")
+CHANNELS = CAMERA_CHANNELS + EFFECT_CHANNELS
+CHANNEL_LABELS = {"pos": "Position", "size": "Frame size", "rot": "Rotation",
+                  "mood": "Mood (calm → storm)", "hush": "Hush", "lift": "Snow lift"}
+EFFECT_DEFAULTS = {"mood": 1.0, "hush": 0.0, "lift": 0.0}   # value of a channel without keyframes
 
 # Categories of engravings that can be switched off per measure: name -> SVG classes that make them up.
 # A class that is a whole element (a fingering, a dynamic) hides that element; a class inside a
@@ -44,6 +50,46 @@ class Key:
 
 
 @dataclass
+class Effects:
+    """The "produced" look of the video: animated backdrop, note light-up, reactions to the music, title.
+    Colours are #rrggbb strings; nothing here is used unless `enabled`."""
+    enabled: bool = False
+    # backdrop (each is [top, bottom]); the mood channel blends from calm to storm
+    bg_calm: list = field(default_factory=lambda: ["#0e1424", "#1a2238"])
+    bg_storm: list = field(default_factory=lambda: ["#060a14", "#10192c"])
+    mist: float = 1.0            # drifting fog (0..1)
+    snow: float = 1.0            # blown snow (0..1)
+    vignette: float = 1.0        # dark corners (0..1)
+    # the notation itself
+    ink_calm: str = "#bec8de"
+    ink_storm: str = "#ecf3fc"
+    edge_fade: float = 0.125     # fraction of the frame width over which the score fades out at each side
+    # light-up of notes as they sound: staff 1 (right hand) and staff 2 (left hand)
+    flash: bool = True
+    flash_colors: list = field(default_factory=lambda: ["#78deff", "#ffc070"])
+    flash_time: float = 0.45     # seconds a note keeps glowing
+    glow: float = 1.6            # strength of the bloom around lit notes
+    # reactions to the music
+    react: float = 1.0           # wind and snow follow loudness and how many notes are playing
+    shake: float = 1.0           # camera shake on loud events
+    punch: float = 1.0           # zoom punch on loud events
+    breathe: float = 1.0         # slow zoom with loudness
+    use_dynamics: bool = True    # f, ff, fff, sfz ... markings cause events
+    use_accents: bool = True     # accents and marcatos cause events
+    impulses: list = field(default_factory=list)      # [{"t": seconds, "s": 0..1}]
+    hits: list = field(default_factory=list)          # [{"m0": measure, "m1": measure, "s": 0..1}]: every note onset
+    spotlights: list = field(default_factory=list)    # [{"t", "ramp", "end", "m0", "m1"}]: only those measures stay visible
+    # text and fades
+    title: str = ""
+    subtitle: str = ""
+    title_font: str = "Times New Roman"
+    title_color: str = "#dee8f6"
+    title_in: list = field(default_factory=lambda: [0.6, 2.2])     # start, fade-in seconds
+    title_out: list = field(default_factory=lambda: [0.0, 2.5])    # start (0 = stays), fade-out seconds
+    fade_out: float = 1.0        # the picture fades to black this many seconds before the end
+
+
+@dataclass
 class Settings:
     layout: str = "pages"        # "pages" (lines stacked) or "horizontal" (one long line); see measures_per_line
     measures_per_line: int = 4   # measures in each line (0 = the whole score on one line)
@@ -61,7 +107,10 @@ class Settings:
     paper: str = "#ffffff"
     audio: str = "synth"         # "synth", "none", or a path to an audio file
     crf: int = 16
+    preset: str = "medium"       # x264 speed/size trade-off (ultrafast ... veryslow); faster = bigger files
     follow_width: float = 14000.0  # camera width (page units) used by the automatic camera path
+    follow_lead: float = 0.25    # where "now" sits in the frame (fraction from the left) when following the music
+    align_audio: str = ""        # recording the score timing was fitted to ("" = the score's own timing)
 
     @property
     def aspect(self) -> float:
@@ -106,6 +155,8 @@ class Project:
     hidden: dict[int, set[str]] = field(default_factory=dict)   # measure index -> hidden CATEGORIES
     transforms: dict[int, list[float]] = field(default_factory=dict)   # unit uid -> [dx, dy, scale]
     line_starts: list[int] | None = None   # measure index that starts each line (None: every measures_per_line)
+    effects: Effects = field(default_factory=Effects)
+    time_map: list = field(default_factory=list)   # [[score seconds, recording seconds], ...] from aligning to audio
 
     # ---- camera ---------------------------------------------------------------------
     def has_keys(self) -> bool:
@@ -146,7 +197,7 @@ class Project:
         if cur is not None:
             now = {"pos": [cur[0], cur[1]], "size": [cur[2]], "rot": [cur[3]]}
         out = []
-        for ch in CHANNELS:
+        for ch in CAMERA_CHANNELS:
             keys = self.channels[ch]
             if now[ch] is not None and all(abs(a - b) < 1e-6 for a, b in zip(now[ch], wanted[ch])):
                 continue
@@ -169,14 +220,63 @@ class Project:
         existing = next((k for k in keys if abs(k.t - t) <= snap), None)
         if existing is not None:
             return existing
-        cur = self.camera_at(t)
-        if cur is None:
-            return None
-        k = Key(t, {"pos": [cur[0], cur[1]], "size": [cur[2]], "rot": [cur[3]]}[channel])
+        if channel in EFFECT_CHANNELS:
+            k = Key(t, [self.effect_at(channel, t)])
+        else:
+            cur = self.camera_at(t)
+            if cur is None:
+                return None
+            k = Key(t, {"pos": [cur[0], cur[1]], "size": [cur[2]], "rot": [cur[3]]}[channel])
         keys.append(k)
         keys.sort(key=lambda q: q.t)
-        self.keys_edited = True
+        if channel in CAMERA_CHANNELS:
+            self.keys_edited = True
         return k
+
+    def effect_at(self, channel: str, t: float) -> float:
+        """Value (0..1) of an effect channel at time t."""
+        v = _interp(self.channels[channel], t, "scalar")
+        return EFFECT_DEFAULTS[channel] if v is None else float(v[0])
+
+    def sample_effect(self, channel: str, times):
+        """effect_at for many times at once (numpy arrays)."""
+        import numpy as np
+        t = np.asarray(times, dtype=np.float64)
+        keys = self.channels[channel]
+        if not keys:
+            return np.full(len(t), EFFECT_DEFAULTS[channel], np.float32)
+        out = np.empty(len(t), np.float64)
+        out[:] = keys[-1].v[0]
+        out[t < keys[0].t] = keys[0].v[0]
+        for a, b in zip(keys, keys[1:]):
+            m = (t >= a.t) & (t < b.t)
+            if not m.any():
+                continue
+            if a.ease == "hold":
+                out[m] = a.v[0]
+                continue
+            u = (t[m] - a.t) / max(b.t - a.t, 1e-9)
+            if a.ease == "smooth":
+                u = u * u * (3 - 2 * u)
+            out[m] = a.v[0] + (b.v[0] - a.v[0]) * u
+        return out.astype(np.float32)
+
+    def retime(self, fn) -> None:
+        """Move everything that is placed in time (keyframes, events, spotlights, title cues) with `fn`,
+        e.g. when the score is aligned to a recording and its notes move."""
+        for ch in CHANNELS:
+            for k in self.channels[ch]:
+                k.t = max(float(fn(k.t)), 0.0)
+            self.channels[ch].sort(key=lambda q: q.t)
+        fx = self.effects
+        for im in fx.impulses:
+            im["t"] = float(fn(im["t"]))
+        for sp in fx.spotlights:
+            sp["t"] = float(fn(sp["t"]))
+            if sp.get("end", 0) > 0:
+                sp["end"] = float(fn(sp["end"]))
+        if fx.title_out[0] > 0:
+            fx.title_out[0] = float(fn(fx.title_out[0]))
 
     def all_keys(self):
         return [(ch, k) for ch in CHANNELS for k in self.channels[ch]]
@@ -225,13 +325,13 @@ class Project:
 
     # ---- persistence -----------------------------------------------------------------------
     def to_dict(self) -> dict:
-        return {"version": 2, "xml_path": self.xml_path, "settings": asdict(self.settings),
+        return {"version": 3, "xml_path": self.xml_path, "settings": asdict(self.settings),
                 "channels": {ch: [{"t": k.t, "v": k.v, "ease": k.ease} for k in self.channels[ch]] for ch in CHANNELS},
                 "overrides": {str(k): v for k, v in sorted(self.overrides.items())},
                 "keys_edited": self.keys_edited, "timed": sorted(self.timed),
                 "hidden": {str(m): sorted(c) for m, c in sorted(self.hidden.items()) if c},
                 "transforms": {str(u): list(v) for u, v in sorted(self.transforms.items())},
-                "line_starts": self.line_starts}
+                "line_starts": self.line_starts, "effects": asdict(self.effects), "time_map": self.time_map}
 
     def snapshot(self) -> str:
         return json.dumps(self.to_dict(), sort_keys=True)
@@ -258,6 +358,9 @@ class Project:
         self.hidden = {int(m): set(c) for m, c in d.get("hidden", {}).items()}
         self.transforms = {int(u): list(v) for u, v in d.get("transforms", {}).items()}
         self.line_starts = d.get("line_starts")
+        known_fx = Effects.__dataclass_fields__
+        self.effects = Effects(**{k: v for k, v in d.get("effects", {}).items() if k in known_fx})
+        self.time_map = [list(p) for p in d.get("time_map", [])]
 
     def restore(self, snapshot: str) -> None:
         self.load_dict(json.loads(snapshot))
@@ -270,6 +373,29 @@ class Project:
         p = cls()
         p.load_dict(json.loads(Path(path).read_text(encoding="utf8")))
         return p
+
+
+def time_map_function(points):
+    """f(t) for a time map [[score seconds, recording seconds], ...] (identity for an empty map)."""
+    import numpy as np
+    if not points or len(points) < 2:
+        return lambda t: t
+    xs = [float(p[0]) for p in points]
+    ys = [float(p[1]) for p in points]
+    lo, hi = ys[0] - xs[0], ys[-1] - xs[-1]
+    return lambda t: t + lo if t <= xs[0] else t + hi if t >= xs[-1] else float(np.interp(t, xs, ys))
+
+
+def retimer(old_points, new_points, grid):
+    """A function taking a time in the output of the old time map to the matching time of the new one.
+    `grid`: score times (seconds) at which both maps are compared."""
+    import numpy as np
+    f_old, f_new = time_map_function(old_points), time_map_function(new_points)
+    g = sorted(set(float(x) for x in grid))
+    old = np.array([f_old(x) for x in g])
+    new = np.array([f_new(x) for x in g])
+    o = np.maximum.accumulate(old)
+    return lambda t: float(new[0] + (t - o[0]) if t <= o[0] else new[-1] + (t - o[-1]) if t >= o[-1] else np.interp(t, o, new))
 
 
 # --------------------------------------------------------------------------------------------
@@ -328,7 +454,7 @@ def _auto_keys(score: Score, settings: Settings) -> list:
         lo, hi = x + fw / 2 - 150, x + w - fw / 2 + 150
 
         def at(t, i=i, fw=fw, lo=lo, hi=hi):
-            return min(max(score.now_x(i, t) + 0.25 * fw, lo), hi)
+            return min(max(score.now_x(i, t) + (0.5 - settings.follow_lead) * fw, lo), hi)
 
         keys.append(CameraKey(arrive, at(s.start), cy, fw, "linear"))
         for t, _ in score.measures:
@@ -343,8 +469,9 @@ def _auto_keys(score: Score, settings: Settings) -> list:
 
 
 def auto_camera(score: Score, settings: Settings) -> dict:
-    """The automatic camera path as keyframe channels (position changes often, frame size rarely)."""
-    out = _blank_channels()
+    """The automatic camera path as keyframe channels (position changes often, frame size rarely).
+    Only the camera channels: `project.channels.update(auto_camera(...))` leaves the effect channels alone."""
+    out = {c: [] for c in CAMERA_CHANNELS}
     last_w = None
     for k in _auto_keys(score, settings):
         out["pos"].append(Key(k.t, [k.cx, k.cy], k.ease))
