@@ -1,0 +1,359 @@
+"""Audio analysis: loudness of a recording and alignment of the score to it.
+
+`align_score` fits the (mechanical) timing of the MusicXML to a real performance: it compares
+pitch-class features of the recording with features synthesised from the score (dynamic time warping,
+coarse to fine) and then snaps every note onset to the nearest attack of that note's pitch.
+The result is a monotone time map (score seconds -> recording seconds) that `Score.warp` applies.
+"""
+from __future__ import annotations
+
+import hashlib
+import os
+import subprocess
+import tempfile
+from dataclasses import dataclass
+from pathlib import Path
+
+import imageio_ffmpeg
+import numpy as np
+from numpy.lib.stride_tricks import sliding_window_view
+
+SR = 22050
+_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
+
+
+# ------------------------------------------------------------------------------------ loading
+def decode_audio(path: str, sr: int = SR) -> np.ndarray:
+    """Mono float32 samples of any audio/video file (decoded by the bundled ffmpeg)."""
+    proc = subprocess.run([imageio_ffmpeg.get_ffmpeg_exe(), "-v", "error", "-i", str(path), "-vn",
+                           "-f", "f32le", "-ac", "1", "-ar", str(sr), "-"],
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, creationflags=_NO_WINDOW)
+    if proc.returncode != 0 or not proc.stdout:
+        raise ValueError("Could not read audio from %s\n%s" % (path, proc.stderr.decode(errors="replace")[-400:]))
+    return np.frombuffer(proc.stdout, np.float32)
+
+
+def _cache_path(path: str, tag: str) -> Path:
+    st = os.stat(path)
+    key = hashlib.sha1(f"{os.path.abspath(path)}|{st.st_size}|{st.st_mtime_ns}|{tag}".encode()).hexdigest()[:16]
+    d = Path(tempfile.gettempdir()) / "sheet_music_animator"
+    d.mkdir(exist_ok=True)
+    return d / f"{key}.npy"
+
+
+def loudness(path: str, fps: int = 100) -> tuple[np.ndarray, int]:
+    """RMS amplitude of the recording, `fps` values per second (cached; first call decodes the file)."""
+    cache = _cache_path(path, f"rms{fps}")
+    if cache.exists():
+        return np.load(cache), fps
+    y = decode_audio(path)
+    hop = SR // fps
+    n = len(y) // hop
+    rms = np.sqrt(np.mean(y[:n * hop].reshape(n, hop).astype(np.float64) ** 2, axis=1)).astype(np.float32)
+    np.save(cache, rms)
+    return rms, fps
+
+
+# ------------------------------------------------------------------------------------ features
+def stft_mag(y: np.ndarray, n_fft: int, hop: int) -> np.ndarray:
+    """|STFT| (frames x bins); frame i is centred on sample i*hop."""
+    y = np.pad(y, n_fft // 2)
+    win = np.hanning(n_fft).astype(np.float32)
+    frames = sliding_window_view(y, n_fft)[::hop]
+    out = np.empty((len(frames), n_fft // 2 + 1), np.float32)
+    for s in range(0, len(frames), 512):
+        out[s:s + 512] = np.abs(np.fft.rfft(frames[s:s + 512] * win, axis=1))
+    return out
+
+
+LO_MIDI, HI_MIDI = 33, 105              # pitch range that is compared (A1 .. A7)
+NP = HI_MIDI - LO_MIDI + 1
+LEVEL_W, FLUX_W = 0.75, 1.0             # weights of "what sounds" and "what just started" in the match
+
+
+SPLIT_MIDI = 55          # below this the long window is used (bass notes need the frequency resolution)
+
+
+def _band_matrix(n_fft: int, lo: int, hi: int):
+    """Maps spectrum bins to semitone bins (columns of the full LO_MIDI..HI_MIDI range); only pitches lo..hi."""
+    f = np.fft.rfftfreq(n_fft, 1 / SR)
+    sel = np.nonzero((f >= 40.0) & (f <= 3800.0))[0]
+    midi = np.round(69 + 12 * np.log2(f[sel] / 440.0)).astype(int)
+    ok = (midi >= max(lo, LO_MIDI)) & (midi <= min(hi, HI_MIDI))
+    M = np.zeros((len(f), NP), np.float32)
+    M[sel[ok], midi[ok] - LO_MIDI] = 1.0
+    return M
+
+
+NORM_FLOOR = 0.25      # frames quieter than this fraction of the typical frame are not scaled up to full size
+PENALTY = 0.12         # extra cost of advancing only one of the two sequences
+START_SLACK = 0.0      # seconds the first note may come after the start of the (trimmed) recording
+START_PENALTY = 0.3    # cost per second of that delay
+OPEN_END = False       # let the recording go on after the last note
+END_PENALTY = 0.25
+CORRIDOR = 1.5         # seconds either side of the coarse path searched by the fine alignment
+
+
+def _unit_rows(x: np.ndarray, floor: float = 0.0) -> np.ndarray:
+    n = np.linalg.norm(x, axis=1, keepdims=True)
+    if floor:
+        nz = n[n > 1e-6]
+        n = np.maximum(n, floor * (np.median(nz) if len(nz) else 1.0))
+    return np.where(n > 1e-6, x / np.maximum(n, 1e-9), 0.0).astype(np.float32)
+
+
+def _combine(level: np.ndarray, flux: np.ndarray, floor: float = 0.0) -> np.ndarray:
+    return np.hstack([LEVEL_W * _unit_rows(level, floor), FLUX_W * _unit_rows(flux, floor)]) / np.hypot(LEVEL_W, FLUX_W)
+
+
+def audio_features(y: np.ndarray, fps: int) -> np.ndarray:
+    """Per-semitone loudness of the recording and how much of it is new (an onset detector per pitch)."""
+    n_fft = 4096
+    mag = stft_mag(y, n_fft, SR // fps)
+    ref = np.percentile(mag[:, 20:], 99.5) + 1e-9
+    L = np.log1p(30.0 * mag / ref) @ _band_matrix(n_fft, LO_MIDI, HI_MIDI)
+    L = np.maximum(L - np.percentile(L, 20, axis=0), 0)       # remove the steady noise floor of each pitch
+    k = max(int(round(0.04 * fps)), 1)
+    F = np.zeros_like(L)
+    F[k:] = np.maximum(L[k:] - L[:-k], 0)
+    return _combine(L, F, NORM_FLOOR)
+
+
+PARTIALS = ((0, 1.0), (12, 0.6), (19, 0.45), (24, 0.3), (28, 0.2), (31, 0.15))   # semitones above the fundamental
+
+
+def score_features(notes, fps: int, length: float) -> np.ndarray:
+    """What the score should sound like in the same features: every note contributes its partials."""
+    n = int(length * fps) + 2
+    Lv = np.zeros((n, NP), np.float32)
+    Fx = np.zeros((n, NP), np.float32)
+    tail = np.exp(-np.arange(1, int(0.4 * fps) + 1) / (0.15 * fps))   # the ring after the key is released
+    for pitch, start, end, *_ in notes:
+        v = np.zeros(NP, np.float32)
+        for off, w in PARTIALS:
+            b = pitch + off - LO_MIDI
+            if 0 <= b < NP:
+                v[b] += w
+        a = int(start * fps)
+        e = max(int(end * fps), a + 1)
+        Lv[a:e + 1] += v
+        t = min(e + 1 + len(tail), n)
+        Lv[e + 1:t] += tail[:t - e - 1, None] * v * 0.6
+        Fx[a] += v
+        if a + 1 < n:
+            Fx[a + 1] += 0.5 * v
+    return _combine(Lv, Fx)
+
+
+# ------------------------------------------------------------------------------------ DTW
+def _dtw(X, Y, lo, hi, penalty=None, fps=50):
+    """Dynamic time warping of rows of X against rows of Y inside the window [lo[i], hi[i]) of every row.
+    Cost is cosine distance; stepping along only one sequence costs `penalty` extra.  Returns, for every
+    row of X, the (float) column it is matched to."""
+    penalty = PENALTY if penalty is None else penalty
+    n, m = len(X), len(Y)
+    Ds = []
+    prev, plo = None, 0
+    for i in range(n):
+        a, b = int(lo[i]), int(hi[i])
+        c = (1.0 - Y[a:b] @ X[i]).astype(np.float64)
+        if prev is None:
+            q = np.full(b - a, np.inf)
+            if a == 0:                                         # the first note may sound a little after the recording starts
+                late = np.arange(0, min(b, int(START_SLACK * fps) + 1))
+                q[late] = c[late] + START_PENALTY * late / fps
+        else:
+            ext = np.full(m + 2, np.inf)                       # previous row, indexed by column + 1
+            ext[plo + 1:plo + 1 + len(prev)] = prev
+            j = np.arange(a, b)
+            q = c + np.minimum(ext[j + 1] + penalty, ext[j])   # from above (+penalty) or diagonally
+        T = np.cumsum(c + penalty)
+        D = np.minimum.accumulate(q - T) + T                   # horizontal steps within the row
+        Ds.append(D.astype(np.float32))
+        prev, plo = D, a
+    # backtrace from the best end point (open end: the recording may continue after the last note)
+    i = n - 1
+    a = int(lo[i])
+    tail = np.maximum(m - 1 - np.arange(a, int(hi[i])), 0)
+    j = a + int(np.argmin(Ds[i] + (END_PENALTY * penalty * tail if OPEN_END else np.where(tail > 0, np.inf, 0))))
+    cols = [[] for _ in range(n)]
+    cols[i].append(j)
+    pen = np.float32(penalty)
+    while i > 0 or j > 0:
+        a = int(lo[i])
+        best, step = np.inf, None
+        if i > 0:
+            pa = int(lo[i - 1])
+            Dp = Ds[i - 1]
+            if j - 1 >= pa and j - 1 - pa < len(Dp) and j - 1 >= 0:
+                best, step = Dp[j - 1 - pa], (-1, -1)
+            if pa <= j < pa + len(Dp) and Dp[j - pa] + pen < best:
+                best, step = Dp[j - pa] + pen, (-1, 0)
+        if j > a and Ds[i][j - 1 - a] + pen < best:
+            best, step = Ds[i][j - 1 - a] + pen, (0, -1)
+        if step is None:
+            break
+        i, j = i + step[0], j + step[1]
+        cols[i].append(j)
+    return np.array([np.mean(c) if c else np.nan for c in cols])
+
+
+def _fill(a):
+    idx = np.arange(len(a))
+    good = ~np.isnan(a)
+    return np.interp(idx, idx[good], a[good])
+
+
+@dataclass
+class Alignment:
+    nominal: np.ndarray       # score seconds (anchor points)
+    actual: np.ndarray        # matching seconds in the recording
+    shifts: np.ndarray        # how far the refinement moved each onset from the DTW estimate (s)
+
+    def points(self) -> list:
+        return [[round(float(a), 4), round(float(b), 4)] for a, b in zip(self.nominal, self.actual)]
+
+
+SILENCE = 0.02       # frames quieter than this fraction of the loudest one count as silence at the ends
+
+
+def _active_range(y: np.ndarray, fps: int = 50, floor: float | None = None):
+    floor = SILENCE if floor is None else floor
+    hop = SR // fps
+    n = len(y) // hop
+    rms = np.sqrt(np.mean(y[:n * hop].reshape(n, hop) ** 2, axis=1))
+    loud = np.nonzero(rms > floor * rms.max())[0]
+    return (loud[0] / fps, (loud[-1] + 1) / fps) if len(loud) else (0.0, len(y) / SR)
+
+
+def align_score(notes, audio_path: str, progress=None, refine: bool = True) -> Alignment:
+    """Time map from score time to the recording.  `notes`: (midi pitch, start, end, ...) in score seconds."""
+    say = progress or (lambda f, s="": True)
+    notes = sorted(notes, key=lambda n: n[1])
+    if len(notes) < 8:
+        raise ValueError("The score has too few notes to align.")
+    say(0.02, "Reading the recording…")
+    y = decode_audio(audio_path)
+    a0, a1 = _active_range(y)
+    s0, s1 = notes[0][1], max(n[2] for n in notes)
+    if a1 - a0 < 0.5 * (s1 - s0) * 0.25:
+        raise ValueError("The recording is much shorter than the score.")
+    ya = y[int(a0 * SR):int(a1 * SR)]
+    shifted = [(p, s - s0, e - s0) for p, s, e, *_ in notes]
+    ls = s1 - s0
+
+    # coarse: the whole matrix at 10 frames/s
+    say(0.08, "Coarse alignment…")
+    fc = 10
+    Xc, Yc = score_features(shifted, fc, ls), audio_features(ya, fc)
+    nxc, nyc = len(Xc), len(Yc)
+    wc = _dtw(Xc, Yc, np.zeros(nxc, int), np.full(nxc, nyc), fps=fc)
+    wc = np.maximum.accumulate(_fill(wc))
+
+    # fine: 50 frames/s inside a corridor around the coarse path
+    say(0.25, "Fine alignment…")
+    ff = 50
+    Xf, Yf = score_features(shifted, ff, ls), audio_features(ya, ff)
+    nx, ny = len(Xf), len(Yf)
+    centre = np.interp(np.arange(nx) / ff, np.arange(nxc) / fc, wc / fc) * ff
+    r = int(CORRIDOR * ff)
+    lo = np.maximum.accumulate(np.clip(np.round(centre - r), 0, ny - 1)).astype(int)
+    hi = np.maximum.accumulate(np.clip(np.round(centre + r) + 1, 1, ny)).astype(int)
+    lo[0] = 0
+    if not OPEN_END:
+        hi[-1] = ny
+    wf = _fill(_dtw(Xf, Yf, lo, hi, fps=ff))
+    wf = np.maximum.accumulate(wf) / ff                                  # recording time of each score frame
+
+    onsets = np.unique(np.round([n[1] - s0 for n in notes], 4))
+    est = np.interp(onsets, np.arange(nx) / ff, wf)
+    shifts = np.zeros(len(onsets))
+    if refine:
+        say(0.7, "Snapping notes to their attacks…")
+        est2 = _refine(ya, shifted, onsets, est)
+        shifts = est2 - est
+        est = est2
+    est = np.maximum.accumulate(est)
+    est += np.arange(len(est)) * 1e-5                                    # strictly increasing
+    say(1.0, "Done")
+    return Alignment(onsets + s0, est + a0, shifts)
+
+
+SNAP_WINDOW = 0.55       # how far (s) from the DTW estimate an attack may be taken in dense music...
+SNAP_SPARSE = 2.5        # ...and this many times the gap to the neighbouring notes in sparse music (a long pause)
+SNAP_MAX = 1.6
+SNAP_CANDIDATES = 10
+SNAP_FREE_RATIO = 2.2    # an interval between two notes may differ from the DTW's by this factor at no cost
+SNAP_RATIO_COST = 1.5
+
+
+def _refine(ya, notes, onsets, est):
+    """Choose, for every onset, the attack of its own pitches that makes the best monotone sequence.
+
+    Candidates are the peaks of a per-pitch onset detector around the DTW estimate; a Viterbi pass
+    maximises their strength while keeping the order and not changing the spacing of neighbouring
+    notes by more than SNAP_FREE_RATIO."""
+    hop, n_fft = 221, 2048                              # 10 ms
+    mag = stft_mag(ya, n_fft, hop)
+    L = np.log1p(30.0 * mag / (np.percentile(mag[:, 10:], 99.5) + 1e-9))
+    flux = np.zeros_like(L)
+    flux[2:] = np.maximum(L[2:] - np.maximum(L[1:-1], L[:-2]), 0)
+    binhz = SR / n_fft
+    fps = SR / hop
+    nb = flux.shape[1]
+    by_time: dict[float, list] = {}
+    for p, s, *_ in notes:
+        by_time.setdefault(round(s, 4), []).append(p)
+
+    gaps = np.diff(onsets)
+    room = np.minimum(np.r_[np.inf, gaps], np.r_[gaps, np.inf])        # distance to the nearest neighbouring onset
+    cands = []     # per onset: (times, strengths); the DTW estimate is always one of them
+    for (t, e), rm in zip(zip(onsets, est), room):
+        win = float(np.clip(SNAP_SPARSE * rm, SNAP_WINDOW, SNAP_MAX))
+        bins = []
+        for p in by_time.get(round(t, 4), ()):
+            f0 = 440.0 * 2 ** ((p - 69) / 12)
+            for h in (1, 2, 3):
+                b = int(round(f0 * h / binhz))
+                if 1 <= b < nb - 1:
+                    bins += [b - 1, b, b + 1]
+        a, b = max(int((e - win) * fps), 1), min(int((e + win) * fps) + 1, len(flux) - 1)
+        if not bins or b - a < 5:
+            cands.append((np.array([e]), np.array([0.0])))
+            continue
+        curve = flux[a:b][:, bins].sum(axis=1)
+        z = (curve - curve.mean()) / (curve.std() + 1e-6)
+        peaks = [i for i in range(1, len(z) - 1) if z[i] >= z[i - 1] and z[i] > z[i + 1] and z[i] > 1.0]
+        peaks = sorted(peaks, key=lambda i: -z[i])[:SNAP_CANDIDATES]
+        times, strength = [], []
+        for i in peaks:
+            den = z[i - 1] - 2 * z[i] + z[i + 1]
+            d = 0.5 * (z[i - 1] - z[i + 1]) / den if den else 0.0
+            times.append((a + i + d) / fps - 0.005)
+            strength.append(min(z[i], 6.0))
+        times.append(e)
+        strength.append(0.0)                            # no evidence for "keep the estimate"
+        o = np.argsort(times)
+        cands.append((np.array(times)[o], np.array(strength)[o]))
+
+    # Viterbi over the candidates
+    n = len(onsets)
+    score = [cands[0][1].copy()]
+    back = []
+    for k in range(1, n):
+        tk, sk = cands[k]
+        tp, _ = cands[k - 1]
+        d_est = max(est[k] - est[k - 1], 1e-3)
+        dt = tk[:, None] - tp[None, :]                  # (cand k, cand k-1)
+        ratio = np.abs(np.log(np.maximum(dt, 1e-3) / d_est))
+        pen = SNAP_RATIO_COST * np.maximum(ratio - np.log(SNAP_FREE_RATIO), 0)
+        pen = np.where(dt < 0.012, 1e3, pen)            # notes cannot be simultaneous or reversed
+        tot = score[-1][None, :] - pen
+        j = np.argmax(tot, axis=1)
+        score.append(sk + tot[np.arange(len(tk)), j])
+        back.append(j)
+    idx = [int(np.argmax(score[-1]))]
+    for k in range(n - 2, -1, -1):
+        idx.append(int(back[k][idx[-1]]))
+    idx.reverse()
+    return np.array([cands[k][0][idx[k]] for k in range(n)])

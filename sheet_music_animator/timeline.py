@@ -1,4 +1,4 @@
-"""Timeline widget: ruler + note density + camera keyframe track + playhead."""
+"""Timeline widget: ruler + note density + camera keyframe channels + playhead."""
 from __future__ import annotations
 
 from PySide6.QtCore import QPointF, QRectF, Qt, Signal
@@ -6,9 +6,15 @@ from PySide6.QtGui import QColor, QFont, QPainter, QPen, QPolygonF
 from PySide6.QtWidgets import QMenu, QWidget
 
 from .engraver import NOTE_KINDS
-from .project import EASES, Project
+from .project import CAMERA_CHANNELS, EASES, LANE, Project, channel_label, is_lane
 
-GUTTER, RULER_H, NOTES_H, CAM_H = 74, 24, 30, 30
+GUTTER, RULER_H, NOTES_H, CAM_H = 84, 24, 30, 26
+CHANNEL_COLORS = {"pos": "#ff9f1a", "size": "#34c759", "rot": "#bf5af2"}
+LANE_COLORS = ["#5ac8fa", "#ffd60a", "#ff6b8a", "#7be0a0", "#c792ea", "#ff9f43", "#4dd0e1", "#a5d6a7"]
+
+
+def channel_color(ch: str) -> str:
+    return CHANNEL_COLORS.get(ch) or LANE_COLORS[sum(map(ord, ch)) % len(LANE_COLORS)]
 STEPS = (0.1, 0.25, 0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300, 600)
 
 
@@ -20,7 +26,10 @@ def fmt(t: float) -> str:
 class Timeline(QWidget):
     seeked = Signal(float)
     keysChanged = Signal()
-    addKeyRequested = Signal(float)
+    keysEditFinished = Signal()          # a drag or an edit of keyframes is complete (for undo)
+    addKeyRequested = Signal(str, float)
+    channelsChanged = Signal()
+    selectionChanged = Signal()           # the set of selected keyframes changed
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -29,11 +38,13 @@ class Timeline(QWidget):
         self.duration = 10.0
         self.t = 0.0
         self.view_start, self.view_span = 0.0, 10.0
-        self.selected = None          # CameraKey
+        self.selected: set = set()    # the selected Keys (of any channel)
+        self._anchor = None           # (channel, key) of the last plain/ctrl click, for shift-click ranges
+        self.visible_channels = list(CAMERA_CHANNELS)
         self._drag = None
         self._panning = None
         self._density: list[int] = []
-        self.setMinimumHeight(RULER_H + NOTES_H + CAM_H + 6)
+        self._update_height()
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.StrongFocus)
 
@@ -45,7 +56,7 @@ class Timeline(QWidget):
             if u.kind in NOTE_KINDS:
                 bins[min(int(u.time / 0.25), len(bins) - 1)] += 1
         self._density = bins
-        self.selected = None
+        self.selected, self._anchor = set(), None
         self.fit()
 
     def fit(self):
@@ -59,6 +70,32 @@ class Timeline(QWidget):
             self.view_start = max(0.0, t - self.view_span * 0.1)
         self.update()
 
+    def all_channels(self):
+        """The camera channels, then the automation lanes of the project."""
+        lanes = [LANE + n for n in self.project.effects.lanes] if self.project else []
+        return list(CAMERA_CHANNELS) + lanes
+
+    def set_visible_channels(self, channels):
+        self.visible_channels = [c for c in self.all_channels() if c in channels] or ["pos"]
+        self._update_height()
+        self.update()
+        self.channelsChanged.emit()
+
+    def _update_height(self):
+        self.setMinimumHeight(RULER_H + NOTES_H + CAM_H * len(self.visible_channels) + 6)
+        self.updateGeometry()
+
+    # ---- selection -----------------------------------------------------------------------------------
+    def select_only(self, key):
+        self.selected = {key} if key is not None else set()
+        self.update()
+
+    def select_all(self):
+        if self.project:
+            self.selected = {k for ch in self.visible_channels for k in self.project.channels.get(ch, [])}
+            self.update()
+            self.selectionChanged.emit()
+
     # ---- coordinate helpers -------------------------------------------------------------------------
     def _x(self, t):
         return GUTTER + (t - self.view_start) / self.view_span * (self.width() - GUTTER - 8)
@@ -66,8 +103,12 @@ class Timeline(QWidget):
     def _t(self, x):
         return self.view_start + (x - GUTTER) / max(self.width() - GUTTER - 8, 1) * self.view_span
 
-    def _cam_y(self):
-        return RULER_H + NOTES_H + 2
+    def _lane_y(self, i):
+        return RULER_H + NOTES_H + 2 + i * CAM_H
+
+    def _lane_at(self, y):
+        i = int((y - (RULER_H + NOTES_H + 2)) // CAM_H)
+        return self.visible_channels[i] if 0 <= i < len(self.visible_channels) else None
 
     # ---- painting ----------------------------------------------------------------------------------------
     def paintEvent(self, _):
@@ -81,16 +122,22 @@ class Timeline(QWidget):
         faint.setAlpha(40)
         p.fillRect(self.rect(), bg)
         font = QFont(self.font())
-        font.setPointSizeF(font.pointSizeF() * 0.85)
+        if font.pointSizeF() > 0:
+            font.setPointSizeF(font.pointSizeF() * 0.85)
         p.setFont(font)
         right = self.width() - 8
 
         # lane backgrounds + labels
         p.fillRect(QRectF(GUTTER, RULER_H, right - GUTTER, NOTES_H), faint)
-        p.fillRect(QRectF(GUTTER, self._cam_y(), right - GUTTER, CAM_H), faint)
         p.setPen(dim)
         p.drawText(QRectF(6, RULER_H, GUTTER - 8, NOTES_H), Qt.AlignVCenter, "Notes")
-        p.drawText(QRectF(6, self._cam_y(), GUTTER - 8, CAM_H), Qt.AlignVCenter, "Camera")
+        for i, ch in enumerate(self.visible_channels):
+            y = self._lane_y(i)
+            p.fillRect(QRectF(GUTTER, y, right - GUTTER, CAM_H - 2), faint)
+            p.setPen(dim)
+            if i == 0:
+                p.drawText(QRectF(6, y, GUTTER - 8, CAM_H), Qt.AlignVCenter, "Camera ▾")
+            p.drawText(QRectF(GUTTER + 4, y, 90, CAM_H), Qt.AlignVCenter, channel_label(ch))
 
         # ruler ticks
         step = next((s for s in STEPS if s / self.view_span * (right - GUTTER) >= 70), STEPS[-1])
@@ -133,27 +180,32 @@ class Timeline(QWidget):
                     h = (NOTES_H - 8) * c / peak
                     p.drawRect(QRectF(x0, RULER_H + NOTES_H - 3 - h, max(x1 - x0 - 0.5, 1), h))
 
-        # camera keyframes
+        # camera keyframes, one lane per visible channel
         if self.project:
-            cy = self._cam_y() + CAM_H / 2
-            ks = self.project.keys
-            p.setPen(QPen(QColor("#ff9f1a"), 1.5))
-            for a, b in zip(ks, ks[1:]):
-                if a.ease != "hold":
-                    p.drawLine(QPointF(self._x(a.t), cy), QPointF(self._x(b.t), cy))
-                else:
-                    p.setPen(QPen(QColor("#ff9f1a"), 1, Qt.DotLine))
-                    p.drawLine(QPointF(self._x(a.t), cy), QPointF(self._x(b.t), cy))
-                    p.setPen(QPen(QColor("#ff9f1a"), 1.5))
-            for k in ks:
-                x = self._x(k.t)
-                if x < GUTTER - 6 or x > right + 6:
-                    continue
-                r = 6
-                poly = QPolygonF([QPointF(x, cy - r), QPointF(x + r, cy), QPointF(x, cy + r), QPointF(x - r, cy)])
-                p.setBrush(QColor("#ffffff") if k is self.selected else QColor("#ff9f1a"))
-                p.setPen(QPen(QColor("#7a4a00"), 1))
-                p.drawPolygon(poly)
+            for i, ch in enumerate(self.visible_channels):
+                color = QColor(channel_color(ch))
+                cy = self._lane_y(i) + (CAM_H - 2) / 2
+                ks = self.project.channels.get(ch, [])
+                p.setPen(QPen(color, 1.5))
+                for a, b in zip(ks, ks[1:]):
+                    if a.ease != "hold":
+                        p.drawLine(QPointF(self._x(a.t), cy), QPointF(self._x(b.t), cy))
+                    else:
+                        p.setPen(QPen(color, 1, Qt.DotLine))
+                        p.drawLine(QPointF(self._x(a.t), cy), QPointF(self._x(b.t), cy))
+                        p.setPen(QPen(color, 1.5))
+                for k in ks:
+                    x = self._x(k.t)
+                    if x < GUTTER - 6 or x > right + 6:
+                        continue
+                    r = 6
+                    poly = QPolygonF([QPointF(x, cy - r), QPointF(x + r, cy), QPointF(x, cy + r), QPointF(x - r, cy)])
+                    p.setBrush(QColor("#ffffff") if k in self.selected else color)
+                    p.setPen(QPen(color.darker(220), 1))
+                    p.drawPolygon(poly)
+                    if is_lane(ch):   # the value of an automation key
+                        p.setPen(dim)
+                        p.drawText(QPointF(x + 8, cy - 5), f"{k.v[0]:.2f}")
 
         # playhead
         x = self._x(self.t)
@@ -166,37 +218,69 @@ class Timeline(QWidget):
 
     # ---- interaction ------------------------------------------------------------------------------------
     def _key_at(self, pos):
-        if not self.project or not (self._cam_y() <= pos.y() <= self._cam_y() + CAM_H):
+        """(channel, key) under the mouse."""
+        ch = self._lane_at(pos.y()) if self.project else None
+        if ch is None:
             return None
-        best = min(self.project.keys, key=lambda k: abs(self._x(k.t) - pos.x()), default=None)
-        return best if best and abs(self._x(best.t) - pos.x()) <= 8 else None
+        best = min(self.project.channels.get(ch, []), key=lambda k: abs(self._x(k.t) - pos.x()), default=None)
+        return (ch, best) if best is not None and abs(self._x(best.t) - pos.x()) <= 8 else None
+
+    def _in_label(self, pos):
+        return pos.x() < GUTTER and self._lane_y(0) <= pos.y() <= self._lane_y(0) + CAM_H
 
     def mousePressEvent(self, e):
+        before = set(self.selected)
+        self._press(e)
+        if self.selected != before:
+            self.selectionChanged.emit()
+
+    def _press(self, e):
+        self.setFocus()
         pos = e.position()
         if e.button() == Qt.MiddleButton:
             self._panning = (pos.x(), self.view_start)
             return
-        k = self._key_at(pos)
+        if e.button() == Qt.LeftButton and self._in_label(pos):
+            self._channel_menu(e.globalPosition().toPoint())
+            return
+        hit = self._key_at(pos)
+        mods = e.modifiers()
         if e.button() == Qt.RightButton:
-            if k:
-                self.selected = k
-                self._key_menu(k, e.globalPosition().toPoint())
+            if hit:
+                if hit[1] not in self.selected:
+                    self.selected = {hit[1]}
+                    self._anchor = hit
+                self._key_menu(e.globalPosition().toPoint())
+                self.update()
             return
         if e.button() != Qt.LeftButton:
             return
-        if k:
-            self.selected = k
-            self._drag = ("key", k)
+        if hit:
+            ch, k = hit
+            if mods & Qt.ControlModifier:
+                self.selected ^= {k}
+                self._anchor = hit
+            elif mods & Qt.ShiftModifier and self._anchor and self._anchor[0] == ch:
+                lo, hi = sorted((self._anchor[1].t, k.t))
+                self.selected = {q for q in self.project.channels[ch] if lo - 1e-9 <= q.t <= hi + 1e-9}
+            else:
+                if k not in self.selected:
+                    self.selected = {k}
+                self._anchor = hit
+            if k in self.selected:
+                self._drag = ("keys", self._t(pos.x()), {q: q.t for q in self.selected})
             self.seeked.emit(k.t)
         else:
-            self.selected = None
-            self._drag = ("scrub", None)
+            if not mods & (Qt.ControlModifier | Qt.ShiftModifier):
+                self.selected = set()
+            self._drag = ("scrub", None, None)
             self._scrub(pos.x())
         self.update()
 
     def mouseDoubleClickEvent(self, e):
-        if self._cam_y() <= e.position().y() <= self._cam_y() + CAM_H and not self._key_at(e.position()):
-            self.addKeyRequested.emit(max(self._t(e.position().x()), 0.0))
+        ch = self._lane_at(e.position().y())
+        if ch and e.position().x() >= GUTTER and not self._key_at(e.position()):
+            self.addKeyRequested.emit(ch, max(self._t(e.position().x()), 0.0))
 
     def mouseMoveEvent(self, e):
         pos = e.position()
@@ -205,20 +289,30 @@ class Timeline(QWidget):
             self.view_start = max(0.0, s0 - (pos.x() - x0) / (self.width() - GUTTER) * self.view_span)
             self.update()
         elif self._drag:
-            kind, k = self._drag
+            kind, t0, starts = self._drag
             if kind == "scrub":
                 self._scrub(pos.x())
             else:
-                k.t = max(self._t(pos.x()), 0.0)
-                self.project.keys.sort(key=lambda q: q.t)
-                self.project.keys_edited = True
-                self.seeked.emit(k.t)
-                self.keysChanged.emit()
+                dt = self._t(pos.x()) - t0
+                if abs(dt) > 1e-9:
+                    for k, k0 in starts.items():
+                        k.t = max(k0 + dt, 0.0)
+                    for keys in self.project.channels.values():
+                        keys.sort(key=lambda q: q.t)
+                    self.project.keys_edited = True
+                    self._drag = (kind, t0, starts)
+                    self._dragged = True
+                    self.seeked.emit(max(self._t(pos.x()), 0.0))
+                    self.keysChanged.emit()
         else:
-            self.setCursor(Qt.PointingHandCursor if self._key_at(pos) else Qt.ArrowCursor)
+            self.setCursor(Qt.PointingHandCursor if self._key_at(pos) or self._in_label(pos) else Qt.ArrowCursor)
 
     def mouseReleaseEvent(self, e):
+        dragged = self._drag and self._drag[0] == "keys" and getattr(self, "_dragged", False)
         self._drag = self._panning = None
+        self._dragged = False
+        if dragged:
+            self.keysEditFinished.emit()
 
     def _scrub(self, x):
         self.seeked.emit(min(max(self._t(x), 0.0), self.duration))
@@ -233,31 +327,56 @@ class Timeline(QWidget):
             self.view_start = max(0.0, self.view_start - e.angleDelta().y() / 120 * self.view_span * 0.1)
         self.update()
 
-    def _key_menu(self, k, global_pos):
+    def _channel_menu(self, global_pos):
         menu = QMenu(self)
-        for ease in EASES:
-            a = menu.addAction(("● " if k.ease == ease else "   ") + f"Ease: {ease}")
-            a.triggered.connect(lambda _=False, ease=ease: self._set_ease(k, ease))
-        menu.addSeparator()
-        menu.addAction("Delete keyframe").triggered.connect(self.delete_selected)
+        for ch in self.all_channels():
+            a = menu.addAction(channel_label(ch))
+            a.setCheckable(True)
+            a.setChecked(ch in self.visible_channels)
+            a.toggled.connect(lambda on, ch=ch: self._toggle_channel(ch, on))
         menu.exec(global_pos)
 
-    def _set_ease(self, k, ease):
-        k.ease = ease
+    def _toggle_channel(self, ch, on):
+        shown = set(self.visible_channels)
+        (shown.add if on else shown.discard)(ch)
+        self.set_visible_channels(shown)
+
+    def _key_menu(self, global_pos):
+        menu = QMenu(self)
+        common = {k.ease for k in self.selected}
+        for ease in EASES:
+            a = menu.addAction(("● " if common == {ease} else "   ") + f"Ease: {ease}")
+            a.triggered.connect(lambda _=False, ease=ease: self._set_ease(ease))
+        menu.addSeparator()
+        menu.addAction(f"Delete {len(self.selected)} keyframe" + ("s" if len(self.selected) != 1 else "")
+                       ).triggered.connect(self.delete_selected)
+        menu.exec(global_pos)
+
+    def _set_ease(self, ease):
+        for k in self.selected:
+            k.ease = ease
         self.project.keys_edited = True
         self.keysChanged.emit()
+        self.keysEditFinished.emit()
         self.update()
 
     def delete_selected(self):
-        if self.project and self.selected in self.project.keys and len(self.project.keys) > 0:
-            self.project.keys.remove(self.selected)
-            self.project.keys_edited = True
-            self.selected = None
-            self.keysChanged.emit()
-            self.update()
+        if not self.project or not self.selected:
+            return
+        for ch in list(self.project.channels):
+            self.project.channels[ch] = [k for k in self.project.channels[ch] if k not in self.selected]
+        self.project.keys_edited = True
+        self.selected = set()
+        self._anchor = None
+        self.keysChanged.emit()
+        self.keysEditFinished.emit()
+        self.update()
+        self.selectionChanged.emit()
 
     def keyPressEvent(self, e):
         if e.key() in (Qt.Key_Delete, Qt.Key_Backspace):
             self.delete_selected()
+        elif e.key() == Qt.Key_A and e.modifiers() & Qt.ControlModifier:
+            self.select_all()
         else:
             super().keyPressEvent(e)
