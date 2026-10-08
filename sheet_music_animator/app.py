@@ -1286,8 +1286,13 @@ class MainWindow(QMainWindow):
                 self, "Apply preset", f"“{PRESETS[name]}” replaces the effect settings and the camera, mood, hush and "
                 "snow-lift keyframes. Continue?") != QMessageBox.Yes:
             return
+        ink = self.project.settings.ink
         notes = apply_preset(name, self.project, self.score)
         self.timeline.selected = set()
+        if self.project.settings.ink != ink:      # the ink colour is baked into the engraving
+            if self.load_score(old_score=self.score, fresh=False):
+                self.commit()
+            return
         self.scene.refresh()
         self.timeline.set_data(self.project, self.score, self.end_time())
         self._sync_settings_to_ui()

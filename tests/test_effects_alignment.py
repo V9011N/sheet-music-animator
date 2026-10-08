@@ -164,6 +164,22 @@ class TestEffects(unittest.TestCase):
         self.assertGreater(lit.mean(), 5)                          # not black: backdrop and snow are drawn
 
 
+class TestPresets(unittest.TestCase):
+    def test_plain_preset_restores_the_blank_slate(self):
+        from sheet_music_animator.presets import apply_preset
+        project = make_project(Path(tempfile.mkdtemp()))
+        score = build_score(project)
+        project.channels.update(auto_camera(score, project.settings))
+        apply_preset("winter_wind", project, score)
+        self.assertTrue(project.effects.enabled)
+        project.settings.ink, project.settings.paper = "#ffffff", "#000000"
+        apply_preset("plain", project, score)
+        self.assertFalse(project.effects.enabled)
+        self.assertEqual((project.settings.paper, project.settings.ink, project.settings.fps), ("#ffffff", "#1a1a1a", 30))
+        self.assertTrue(all(not project.channels[c] for c in ("mood", "hush", "lift")))
+        self.assertTrue(project.has_keys())
+
+
 class TestProject(unittest.TestCase):
     def test_effects_and_time_map_survive_a_round_trip(self):
         p = Project()

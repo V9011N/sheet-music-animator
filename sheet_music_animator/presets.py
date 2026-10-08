@@ -2,9 +2,9 @@
 from the measure numbers of the score, so it needs a loaded (and, for a recording, aligned) score."""
 from __future__ import annotations
 
-from .project import Effects, Key, Project, auto_camera
+from .project import EFFECT_CHANNELS, Effects, Key, Project, Settings, auto_camera
 
-PRESETS = {"winter_wind": "Winter Wind (storm)"}
+PRESETS = {"plain": "Plain (white page, no effects)", "winter_wind": "Winter Wind (storm)"}
 
 
 def _start(score, number: int) -> float:
@@ -14,9 +14,26 @@ def _start(score, number: int) -> float:
 
 
 def apply_preset(name: str, project: Project, score) -> list[str]:
+    if name == "plain":
+        return plain(project, score)
     if name == "winter_wind":
         return winter_wind(project, score)
     raise KeyError(name)
+
+
+def plain(project: Project, score) -> list[str]:
+    """The blank slate: dark ink on a white page, no effects, the automatic camera.  The score itself (its
+    layout, a fitted recording, the audio) is left as it is."""
+    s, d = project.settings, Settings()
+    for name in ("paper", "ink", "width", "height", "fps", "crf", "preset", "tail", "reveal", "fade", "ghost",
+                 "follow_width", "follow_lead"):
+        setattr(s, name, getattr(d, name))
+    project.effects = Effects()
+    for ch in EFFECT_CHANNELS:
+        project.channels[ch] = []
+    project.channels.update(auto_camera(score, s))
+    project.keys_edited = False
+    return []
 
 
 def winter_wind(project: Project, score) -> list[str]:
