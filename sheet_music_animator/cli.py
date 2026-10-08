@@ -1,6 +1,6 @@
-"""Headless rendering:  python -m sheet_music_animator.cli render piece.mxl --audio perf.mp3 --align --preset winter_wind
+"""Headless rendering:  python -m sheet_music_animator.cli render piece.mxl --audio perf.mp3 --align --look winter_wind
 
-Does what the editor does, without a window: engrave the score, fit it to a recording, apply a preset (or the
+Does what the editor does, without a window: engrave the score, fit it to a recording, apply a look (or the
 automatic camera), and render with one process per slice of the video.
 """
 from __future__ import annotations
@@ -34,7 +34,7 @@ def render(args) -> int:
     from . import analysis
     from .build import build_score
     from .export import render_video, render_video_parallel, total_duration
-    from .presets import apply_preset
+    from . import looks
     from .project import Project, auto_camera
     from .scene import SheetScene
 
@@ -61,10 +61,13 @@ def render(args) -> int:
         project.time_map, s.align_audio = al.points(), s.audio
         score = build_score(project)
         print(f"  score now lasts {score.duration:.1f} s ({len(al.nominal)} note positions fitted)")
-    if args.preset:
-        for note in apply_preset(args.preset, project, score):
+    if args.look:
+        key = args.look
+        if key not in looks.BUILTIN and not key.startswith(("user:", "file:")):
+            key = "file:" + key if Path(key).exists() else "user:" + key
+        for note in looks.apply_look(looks.get_look(key), project, score):
             print("  note:", note)
-    elif not project.has_keys():
+    if not project.has_keys():
         project.channels.update(auto_camera(score, s))
     if args.fps:
         s.fps = args.fps
@@ -101,7 +104,6 @@ def render(args) -> int:
 
 
 def main(argv=None) -> int:
-    from .presets import PRESETS
     ap = argparse.ArgumentParser(prog="python -m sheet_music_animator.cli", description=__doc__.split("\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
     r = sub.add_parser("render", help="render a MusicXML file or a .smanim project to a video")
@@ -109,7 +111,8 @@ def main(argv=None) -> int:
     r.add_argument("--out", required=True, help="output .mp4")
     r.add_argument("--audio", help="recording to use as the soundtrack (default: the built-in synth)")
     r.add_argument("--align", action="store_true", help="fit the score's timing to the recording first")
-    r.add_argument("--preset", choices=sorted(PRESETS), help="apply a look (after aligning)")
+    r.add_argument("--look", help="apply a look (after aligning): a built-in name (plain, winter_wind, ember, fireflies, "
+                                  "ocean, golden_rain, neon, mono_storm, paper, photo), the name of one of yours, or a .json file")
     r.add_argument("--measures-per-line", type=int, default=4, help="0 = the whole score on one line")
     r.add_argument("--size", help="e.g. 1920x1080")
     r.add_argument("--fps", type=int)

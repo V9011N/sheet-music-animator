@@ -6,16 +6,21 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from .engraver import NOTE_KINDS, REST_KINDS, Score
+from .layers import Layer, legacy_layers, schema
 
 EASES = ("smooth", "linear", "hold")
 CAMERA_CHANNELS = ("pos", "size", "rot")
-# Automation of the look (0..1): how stormy it is, how hushed (a dimming before the storm), and how strongly
-# the snow is lifted upwards (the finale).  Keyframed on the timeline like the camera.
-EFFECT_CHANNELS = ("mood", "hush", "lift")
-CHANNELS = CAMERA_CHANNELS + EFFECT_CHANNELS
-CHANNEL_LABELS = {"pos": "Position", "size": "Frame size", "rot": "Rotation",
-                  "mood": "Mood (calm → storm)", "hush": "Hush", "lift": "Snow lift"}
-EFFECT_DEFAULTS = {"mood": 1.0, "hush": 0.0, "lift": 0.0}   # value of a channel without keyframes
+LANE = "lane:"                      # automation lanes live in `channels` under "lane:<name>"
+CHANNEL_LABELS = {"pos": "Position", "size": "Frame size", "rot": "Rotation"}
+
+
+def is_lane(channel: str) -> bool:
+    return channel.startswith(LANE)
+
+
+def channel_label(channel: str) -> str:
+    return CHANNEL_LABELS.get(channel) or channel[len(LANE):]
+
 
 # Categories of engravings that can be switched off per measure: name -> SVG classes that make them up.
 # A class that is a whole element (a fingering, a dynamic) hides that element; a class inside a
@@ -51,42 +56,36 @@ class Key:
 
 @dataclass
 class Effects:
-    """The "produced" look of the video: animated backdrop, note light-up, reactions to the music, title.
-    Colours are #rrggbb strings; nothing here is used unless `enabled`."""
+    """The produced look of the video: a stack of effect layers (see layers.py) drawn bottom to top, the
+    automation lanes they can follow, and how events are made from the music.  Unused unless `enabled`."""
     enabled: bool = False
-    # backdrop (each is [top, bottom]); the mood channel blends from calm to storm
-    bg_calm: list = field(default_factory=lambda: ["#0e1424", "#1a2238"])
-    bg_storm: list = field(default_factory=lambda: ["#060a14", "#10192c"])
-    mist: float = 1.0            # drifting fog (0..1)
-    snow: float = 1.0            # blown snow (0..1)
-    vignette: float = 1.0        # dark corners (0..1)
-    # the notation itself
-    ink_calm: str = "#bec8de"
-    ink_storm: str = "#ecf3fc"
-    edge_fade: float = 0.125     # fraction of the frame width over which the score fades out at each side
-    # light-up of notes as they sound: staff 1 (right hand) and staff 2 (left hand)
-    flash: bool = True
-    flash_colors: list = field(default_factory=lambda: ["#78deff", "#ffc070"])
-    flash_time: float = 0.45     # seconds a note keeps glowing
-    glow: float = 1.6            # strength of the bloom around lit notes
-    # reactions to the music
-    react: float = 1.0           # wind and snow follow loudness and how many notes are playing
-    shake: float = 1.0           # camera shake on loud events
-    punch: float = 1.0           # zoom punch on loud events
-    breathe: float = 1.0         # slow zoom with loudness
-    use_dynamics: bool = True    # f, ff, fff, sfz ... markings cause events
-    use_accents: bool = True     # accents and marcatos cause events
-    impulses: list = field(default_factory=list)      # [{"t": seconds, "s": 0..1}]
-    hits: list = field(default_factory=list)          # [{"m0": measure, "m1": measure, "s": 0..1}]: every note onset
-    spotlights: list = field(default_factory=list)    # [{"t", "ramp", "end", "m0", "m1"}]: only those measures stay visible
-    # text and fades
-    title: str = ""
-    subtitle: str = ""
-    title_font: str = "Times New Roman"
-    title_color: str = "#dee8f6"
-    title_in: list = field(default_factory=lambda: [0.6, 2.2])     # start, fade-in seconds
-    title_out: list = field(default_factory=lambda: [0.0, 2.5])    # start (0 = stays), fade-out seconds
-    fade_out: float = 1.0        # the picture fades to black this many seconds before the end
+    layers: list = field(default_factory=list)        # Layer objects, bottom to top
+    lanes: dict = field(default_factory=dict)         # lane name -> its value where it has no keyframes
+    use_dynamics: bool = True     # f, ff, fff, sfz ... markings make events
+    use_accents: bool = True      # accents and marcatos make events
+    impulses: list = field(default_factory=list)      # [{"t": seconds, "s": 0..1}]: events placed by hand
+    hits: list = field(default_factory=list)          # [{"m0": measure, "m1": measure, "s": 0..1}]: every note is an event
+    loud_floor_db: float = -40.0  # loudness 0 at this level...
+    loud_range_db: float = 26.0   # ...and 1 this many dB above
+    density_max: float = 14.0     # notes per second that count as "full density"
+
+    def to_dict(self) -> dict:
+        d = asdict(self)
+        d["layers"] = [lay.to_dict() for lay in self.layers]
+        return d
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "Effects":
+        d = dict(d)
+        known = cls.__dataclass_fields__
+        if "layers" not in d and ("bg_calm" in d or "flash_colors" in d):   # the first, fixed-feature version
+            d["layers"] = legacy_layers(d)
+            d["lanes"] = {"Mood": 1.0, "Hush": 0.0, "Snow lift": 0.0}
+        layers = [Layer.from_dict(x) if isinstance(x, dict) else x for x in d.get("layers", [])]
+        return cls(**{**{k: v for k, v in d.items() if k in known}, "layers": layers})
+
+    def layer(self, layer_id: str):
+        return next((x for x in self.layers if x.id == layer_id), None)
 
 
 @dataclass
@@ -118,7 +117,7 @@ class Settings:
 
 
 def _blank_channels():
-    return {c: [] for c in CHANNELS}
+    return {c: [] for c in CAMERA_CHANNELS}
 
 
 def _interp(keys, t, kind):
@@ -220,8 +219,8 @@ class Project:
         existing = next((k for k in keys if abs(k.t - t) <= snap), None)
         if existing is not None:
             return existing
-        if channel in EFFECT_CHANNELS:
-            k = Key(t, [self.effect_at(channel, t)])
+        if is_lane(channel):
+            k = Key(t, [self.lane_at(channel[len(LANE):], t)])
         else:
             cur = self.camera_at(t)
             if cur is None:
@@ -233,18 +232,19 @@ class Project:
             self.keys_edited = True
         return k
 
-    def effect_at(self, channel: str, t: float) -> float:
-        """Value (0..1) of an effect channel at time t."""
-        v = _interp(self.channels[channel], t, "scalar")
-        return EFFECT_DEFAULTS[channel] if v is None else float(v[0])
+    # ---- automation lanes ---------------------------------------------------------------
+    def lane_at(self, name: str, t: float) -> float:
+        """Value of a lane at time t."""
+        v = _interp(self.channels.get(LANE + name, []), t, "scalar")
+        return float(self.effects.lanes.get(name, 0.0)) if v is None else float(v[0])
 
-    def sample_effect(self, channel: str, times):
-        """effect_at for many times at once (numpy arrays)."""
+    def sample_lane(self, name: str, times):
+        """lane_at for many times at once (numpy arrays)."""
         import numpy as np
         t = np.asarray(times, dtype=np.float64)
-        keys = self.channels[channel]
+        keys = self.channels.get(LANE + name, [])
         if not keys:
-            return np.full(len(t), EFFECT_DEFAULTS[channel], np.float32)
+            return np.full(len(t), float(self.effects.lanes.get(name, 0.0)), np.float32)
         out = np.empty(len(t), np.float64)
         out[:] = keys[-1].v[0]
         out[t < keys[0].t] = keys[0].v[0]
@@ -261,25 +261,55 @@ class Project:
             out[m] = a.v[0] + (b.v[0] - a.v[0]) * u
         return out.astype(np.float32)
 
+    def add_lane(self, name: str, default: float = 0.0) -> str:
+        name = name.strip() or "Lane"
+        base, i = name, 2
+        while name in self.effects.lanes:
+            name, i = f"{base} {i}", i + 1
+        self.effects.lanes[name] = default
+        self.channels.setdefault(LANE + name, [])
+        return name
+
+    def remove_lane(self, name: str) -> None:
+        self.effects.lanes.pop(name, None)
+        self.channels.pop(LANE + name, None)
+        for lay in self.effects.layers:
+            for setting, bs in list(lay.bindings.items()):
+                lay.bindings[setting] = [b for b in bs if b.get("src") != LANE + name]
+
+    def rename_lane(self, old: str, new: str) -> str:
+        if old not in self.effects.lanes or not new.strip() or new == old:
+            return old
+        new = new.strip()
+        if new in self.effects.lanes:
+            return old
+        self.effects.lanes = {(new if k == old else k): v for k, v in self.effects.lanes.items()}
+        self.channels = {(LANE + new if k == LANE + old else k): v for k, v in self.channels.items()}
+        for lay in self.effects.layers:
+            for bs in lay.bindings.values():
+                for b in bs:
+                    if b.get("src") == LANE + old:
+                        b["src"] = LANE + new
+        return new
+
     def retime(self, fn) -> None:
-        """Move everything that is placed in time (keyframes, events, spotlights, title cues) with `fn`,
-        e.g. when the score is aligned to a recording and its notes move."""
-        for ch in CHANNELS:
-            for k in self.channels[ch]:
+        """Move everything that is placed in time (keyframes, events, layer timings) with `fn`, e.g. when the
+        score is aligned to a recording and its notes move."""
+        for ch, keys in self.channels.items():
+            for k in keys:
                 k.t = max(float(fn(k.t)), 0.0)
-            self.channels[ch].sort(key=lambda q: q.t)
+            keys.sort(key=lambda q: q.t)
         fx = self.effects
         for im in fx.impulses:
             im["t"] = float(fn(im["t"]))
-        for sp in fx.spotlights:
-            sp["t"] = float(fn(sp["t"]))
-            if sp.get("end", 0) > 0:
-                sp["end"] = float(fn(sp["end"]))
-        if fx.title_out[0] > 0:
-            fx.title_out[0] = float(fn(fx.title_out[0]))
+        for lay in fx.layers:
+            for prm in schema(lay.type):
+                v = lay.params.get(prm.name)
+                if prm.kind == "time" and isinstance(v, (int, float)) and v > 0:
+                    lay.params[prm.name] = float(fn(v))
 
     def all_keys(self):
-        return [(ch, k) for ch in CHANNELS for k in self.channels[ch]]
+        return [(ch, k) for ch, keys in self.channels.items() for k in keys]
 
     # ---- note reveal -------------------------------------------------------------------
     def start_of(self, unit) -> float:
@@ -325,13 +355,13 @@ class Project:
 
     # ---- persistence -----------------------------------------------------------------------
     def to_dict(self) -> dict:
-        return {"version": 3, "xml_path": self.xml_path, "settings": asdict(self.settings),
-                "channels": {ch: [{"t": k.t, "v": k.v, "ease": k.ease} for k in self.channels[ch]] for ch in CHANNELS},
+        return {"version": 4, "xml_path": self.xml_path, "settings": asdict(self.settings),
+                "channels": {ch: [{"t": k.t, "v": k.v, "ease": k.ease} for k in keys] for ch, keys in self.channels.items()},
                 "overrides": {str(k): v for k, v in sorted(self.overrides.items())},
                 "keys_edited": self.keys_edited, "timed": sorted(self.timed),
                 "hidden": {str(m): sorted(c) for m, c in sorted(self.hidden.items()) if c},
                 "transforms": {str(u): list(v) for u, v in sorted(self.transforms.items())},
-                "line_starts": self.line_starts, "effects": asdict(self.effects), "time_map": self.time_map}
+                "line_starts": self.line_starts, "effects": self.effects.to_dict(), "time_map": self.time_map}
 
     def snapshot(self) -> str:
         return json.dumps(self.to_dict(), sort_keys=True)
@@ -345,9 +375,10 @@ class Project:
         self.xml_path = d.get("xml_path", "")
         self.settings = Settings(**st)
         self.channels = _blank_channels()
+        legacy = {"mood": LANE + "Mood", "hush": LANE + "Hush", "lift": LANE + "Snow lift"}   # the first version's fixed lanes
         if "channels" in d:
-            for ch in CHANNELS:
-                self.channels[ch] = [Key(k["t"], list(k["v"]), k.get("ease", "smooth")) for k in d["channels"].get(ch, [])]
+            for ch, keys in d["channels"].items():
+                self.channels[legacy.get(ch, ch)] = [Key(k["t"], list(k["v"]), k.get("ease", "smooth")) for k in keys]
         else:   # version 1: one list of keys that carry position and size together
             for k in d.get("keys", []):
                 self.channels["pos"].append(Key(k["t"], [k["cx"], k["cy"]], k.get("ease", "smooth")))
@@ -358,8 +389,12 @@ class Project:
         self.hidden = {int(m): set(c) for m, c in d.get("hidden", {}).items()}
         self.transforms = {int(u): list(v) for u, v in d.get("transforms", {}).items()}
         self.line_starts = d.get("line_starts")
-        known_fx = Effects.__dataclass_fields__
-        self.effects = Effects(**{k: v for k, v in d.get("effects", {}).items() if k in known_fx})
+        self.effects = Effects.from_dict(d.get("effects", {}))
+        for ch in self.channels:             # a lane always has its entry in the effects
+            if is_lane(ch):
+                self.effects.lanes.setdefault(ch[len(LANE):], 0.0)
+        for name in self.effects.lanes:
+            self.channels.setdefault(LANE + name, [])
         self.time_map = [list(p) for p in d.get("time_map", [])]
 
     def restore(self, snapshot: str) -> None:

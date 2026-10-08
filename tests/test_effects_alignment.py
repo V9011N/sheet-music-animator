@@ -1,4 +1,4 @@
-"""Regression tests for audio alignment, effects signals and the effects compositor.
+"""Regression tests for audio alignment, the effect layers, signals, looks and the project's effect data.
 
 Run:  python -m unittest discover tests
 They build a small MusicXML score on the fly, so no files are needed.
@@ -17,9 +17,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import numpy as np                                    # noqa: E402
 from PySide6.QtWidgets import QApplication            # noqa: E402
 
-from sheet_music_animator import analysis, audio     # noqa: E402
+from sheet_music_animator import analysis, audio, looks   # noqa: E402
 from sheet_music_animator.build import build_score    # noqa: E402
-from sheet_music_animator.project import Key, Project, auto_camera, retimer   # noqa: E402
+from sheet_music_animator.layers import LAYER_TYPES, Layer, bind, new_layer   # noqa: E402
+from sheet_music_animator.project import LANE, Key, Project, auto_camera, retimer   # noqa: E402
 
 _app = QApplication.instance() or QApplication([])
 
@@ -27,7 +28,7 @@ PITCHES = ["C", "D", "E", "F", "G", "A", "B", "C"]
 
 
 def make_score_xml(measures=12) -> str:
-    """Piano, 4/4, two staves: running quarter notes on top, a bass note below; a dynamic, an accent, a tie."""
+    """Piano, 4/4, two staves: random quarter notes on top, a bass note below; a dynamic, an accent, a tie."""
     rng = random.Random(7)          # no repeating pattern: every note has to be found on its own
     out = ['<?xml version="1.0" encoding="UTF-8"?><score-partwise version="3.1"><part-list><score-part id="P1">'
            '<part-name>Piano</part-name></score-part></part-list><part id="P1">']
@@ -75,11 +76,12 @@ class TestScore(unittest.TestCase):
         cls.project = make_project(cls.tmp)
         cls.score = build_score(cls.project)
 
-    def test_noteheads_carry_staff_and_tie_information(self):
+    def test_noteheads_carry_staff_tie_and_pitch(self):
         heads = [h for u in self.score.units for h in u.heads]
         self.assertEqual(len(heads), 12 * 5)                       # four quarters and a bass note per measure
         self.assertEqual({h[4] for h in heads}, {0, 1})
         self.assertEqual(sum(1 for h in heads if h[5]), 1)         # one note only continues a tie
+        self.assertEqual({h[6] for h in heads if h[4] == 1}, {48})  # the bass note is C3
 
     def test_dynamics_and_accents_are_labelled(self):
         labels = [u.label for u in self.score.units if u.kind in ("dynam", "artic")]
@@ -122,86 +124,165 @@ class TestAlignment(unittest.TestCase):
         self.assertGreater(rms[int(0.5 * fps)], 2 * rms[int(2.5 * fps)])
 
 
-class TestEffects(unittest.TestCase):
+class TestLayers(unittest.TestCase):
+    def test_every_layer_type_has_a_complete_catalogue_entry(self):
+        for key, t in LAYER_TYPES.items():
+            lay = new_layer(key)
+            for p in t.all_params():
+                v = lay.get(p.name)
+                if p.kind in ("float", "int", "time"):
+                    self.assertTrue(p.lo - 1e-9 <= float(v) <= p.hi + 1e-9 or p.kind == "time", (key, p.name, v))
+                if p.kind == "choice":
+                    self.assertIn(v, p.choices, (key, p.name))
+            self.assertEqual(Layer.from_dict(lay.to_dict()).to_dict()["params"], lay.to_dict()["params"])
+
+    def test_layers_survive_a_round_trip_with_bindings(self):
+        p = Project()
+        lay = bind(new_layer("particles", "Snow", count=40), "speed", "activity", 300.0)
+        p.effects.layers.append(lay)
+        p.effects.enabled = True
+        q = Project()
+        q.load_dict(json.loads(json.dumps(p.to_dict())))
+        self.assertTrue(q.effects.enabled)
+        self.assertEqual(q.effects.layers[0].get("count"), 40)
+        self.assertEqual(q.effects.layers[0].bindings["speed"][0]["amount"], 300.0)
+
+
+class TestProject(unittest.TestCase):
+    def test_lanes_are_named_and_sampled(self):
+        p = Project()
+        name = p.add_lane("Storm")
+        p.channels[LANE + name] = [Key(1.0, [0.0]), Key(3.0, [1.0]), Key(5.0, [0.2], "hold"), Key(7.0, [0.9])]
+        ts = np.linspace(0, 9, 91)
+        vec = p.sample_lane(name, ts)
+        pt = np.array([p.lane_at(name, t) for t in ts])
+        self.assertLess(np.abs(vec - pt).max(), 1e-5)
+        self.assertEqual(p.add_lane("Storm"), "Storm 2")
+
+    def test_renaming_a_lane_keeps_the_bindings(self):
+        p = Project()
+        n = p.add_lane("Storm")
+        lay = bind(new_layer("gradient"), "mix", LANE + n)
+        p.effects.layers.append(lay)
+        p.rename_lane("Storm", "Gale")
+        self.assertEqual(lay.bindings["mix"][0]["src"], "lane:Gale")
+        self.assertIn("lane:Gale", p.channels)
+        p.remove_lane("Gale")
+        self.assertEqual(lay.bindings["mix"], [])
+
+    def test_retime_moves_keys_events_and_layer_times(self):
+        p = Project()
+        n = p.add_lane("L")
+        p.channels[LANE + n].append(Key(4.0, [1.0]))
+        p.effects.impulses.append({"t": 4.0, "s": 1.0})
+        p.effects.layers.append(new_layer("text", text="x", start=2.0, end=-3.0))
+        p.retime(lambda t: t * 2)
+        self.assertEqual(p.channels[LANE + n][0].t, 8.0)
+        self.assertEqual(p.effects.impulses[0]["t"], 8.0)
+        self.assertEqual(p.effects.layers[0].get("start"), 4.0)
+        self.assertEqual(p.effects.layers[0].get("end"), -3.0)      # relative to the end: unchanged
+
+    def test_projects_of_the_first_version_still_open(self):
+        old = {"version": 3, "channels": {"pos": [], "size": [], "rot": [], "mood": [{"t": 5.0, "v": [1.0], "ease": "smooth"}]},
+               "effects": {"enabled": True, "bg_calm": ["#101010", "#202020"], "flash_colors": ["#ff0000", "#00ff00"],
+                           "title": "Old", "mist": 1.0, "snow": 1.0}}
+        p = Project()
+        p.load_dict(old)
+        self.assertTrue(p.effects.enabled)
+        self.assertIn("Mood", p.effects.lanes)
+        self.assertEqual(p.channels[LANE + "Mood"][0].t, 5.0)
+        self.assertEqual(p.effects.layers[0].get("top"), "#101010")
+        self.assertTrue(any(x.type == "text" and x.get("text") == "Old" for x in p.effects.layers))
+
+
+class TestSignals(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = Path(tempfile.mkdtemp())
+        cls.project = make_project(cls.tmp)
+        cls.score = build_score(cls.project)
+
+    def test_dynamics_and_accents_make_events_and_bindings_follow_signals(self):
+        from sheet_music_animator.signals import Signals
+        sg = Signals(self.project, self.score, 30, 30.0, None)
+        self.assertGreaterEqual(len(sg.events_list), 2)
+        k = int(sg.events_list[0][0] * 30)
+        self.assertGreater(sg.s["events"][k], 0.3)
+        val = sg.evaluate(0.5, [{"src": "events", "amount": 2.0}], 0.0, 1.0)
+        self.assertEqual(val.max(), 1.0)                            # clipped to the setting's range
+        self.assertAlmostEqual(float(sg.evaluate(0.5, [], 0, 1)), 0.5)
+
+
+class TestLooks(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.tmp = Path(tempfile.mkdtemp())
         cls.project = make_project(cls.tmp)
         cls.score = build_score(cls.project)
         cls.project.channels.update(auto_camera(cls.score, cls.project.settings))
-        cls.project.effects.enabled = True
 
-    def test_channel_sampling_matches_pointwise_evaluation(self):
-        p = self.project
-        p.channels["mood"] = [Key(1.0, [0.0]), Key(3.0, [1.0]), Key(5.0, [0.2], "hold"), Key(7.0, [0.9])]
-        ts = np.linspace(0, 9, 91)
-        vec = p.sample_effect("mood", ts)
-        pt = np.array([p.effect_at("mood", t) for t in ts])
-        self.assertLess(np.abs(vec - pt).max(), 1e-5)
-
-    def test_dynamics_and_accents_make_events(self):
-        from sheet_music_animator.effects import EffectTracks
-        tr = EffectTracks(self.project, self.score, 30, 30.0, None)
-        self.assertGreaterEqual(len(tr.impulses), 2)
-        k = int(tr.impulses[0][0] * 30)
-        self.assertGreater(tr.shake_x[k:k + 6].std() + tr.shake_y[k:k + 6].std(), 0)
-
-    def test_frame_has_a_backdrop_and_lights_up_a_struck_note(self):
+    def _renderer(self, W=320, H=180):
         from sheet_music_animator.export import EffectsRenderer
         from sheet_music_animator.scene import SheetScene
         scene = SheetScene(self.score, self.project)
         scene.set_cache(False)
-        W, H = 480, 270
-        r = EffectsRenderer(scene, self.project, W, H, 30, self.score.duration + 2, None)
+        return EffectsRenderer(scene, self.project, W, H, 30, self.score.duration + 2, None)
+
+    def test_every_builtin_look_applies_and_renders(self):
+        for key in looks.BUILTIN:
+            p = Project(xml_path=self.project.xml_path)
+            p.settings.measures_per_line = 4
+            p.channels.update(auto_camera(self.score, p.settings))
+            looks.apply_look(looks.get_look(key), p, self.score)
+            self.assertEqual(p.effects.enabled, looks.BUILTIN[key]["enabled"], key)
+            if not p.effects.enabled:
+                continue
+            from sheet_music_animator.export import EffectsRenderer
+            from sheet_music_animator.scene import SheetScene
+            scene = SheetScene(self.score, p)
+            scene.set_cache(False)
+            r = EffectsRenderer(scene, p, 320, 180, 30, self.score.duration + 2, None)
+            for t in (1.0, 9.5):
+                f = r.frame(int(t * 30))
+                self.assertEqual((f.shape, f.dtype), ((180, 320, 3), np.uint8), key)
+            self.assertGreater(f.mean(), 1.0, key)                  # something was drawn
+            r.close()
+
+    def test_a_look_can_be_captured_and_applied_to_another_project(self):
+        p = Project(xml_path=self.project.xml_path)
+        looks.apply_look(looks.get_look("winter_wind"), p, self.score)
+        cap = looks.capture_look(p, self.score, "mine")
+        q = Project(xml_path=self.project.xml_path)
+        looks.apply_look(json.loads(json.dumps(cap)), q, self.score)
+        self.assertEqual([x.type for x in q.effects.layers], [x.type for x in p.effects.layers])
+        self.assertEqual(set(q.effects.lanes), set(p.effects.lanes))
+        for n in p.effects.lanes:
+            self.assertEqual(len(q.channels[LANE + n]), len(p.channels[LANE + n]))
+            for a, b in zip(p.channels[LANE + n], q.channels[LANE + n]):
+                self.assertAlmostEqual(a.t, b.t, places=2)
+
+    def test_anchors_round_trip(self):
+        t = self.score.measure_infos[5].time + 0.37
+        a = looks.to_anchor(t, self.score)
+        self.assertEqual(a["m"], 6)
+        self.assertAlmostEqual(looks.resolve(a, self.score), t, places=3)
+
+    def test_highlight_lights_up_a_struck_note_and_fades(self):
+        p = Project(xml_path=self.project.xml_path)
+        p.settings.measures_per_line = 4
+        p.channels.update(auto_camera(self.score, p.settings))
+        p.effects.enabled = True
+        p.effects.layers = [new_layer("solid", color="#000000"), new_layer("score", color="#ffffff"),
+                            new_layer("highlight", color_mode="single", color_a="#00a0ff", duration=0.5)]
+        saved, self.project = self.project, p
+        try:
+            r = self._renderer(480, 270)
+        finally:
+            self.project = saved
         t_hit = next(u.time for u in self.score.units if u.heads and u.time > 4.0)
-        lit = r.frame(int(t_hit * 30) + 2)
-        dark = r.frame(int(t_hit * 30) + 40)
-        self.assertEqual(lit.shape, (H, W, 3))
-        self.assertEqual(lit.dtype, np.uint8)
-        # the glow: a cyan-ish (blue > red) bright patch that has faded 1.3 s later
-        blue_excess = lambda f: int(((f[..., 2].astype(int) - f[..., 0].astype(int)) > 90).sum())   # noqa: E731
-        self.assertGreater(blue_excess(lit), blue_excess(dark))
-        self.assertGreater(lit.mean(), 5)                          # not black: backdrop and snow are drawn
-
-
-class TestPresets(unittest.TestCase):
-    def test_plain_preset_restores_the_blank_slate(self):
-        from sheet_music_animator.presets import apply_preset
-        project = make_project(Path(tempfile.mkdtemp()))
-        score = build_score(project)
-        project.channels.update(auto_camera(score, project.settings))
-        apply_preset("winter_wind", project, score)
-        self.assertTrue(project.effects.enabled)
-        project.settings.ink, project.settings.paper = "#ffffff", "#000000"
-        apply_preset("plain", project, score)
-        self.assertFalse(project.effects.enabled)
-        self.assertEqual((project.settings.paper, project.settings.ink, project.settings.fps), ("#ffffff", "#1a1a1a", 30))
-        self.assertTrue(all(not project.channels[c] for c in ("mood", "hush", "lift")))
-        self.assertTrue(project.has_keys())
-
-
-class TestProject(unittest.TestCase):
-    def test_effects_and_time_map_survive_a_round_trip(self):
-        p = Project()
-        p.effects.enabled, p.effects.title = True, "Winter Wind"
-        p.effects.impulses.append({"t": 1.5, "s": 0.8})
-        p.time_map = [[0.0, 0.5], [10.0, 14.0]]
-        p.channels["lift"].append(Key(2.0, [1.0]))
-        q = Project()
-        q.load_dict(json.loads(json.dumps(p.to_dict())))
-        self.assertTrue(q.effects.enabled)
-        self.assertEqual(q.effects.title, "Winter Wind")
-        self.assertEqual(q.effects.impulses, [{"t": 1.5, "s": 0.8}])
-        self.assertEqual(q.time_map, [[0.0, 0.5], [10.0, 14.0]])
-        self.assertEqual(q.channels["lift"][0].v, [1.0])
-
-    def test_retime_moves_keys_and_events(self):
-        p = Project()
-        p.channels["mood"].append(Key(4.0, [1.0]))
-        p.effects.impulses.append({"t": 4.0, "s": 1.0})
-        p.retime(lambda t: t * 2)
-        self.assertEqual(p.channels["mood"][0].t, 8.0)
-        self.assertEqual(p.effects.impulses[0]["t"], 8.0)
+        lit, dark = r.frame(int(t_hit * 30) + 2), r.frame(int(t_hit * 30) + 40)
+        blue = lambda f: int(((f[..., 2].astype(int) - f[..., 0].astype(int)) > 90).sum())   # noqa: E731
+        self.assertGreater(blue(lit), blue(dark))
 
 
 if __name__ == "__main__":

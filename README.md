@@ -29,8 +29,10 @@ python -m venv .venv
 | Hide things in measures | With measures selected, the Selection tab has a drop-down of categories (fingerings, tuplet numbers, articulations, dynamics, slurs, …) that can be switched off for those measures. |
 | Change the line breaks | Select the first measure of a line and press *Move this line up*: the whole line joins the previous one. Select a measure in the middle of a line and press *Move from here to the next line*: it and the measures after it on that line move to the start of the next line (a new line is made after the last one) and get their own clefs, key signature and bracket. The canvas (width and height) and the camera keys follow. |
 | Fit to a recording | Output tab → **Fit the score to a recording…**. The app listens to the recording (any audio file) and moves every note of the score to where it is played, then uses the recording as the soundtrack. Keyframes already placed move along with the music. **Use the score's own timing** goes back. |
-| Produced look | **Effects** tab → *Produced look*: an animated backdrop (sky gradient, drifting mist, wind-blown snow, dark corners), notes that light up when they sound (right hand cyan, left hand amber, with a bloom), camera shake / zoom punch on loud dynamics and accents, a title card, side fades, a spotlight on chosen measures and a fade to black. The **mood** (calm → storm), **hush** and **snow lift** automation lanes appear in the timeline while it is on. *Show the effects in the camera view* previews it. |
-| Presets | Effects tab → **Apply preset**. *Winter Wind (storm)* sets all of the above, and the camera, from the measure numbers of the score (align the score to its recording first). *Plain (white page, no effects)* goes back to the blank slate: dark ink on white, no effects, 1080p30, the automatic camera (the score's layout, fitted recording and audio are kept). |
+| Looks and layers | **Effects** tab. A look is a stack of **layers** drawn bottom to top: backdrops (colour, gradient, flowing mist/fire/water texture, your own photo or video), particles (snow, embers, fireflies, rain, bubbles, or sparks that fly off every note), the notation itself (ink colour, glow, side fades), note highlights (glow, ripple, star flare, column of light; coloured by hand, pitch or register), spotlights, finishing (bloom, dark corners, colour grade, blur, colour fringing, film grain), text, and camera effects (shake, zoom, sway). Add, remove, duplicate, reorder and switch layers off; every layer has its own blend mode, opacity and timing. See *Making your own look* below. |
+| Following the music | Any number setting has a **Link** button: make it follow the loudness, how many notes are playing, the *events* (loud dynamics and accents) or every single note, the pitch height, or one of your own **automation lanes**. Several links can add up. This is what makes snow blow harder in loud passages, the camera shake on a fortissimo, or the sky change colour at a cue. |
+| Automation lanes | Add any number of named lanes (Effects tab → Automation lanes); they appear in the timeline under the camera lanes and are keyframed like the camera. A lane called *Storm* fading a gradient between two palettes is one link away. |
+| Looks you can start from | Effects tab → **Looks**: *Plain*, *Winter Wind (storm)*, *Ember (fire)*, *Fireflies (night garden)*, *Ocean (underwater)*, *Golden rain*, *Neon (night city)*, *Monochrome storm*, *Paper (daylight)* and *Photo backdrop (your own picture)*. **Save this look…** keeps your own as a JSON file (in `~/.sheet_music_animator/looks`; send the file to share it). Times in a look are anchored to measures, so a look made for one piece fits another. |
 | Output | Resolution, frame rate, audio (built-in piano synth, your own audio file, or none) → **Render video…** or **Save current frame as PNG…**. With the produced look on, a render uses one process per slice of the video (set how many in the Output tab; you can render just a part to try things out). |
 | Projects | `Ctrl+S` saves a `.smanim` file (camera keys, timing tweaks, hidden categories, moved elements, line breaks, settings). |
 
@@ -52,6 +54,23 @@ Staves that MuseScore hid because they are empty (`print-object="no"` in the exp
   pitches (Viterbi over candidate attacks).  Checked against the note timing the first Winter Wind
   renderer had worked out for Kissin's recording (with its note list standing in for the score), 80% of
   the notes agree within 30 ms and 96% within 120 ms.
+* `layers.py` – the catalogue of layer types: for each, its settings, ranges, defaults and which settings can
+  follow a signal. The editor builds its panels from it, so adding a new effect means adding one entry there
+  and one drawer in `effects.py`.
+* `signals.py` – the signals of the music (loudness, density, events from dynamics/accents/your markers,
+  every note, pitch) and of your lanes, and the evaluation of links; also the camera layers' motion.
+* `effects.py` – draws a stack of layers into a finished frame: a float canvas with blend modes, one drawer per
+  layer type, the notation's ink arriving as an alpha mask from the Qt scene.
+* `looks.py` / `stacks.py` – saved stacks: applying one, capturing the current setup as a new one, the built-ins.
+  `effects_ui.py` is the tab.
+* `export.py` – draws the camera rectangle for every frame and pipes raw frames to ffmpeg
+  (bundled through `imageio-ffmpeg`). A 2-minute piece at 1080p/30 renders in about half a minute.
+* `analysis.py` – loudness of a recording, and the alignment of the score to it: semitone-resolved
+  features of the recording and of the score (with per-pitch onset detectors) are matched by dynamic time
+  warping, coarse then fine, and every note onset is then snapped to the strongest attack of its own
+  pitches (Viterbi over candidate attacks).  Checked against the note timing the first Winter Wind
+  renderer had worked out for Kissin's recording (with its note list standing in for the score), 80% of
+  the notes agree within 30 ms and 96% within 120 ms.
 * `effects.py` – `EffectTracks` (everything that varies with time: wind from loudness and note density,
   shake/punch/flash from dynamics and accents, mood, vignette, fades) and `Compositor` (backdrop, snow,
   the score's ink as an alpha mask drawn by Qt, per-note light-up with bloom, spotlight, title).
@@ -62,22 +81,43 @@ Staves that MuseScore hid because they are empty (`print-object="no"` in the exp
 * `audio.py` – a small additive piano synth driven by the notes in the file, so there is sound
   without a soundfont. Supply your own recording in the Output tab for anything better.
 
+## Making your own look
+
+1. Effects tab → tick *Produced look* (it starts with a backdrop, the notation and a note highlight) or apply
+   one of the looks and change it.
+2. **Add layer ▾** and pick from the categories. The layer list is drawn bottom to top (the top of the list is
+   in front); put layers *below* the notation for the backdrop, *above* it for light and overlays.
+3. Each layer's settings are listed under it. Colours open a picker, *Appears at* has a ⌖ button that takes the
+   playhead time, a *Picture or video* layer takes any photo or clip (it zooms slowly, loops, can be blurred).
+4. **Link** a setting to make it move: pick a signal and how much it adds. E.g. on a *Particles* layer link
+   *Speed* to *Loudness + density* so the wind blows with the music, link a *Camera shake*'s amount to *Events*,
+   link a *Solid colour* layer (blend *add*) to *Big events* for a lightning flash, link a *Gradient*'s mix to a
+   lane you named *Storm* and keyframe the lane where the storm breaks.
+5. **Save this look…** when you like it.
+
+Recipes: a *fade to black* is a black *Solid colour* with *Appears at* −1.0 (one second before the end) and
+*Fades in over* 1.0; a *title* is a *Text* layer with *Appears at* and *Fades out over*; a *vignette* of colour
+is the *Dark corners* layer with another colour; a *flash on every note* is a *Solid colour* (add) linked to
+*Every note that starts*.
+
 ## Recreating the Winter Wind video
 
-The "Winter Wind" look (calm Lento introduction, storm from bar 5, lit-up notes, shake on the loud chords,
-final spotlight on bar 96) is a preset. You need the MusicXML of the piece (96 measures) and the recording.
+The "Winter Wind (storm)" look (calm Lento introduction, storm from measure 5, lit-up notes, shake on the loud
+chords, final spotlight on measure 96) is one of the built-in looks. You need the MusicXML of the piece
+(96 measures) and the recording.
 
 * In the editor: **Open MusicXML…** (4 measures per line) → Output tab: **Fit the score to a recording…** →
-  Effects tab: **Apply preset** → look at it with *Show the effects in the camera view* → **Render video…**.
-* Or in one command: see below. Apply the preset *after* fitting; it places its cues by measure number.
+  Effects tab: Looks → *Winter Wind (storm)* → **Apply** → look at it with *Show the effects in the camera view*
+  → **Render video…**.
+* Or in one command: see below. Apply the look *after* fitting; it places its cues by measure number.
 
 ## Rendering without the editor
 
 ```
-python -m sheet_music_animator.cli render "Winter Wind.mxl" --audio recording.mp3 --align --preset winter_wind --out winter_wind.mp4
+python -m sheet_music_animator.cli render "Winter Wind.mxl" --audio recording.mp3 --align --look winter_wind --out winter_wind.mp4
 ```
 
-`--align` fits the score to the recording, `--preset` applies a look, `--start/--end` render only a part,
+`--align` fits the score to the recording, `--look` applies a look (a built-in name such as `ember`, the name of one of yours, or a `.json` file), `--start/--end` render only a part,
 `--workers N` sets the number of processes, `--save-project x.smanim` keeps the result for the editor.
 An existing `.smanim` project can be rendered the same way.
 

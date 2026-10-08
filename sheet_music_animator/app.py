@@ -12,6 +12,7 @@ import numpy as np
 from PySide6.QtGui import QAction, QColor, QFont, QImage, QKeySequence, QPalette
 from PySide6.QtWidgets import (QApplication, QCheckBox, QColorDialog, QComboBox, QDialog, QDoubleSpinBox,
                                QFileDialog, QFontComboBox, QFormLayout, QGraphicsView, QGroupBox, QHBoxLayout,
+                               QInputDialog,
                                QLabel, QMainWindow, QMessageBox, QProgressDialog, QPushButton, QSizePolicy, QSpinBox,
                                QSplitter, QTabWidget, QToolBar, QVBoxLayout, QWidget)
 
@@ -20,9 +21,9 @@ from .build import build_score
 from .effects_ui import EffectsPanel
 from .export import (EffectsRenderer, default_workers, effect_loudness, render_frame, render_video,
                      render_video_parallel, total_duration)
-from .presets import PRESETS, apply_preset
-from .project import (CAMERA_CHANNELS, CATEGORIES, CHANNEL_LABELS, CHANNELS, EFFECT_CHANNELS, FIXED_KINDS, Key,
-                      Project, auto_camera, retimer)
+from . import looks
+from .project import (CAMERA_CHANNELS, CATEGORIES, FIXED_KINDS, LANE, Key, Project, auto_camera, is_lane,
+                      retimer)
 from .scene import EditorView, PreviewWidget, SheetScene
 from .layout import relayout_project
 from .timeline import Timeline, fmt
@@ -204,19 +205,22 @@ class MainWindow(QMainWindow):
         pvl = QVBoxLayout(pv)
         pvl.setContentsMargins(4, 4, 4, 4)
         pvl.addWidget(self.preview)
-        sl.addWidget(pv, 3)
+        sl.addWidget(pv, 2)
         self.tabs = QTabWidget()
         self.tabs.addTab(self._camera_tab(), "Camera")
         self.tabs.addTab(self._look_tab(), "Look & timing")
         self.fx_panel = EffectsPanel(self)
         self.fx_panel.changed.connect(self._effects_changed)
-        self.fx_panel.presetRequested.connect(self.apply_preset)
+        self.fx_panel.lookRequested.connect(self.apply_look)
+        self.fx_panel.saveLookRequested.connect(self.save_look)
+        self.fx_panel.deleteLookRequested.connect(self.delete_look)
+        self.fx_panel.structureChanged.connect(self._show_effect_lanes)
         self.fx_panel.chk_preview.setChecked(str(self.cfg.value("fx_preview", "true")).lower() == "true")
         self.fx_panel.chk_preview.toggled.connect(self._fx_preview_toggled)
         self.tabs.addTab(self.fx_panel, "Effects")
         self.tabs.addTab(self._output_tab(), "Output")
         self.tabs.addTab(self._note_tab(), "Selection")
-        sl.addWidget(self.tabs, 2)
+        sl.addWidget(self.tabs, 3)
 
         split = QSplitter(Qt.Horizontal)
         split.addWidget(self.editor)
@@ -1232,17 +1236,23 @@ class MainWindow(QMainWindow):
         return None if self.project.settings.audio == "none" else self.wav_path
 
     def _show_effect_lanes(self):
-        """The mood / hush / lift lanes appear in the timeline while the effects are on."""
-        on = self.project.effects.enabled
-        if on == getattr(self, "_lanes_for", None):
+        """The automation lanes appear in the timeline while the effects are on (and when a lane is added)."""
+        fx = self.project.effects
+        sig = (fx.enabled, tuple(fx.lanes))
+        if sig == getattr(self, "_lanes_for", None):
             return
-        self._lanes_for = on
-        shown = [c for c in self.timeline.visible_channels if c in CAMERA_CHANNELS] or ["pos"]
-        self.timeline.set_visible_channels(shown + (list(EFFECT_CHANNELS) if on else []))
+        old = getattr(self, "_lanes_for", None)
+        self._lanes_for = sig
+        keep = [c for c in self.timeline.visible_channels if c in CAMERA_CHANNELS] or ["pos"]
+        lanes = [LANE + n for n in fx.lanes] if fx.enabled else []
+        if old is not None and old[0] and fx.enabled:           # keep the lanes the user hid, show the new ones
+            shown = [c for c in self.timeline.visible_channels if is_lane(c) and c[len(LANE):] in fx.lanes]
+            lanes = shown + [c for c in lanes if c[len(LANE):] not in old[1]]
+        self.timeline.set_visible_channels(keep + lanes)
 
     def _timeline_selection(self):
         sel = list(self.timeline.selected)
-        key = sel[0] if len(sel) == 1 and any(sel[0] in self.project.channels[c] for c in EFFECT_CHANNELS) else None
+        key = sel[0] if len(sel) == 1 and any(sel[0] in ks for c, ks in self.project.channels.items() if is_lane(c)) else None
         self.fx_panel.show_key(key)
 
     def _effects_changed(self):
@@ -1279,15 +1289,20 @@ class MainWindow(QMainWindow):
         self.preview.show_image(QImage(arr.data, arr.shape[1], arr.shape[0], 3 * arr.shape[1],
                                        QImage.Format_RGB888).copy())
 
-    def apply_preset(self, name: str):
+    def apply_look(self, key: str):
         if self.score is None:
             return
-        if QMessageBox.question(
-                self, "Apply preset", f"“{PRESETS[name]}” replaces the effect settings and the camera, mood, hush and "
-                "snow-lift keyframes. Continue?") != QMessageBox.Yes:
+        try:
+            look = looks.get_look(key)
+        except (OSError, ValueError, KeyError) as e:
+            QMessageBox.critical(self, "Could not open the look", str(e))
+            return
+        if (self.project.effects.layers or self.project.effects.lanes) and QMessageBox.question(
+                self, "Apply look", f"“{look['name']}” replaces the effect layers, lanes and events (you can undo it). "
+                "Continue?") != QMessageBox.Yes:
             return
         ink = self.project.settings.ink
-        notes = apply_preset(name, self.project, self.score)
+        notes = looks.apply_look(look, self.project, self.score)
         self.timeline.selected = set()
         if self.project.settings.ink != ink:      # the ink colour is baked into the engraving
             if self.load_score(old_score=self.score, fresh=False):
@@ -1299,7 +1314,24 @@ class MainWindow(QMainWindow):
         self._fx_dirty = True
         self._refresh_time(follow=False)
         self.commit()
-        self.status.showMessage(" ".join(notes) or f"Applied “{PRESETS[name]}”.", 10000)
+        self.status.showMessage(" ".join(notes) or f"Applied “{look['name']}”.", 10000)
+
+    def save_look(self):
+        if self.score is None or not self.project.effects.layers:
+            self.status.showMessage("There are no layers to save yet.", 4000)
+            return
+        name, ok = QInputDialog.getText(self, "Save this look", "Name of the look:")
+        if not ok or not name.strip():
+            return
+        look = looks.capture_look(self.project, self.score, name.strip())
+        path = looks.save_user_look(look)
+        self.fx_panel.refresh_looks(f"user:{path.stem}")
+        self.status.showMessage(f"Saved the look to {path}", 8000)
+
+    def delete_look(self, key: str):
+        if key.startswith("user:") and QMessageBox.question(self, "Delete look", "Delete this look file?") == QMessageBox.Yes:
+            looks.delete_user_look(key)
+            self.fx_panel.refresh_looks()
 
     # ================================================================== alignment to a recording
     def align_to_recording(self):

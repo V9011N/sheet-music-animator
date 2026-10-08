@@ -76,8 +76,8 @@ class Unit:
     # member has appeared) so the shape grows note by note instead of all at once.
     steps: tuple = ()
     measure: int = -1     # index of the measure the element belongs to (in drawing order)
-    # Notes and chords: (x0, y0, x1, y1, staff, tied) of every notehead in page space; `tied` marks a note
-    # that only continues a tie.  Used by the light-up effect.
+    # Notes and chords: (x0, y0, x1, y1, staff, tied, pitch) of every notehead in page space; `tied` marks a
+    # note that only continues a tie; `pitch` is the written MIDI pitch (without accidentals).  For the light-up effect.
     heads: tuple = ()
     label: str = ""       # dynamics: what is written ("ff", "sfz"); articulations: "acc", "marc", ...
 
@@ -661,7 +661,7 @@ def engrave(path, layout: str = "pages", ink: str = "#000000", progress=None,
     say("Engraving with Verovio…")
     tk = verovio.toolkit()
     opts = {"scale": 40, "svgViewBox": True, "header": "none", "footer": "none",
-            "svgAdditionalAttribute": ["tie@endid", "artic@artic"],
+            "svgAdditionalAttribute": ["tie@endid", "artic@artic", "note@pname", "note@oct"],
             "pageMarginLeft": 40, "pageMarginRight": 40, "pageMarginTop": 60, "pageMarginBottom": 60}
     breaks = None
     if line_starts is not None or measures_per_line is not None:
@@ -1000,7 +1000,10 @@ class _Builder:
             x0, y0, x1, y1 = _xf_box(b, self.m)
             cy = (y0 + y1) / 2
             staff = min(range(len(staves)), key=lambda i: abs(cy - (staves[i][0] + staves[i][1]) / 2)) if staves else 0
-            out.append((x0, y0, x1, y1, staff, (n.get("id") or "") in self.tied_ids))
+            pname, octave = n.get("data-pname"), n.get("data-oct")
+            pitch = (12 * (int(octave) + 1) + "cdefgab".index(pname) * 2 - (1 if "cdefgab".index(pname) > 2 else 0)
+                     ) if pname and octave and pname in "cdefgab" else 60
+            out.append((x0, y0, x1, y1, staff, (n.get("id") or "") in self.tied_ids, pitch))
         return tuple(out)
 
     def _make_units(self):

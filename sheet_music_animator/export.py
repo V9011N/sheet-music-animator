@@ -69,19 +69,18 @@ def effect_loudness(project: Project, audio_path: str | None):
 
 class EffectsRenderer:
     """Finished frames (numpy RGB) of a project with effects.  The scene's ink is drawn by Qt as an alpha
-    mask for the camera of that frame; everything else is composited by `effects.Compositor`."""
+    mask for the camera of that frame; everything else is made by `effects.Compositor`."""
 
     def __init__(self, scene: SheetScene, project: Project, W: int, H: int, fps: int, duration: float,
                  loudness=None):
-        from .effects import Compositor, EffectTracks
+        from .effects import Compositor
         self.scene, self.project, self.W, self.H, self.fps = scene, project, W, H, fps
-        self.tracks = EffectTracks(project, scene.score, fps, duration, loudness)
-        self.comp = Compositor(project, scene.score, self.tracks, W, H, fps)
+        self.comp = Compositor(project, scene.score, W, H, fps, duration, loudness)
         self.image = QImage(W, H, QImage.Format_ARGB32_Premultiplied)
-        self._spot_rects = [self._page_rect(sp) for sp in project.effects.spotlights]
+        self._spots = {lay.id: self._page_range(lay) for lay in project.effects.layers if lay.type == "spotlight"}
 
-    def _page_rect(self, sp):
-        lo, hi = sorted((int(sp["m0"]), int(sp["m1"])))
+    def _page_range(self, lay):
+        lo, hi = sorted((int(lay.get("from_measure")) - 1, int(lay.get("to_measure")) - 1))
         infos = [m for m in self.scene.score.measure_infos if lo <= m.index <= hi and m.rect[2] > 0]
         if not infos:
             return None
@@ -91,19 +90,17 @@ class EffectsRenderer:
     def _spot_pixels(self, pose):
         from .effects import view_matrix
         M = view_matrix(pose, self.W, self.H)
-        out = []
-        for r in self._spot_rects:
-            if r is None:
-                out.append(None)
-                continue
-            xs = [M[0, 0] * x + M[0, 1] * y + M[0, 2] for x in (r[0], r[2]) for y in (r[1], r[3])]
-            out.append((min(xs), max(xs)))
+        out = {}
+        for lid, r in self._spots.items():
+            if r is not None:
+                xs = [M[0, 0] * x + M[0, 1] * y + M[0, 2] for x in (r[0], r[2]) for y in (r[1], r[3])]
+                out[lid] = (min(xs), max(xs))
         return out
 
     def frame(self, k: int) -> np.ndarray:
         t = k / self.fps
         self.scene.apply_time(t)
-        pose = self.tracks.camera(k, self.project.camera_pose(t), self.W, self.H)
+        pose = self.comp.camera_pose(k, self.project.camera_pose(t))
         self.image.fill(Qt.transparent)
         saved = self.scene.backgroundBrush()
         self.scene.setBackgroundBrush(QBrush(Qt.NoBrush))
@@ -116,8 +113,10 @@ class EffectsRenderer:
         bpl = self.image.bytesPerLine()
         ink = np.frombuffer(self.image.constBits(), np.uint8).reshape(self.H, bpl)[:, :self.W * 4]
         alpha = np.ascontiguousarray(ink.reshape(self.H, self.W, 4)[..., 3])
-        self.comp.seek_snow(k)
         return self.comp.frame(k, alpha, pose, self._spot_pixels(pose))
+
+    def close(self):
+        self.comp.close()
 
 
 # ====================================================================================== ffmpeg
@@ -205,13 +204,13 @@ def _worker(job: dict, q) -> None:
         proc = subprocess.Popen(_encoder(job["w"], job["h"], job["fps"], job["out"], job["crf"], "rgb24", None, 2, job["preset"]),
                                 stdin=subprocess.PIPE, creationflags=_NO_WINDOW)
         k0, k1 = job["k0"], job["k1"]
-        r.comp.seek_snow(k0)
         for k in range(k0, k1):
             proc.stdin.write(r.frame(k).tobytes())
             if (k - k0) % 10 == 9 or k == k1 - 1:
                 q.put(("progress", job["id"], k - k0 + 1))
         proc.stdin.close()
         code = proc.wait()
+        r.close()
         q.put(("done", job["id"], code))
     except BaseException as e:   # report anything, the parent decides
         import traceback
