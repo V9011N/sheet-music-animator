@@ -38,7 +38,7 @@ python -m venv .venv
 
 Staves that MuseScore hid because they are empty (`print-object="no"` in the exported MusicXML) stay hidden for those systems; Verovio ignores this itself, so the animator removes them.
 
-Interested in the project and want to help with further development? Join the Discord: https://discord.gg/HDRX89mQ9
+### Interested in the project and want to help with further development? Join the Discord: https://discord.gg/HDRX89mQ9
 
 ## How it works
 
