@@ -300,11 +300,11 @@ NO_ENGINE = ("Reading music from a PDF needs an optical music recognition progra
              "• homr: pip install homr\n\nThen open the PDF again.")
 
 
-def _run(cmd, say, frac0, frac1, text, log: Path) -> int:
+def _run(cmd, say, frac0, frac1, text, log: Path, env=None) -> int:
     """Run an engine, keeping the progress dialog alive; returns its exit code."""
     with open(log, "ab") as out:
         proc = subprocess.Popen([str(c) for c in cmd], stdout=out, stderr=subprocess.STDOUT,
-                                stdin=subprocess.DEVNULL)
+                                stdin=subprocess.DEVNULL, env={**os.environ, **env} if env else None)
         t0 = time.monotonic()
         while proc.poll() is None:
             f = frac0 + (frac1 - frac0) * (1 - np.exp(-(time.monotonic() - t0) / 60.0))
@@ -376,6 +376,75 @@ def merge_scores(roots: list) -> etree._Element:
     return base
 
 
+SPANNERS = ("octave-shift", "wedge", "dashes", "bracket")
+
+
+def tidy(root) -> int:
+    """Take out what an OMR engine writes that the engraver cannot take: lines it starts and never stops (8va,
+    hairpins, dashes, brackets: misreads, and an unclosed 8va line crashes the engraver), pedals let go that were
+    never pressed (Verovio's MIDI then fails), and beams repeated on every note of a chord (Audiveris; Verovio
+    then drops the chord).  Returns how many were taken out."""
+    gone = []
+    for part in root.findall("part"):
+        open_ = {}                                      # (kind, number, staff) -> the element that started it
+        for d in part.iter("direction"):
+            staff = d.findtext("staff") or "1"
+            for e in [e for dt in d.findall("direction-type") for e in dt if e.tag in SPANNERS]:
+                key, kind = (e.tag, e.get("number", "1"), staff), e.get("type")
+                if kind == "continue":
+                    continue
+                if kind == "stop":
+                    match = key if key in open_ else next(      # numbered inconsistently: the oldest of its kind
+                        (k for k in open_ if k[0] == key[0] and k[2] == staff),
+                        next((k for k in open_ if k[0] == key[0]), None))
+                    if match is None:
+                        gone.append(e)                  # a stop without a start
+                    else:
+                        del open_[match]
+                    continue
+                if key in open_:
+                    gone.append(open_[key])             # started again before it stopped
+                open_[key] = e
+        gone += open_.values()
+    for part in root.findall("part"):    # a pedal let go that was never pressed: Verovio's MIDI goes back in time
+        down = False
+        for e in part.iter("pedal"):
+            kind = e.get("type")
+            if kind == "start":
+                down = True
+            elif kind in ("stop", "change", "continue") and not down:
+                gone.append(e)
+            elif kind == "stop":
+                down = False
+    for note in root.iter("note"):   # beams repeated on every note of a chord: Verovio then loses the chord's notes
+        if note.find("chord") is not None:
+            gone += note.findall("beam")
+    for e in gone:
+        if e.tag == "beam":
+            e.getparent().remove(e)
+            continue
+        dt = e.getparent()
+        dt.remove(e)
+        if len(dt) == 0:
+            d = dt.getparent()
+            d.remove(dt)
+            if d.find("direction-type") is None:
+                d.getparent().remove(d)
+    return len(gone)
+
+
+ENGRAVE_CHECK = ("import sys; sys.path.insert(0, sys.argv[1]); from sheet_music_animator.engraver import engrave; "
+                 "engrave(sys.argv[2])")
+
+
+def _engraves(path: Path, say, log: Path) -> bool:
+    """Whether the program's engraver can draw the score.  Tried in a separate process: a score the engraver
+    cannot take can crash it, and in this process that would close the program."""
+    code = _run([sys.executable, "-c", ENGRAVE_CHECK, Path(__file__).resolve().parents[1], path], say, 0.96, 0.99,
+                "Checking that the score can be engraved…", log, {"QT_QPA_PLATFORM": "offscreen"})
+    return code == 0
+
+
 def _check_result(root, name: str) -> tuple[int, int, int]:
     parts, measures, notes = score_stats(root)
     if not parts or not measures:
@@ -402,7 +471,12 @@ def recognize(pdf, pages: list[int], out_path, progress=None, engine: str | None
         else:
             root = _with_homr(Path(pdf), pages, work, log, say)
         _check_result(root, engine)
+        tidy(root)
         out_path.write_bytes(etree.tostring(root.getroottree(), xml_declaration=True, encoding="UTF-8"))
+        if not _engraves(out_path, say, work / "engrave.log"):
+            raise OmrError(f"{engine} read the music, but this program cannot draw the result (it is saved as "
+                           f"{out_path}). Open that file in a notation program such as MuseScore, save it again as "
+                           f"MusicXML and open it with Open XML…")
         say(1.0, "")
         return out_path
     finally:

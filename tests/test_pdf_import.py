@@ -6,6 +6,7 @@ The PDFs are made on the fly (a score engraved by Verovio, text, empty staves, t
 OMR engines are stand-ins that answer like Audiveris and homr on the command line."""
 import os
 import sys
+from collections import Counter
 import tempfile
 import textwrap
 import unittest
@@ -90,6 +91,23 @@ def musicxml(measures=2, notes=True) -> str:
                    + note + '</measure>' for i in range(measures))
     return ('<?xml version="1.0" encoding="UTF-8"?><score-partwise version="3.1"><part-list><score-part id="P1">'
             f'<part-name>Piano</part-name></score-part></part-list><part id="P1">{body}</part></score-partwise>')
+
+
+def with_lines(xml: str, lines) -> str:
+    """`xml` with direction lines added: (measure, kind, type, number, staff)."""
+    root = etree.fromstring(xml.encode())
+    measures = root.find("part").findall("measure")
+    for m, kind, typ, number, staff in lines:
+        d = etree.SubElement(measures[m - 1], "direction")
+        etree.SubElement(etree.SubElement(d, "direction-type"), kind, type=typ, number=number)
+        etree.SubElement(d, "staff").text = staff
+    return etree.tostring(root).decode()
+
+
+def pitches(root) -> Counter:
+    step = {"C": 0, "D": 2, "E": 4, "F": 5, "G": 7, "A": 9, "B": 11}
+    return Counter(12 * (int(p.findtext("octave")) + 1) + step[p.findtext("step")] + int(float(p.findtext("alter") or 0))
+                   for p in root.iter("pitch"))
 
 
 def fake_engine(folder: Path, name: str, body: str) -> Path:
@@ -220,6 +238,55 @@ class TestRecognition(unittest.TestCase):
         pdf = make_pdf(self.dir / "two.pdf", ["music", "music"])
         with self.with_engine(homr=[str(exe)]), self.assertRaisesRegex(pdfimport.OmrError, "page 2"):
             pdfimport.recognize(pdf, [0, 1], self.out)
+
+    def test_lines_an_engine_never_closes_are_taken_out(self):
+        """Audiveris read two 15ma lines into the Heroic Polonaise that never end; Verovio crashes on them."""
+        root = etree.fromstring(with_lines(musicxml(4), [
+            (1, "octave-shift", "down", "1", "1"),                      # never stopped: out
+            (2, "wedge", "crescendo", "1", "2"), (3, "wedge", "stop", "2", "2"),   # numbered loosely: kept
+            (2, "octave-shift", "up", "1", "2"), (3, "octave-shift", "stop", "1", "2"),
+            (4, "dashes", "stop", "1", "1"),                           # a stop without a start: out
+        ]).encode())
+        self.assertEqual(pdfimport.tidy(root), 2)
+        left = [(e.tag, e.get("type")) for e in root.iter("octave-shift", "wedge", "dashes")]
+        self.assertEqual(left, [("wedge", "crescendo"), ("octave-shift", "up"), ("wedge", "stop"),
+                                ("octave-shift", "stop")])
+
+    def test_beams_on_every_note_of_a_chord_and_pedals_never_pressed_are_taken_out(self):
+        """Audiveris writes both; Verovio then drops chords (4,500 of the Polonaise's 5,600 notes engraved) and
+        its MIDI fails (a pedal let go before the first note)."""
+        chord = ('<note><pitch><step>C</step><octave>4</octave></pitch><duration>1</duration><type>quarter</type>'
+                 '<beam number="1">begin</beam></note><note><chord/><pitch><step>E</step><octave>4</octave></pitch>'
+                 '<duration>1</duration><type>quarter</type><beam number="1">begin</beam></note>')
+        pedal = '<direction><direction-type><pedal type="{}"/></direction-type></direction>'
+        xml = musicxml(2).replace('<note>', pedal.format("stop") + chord + pedal.format("start") + '<note>', 1)
+        xml = xml.replace('</measure><measure number="2">', pedal.format("stop") + '</measure><measure number="2">')
+        root = etree.fromstring(xml.encode())
+        self.assertEqual(pdfimport.tidy(root), 2)
+        notes = root.find("part/measure").findall("note")
+        self.assertEqual([len(n.findall("beam")) for n in notes[:2]], [1, 0])
+        self.assertEqual([p.get("type") for p in root.iter("pedal")], ["start", "stop"])
+
+    def test_an_unclosed_8va_from_the_engine_is_tidied_and_opens(self):
+        exe = fake_engine(self.dir, "audiveris", audiveris(with_lines(musicxml(3), [(2, "octave-shift", "down", "1", "1")])))
+        with self.with_engine(audiveris=str(exe)):
+            root = pdfimport.read_musicxml(pdfimport.recognize(self.pdf, [0], self.out))
+        self.assertIsNone(root.find(".//octave-shift"))
+
+    def test_a_score_the_engraver_cannot_draw_is_reported_instead_of_crashing(self):
+        exe = fake_engine(self.dir, "audiveris", audiveris(with_lines(musicxml(3), [(2, "octave-shift", "down", "1", "1")])))
+        with self.with_engine(audiveris=str(exe)), mock.patch.object(pdfimport, "tidy", lambda root: 0), \
+                self.assertRaisesRegex(pdfimport.OmrError, "cannot draw"):
+            pdfimport.recognize(self.pdf, [0], self.out)       # an unclosed 8va: Verovio crashes, in a child process
+        self.assertTrue(self.out.exists())                      # kept, to be fixed in a notation program
+
+    @unittest.skipUnless(pdfimport._audiveris(), "Audiveris is not installed")
+    def test_audiveris_reads_an_engraved_page(self):
+        """The real thing: a page engraved by Verovio, read back by Audiveris."""
+        source = etree.fromstring(make_score_xml(16).encode())
+        root = pdfimport.read_musicxml(pdfimport.recognize(self.pdf, [0], self.out))
+        a, b = pitches(source), pitches(root)
+        self.assertGreater(2 * sum((a & b).values()) / (sum(a.values()) + sum(b.values())), 0.8)
 
     def test_the_result_is_kept_next_to_the_pdf_without_overwriting(self):
         first = pdfimport.output_path(self.pdf)

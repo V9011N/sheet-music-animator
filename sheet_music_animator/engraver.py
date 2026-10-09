@@ -1610,6 +1610,9 @@ class _Builder:
 
     def _audio_notes(self, tk):
         notes = self._midi_notes(tk)
+        last = max(self.off.values(), default=0.0) + 1.0
+        if notes is not None and any(n[2] > last for n in notes):
+            notes = None    # Verovio's MIDI went wrong (voices of a measure that do not add up, e.g. read by OMR)
         if notes is None:   # slow path: ask Verovio for every element's pitch
             notes = []
             for r in self.recs:
