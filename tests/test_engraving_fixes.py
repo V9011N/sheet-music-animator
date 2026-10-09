@@ -76,6 +76,20 @@ class TestEngravingFixes(unittest.TestCase):
         gap = s.measure_infos[0].rect[3]                     # both staves of the measure
         self.assertTrue(all(u.rect[3] < 0.5 * gap for u in arps))
 
+    def test_a_rolled_chord_is_reported_as_one_roll(self):
+        """Verovio plays a roll as notes a few hundredths apart; the alignment needs to know they are one chord."""
+        arp = "<arpeggiate/>"
+        right = note("C", 5, inner=arp) + note("E", 5, chord=True, inner=arp) + note("G", 5, chord=True, inner=arp) + \
+            note("D", 5, typ="half") + note("E", 5)
+        left = BACK + note("C", 3, 2, 5, inner=arp) + note("G", 3, 2, 5, chord=True, inner=arp) + \
+            note("D", 3, 2, 5, typ="half") + note("E", 3, 2, 5)
+        s = engraver.engrave(score([right + left]), measures_per_line=4)
+        self.assertEqual(len(s.rolls), 1)                    # the two hands' rolls start together: one event
+        onsets = sorted({n[1] for n in s.notes})
+        roll = [t for t in onsets if t < 0.2]
+        self.assertGreater(len(roll), 1)
+        self.assertTrue(all(min(abs(t - r) for r in s.rolls[0]) < 0.01 for t in roll))
+
     def test_two_dynamics_at_one_moment_become_one_marking(self):
         d = '<direction placement="below"><direction-type><dynamics><{}/></dynamics></direction-type><staff>2</staff></direction>'
         right = "".join(note(s, 5) for s in "CDEF")

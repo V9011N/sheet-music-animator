@@ -57,7 +57,8 @@ def render(args) -> int:
             return 2
         print("Fitting the score to the recording…", flush=True)
         al = analysis.align_score(score.nominal_notes, s.audio,
-                                  lambda f, text="": print(f"  {100 * f:3.0f}% {text}", flush=True) or True)
+                                  lambda f, text="": print(f"  {100 * f:3.0f}% {text}", flush=True) or True,
+                                  rolls=score.rolls)
         project.time_map, s.align_audio = al.points(), s.audio
         project.sync_conf, project.sync_overall = al.heat(), al.overall
         score = build_score(project)

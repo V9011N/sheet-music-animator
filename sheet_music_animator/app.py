@@ -1527,7 +1527,7 @@ class MainWindow(QMainWindow):
             return True
 
         try:
-            al = analysis.align_score(self.score.nominal_notes, path, progress)
+            al = analysis.align_score(self.score.nominal_notes, path, progress, rolls=self.score.rolls)
         except Exception as e:
             dlg.close()
             QMessageBox.critical(self, "Could not fit the score", f"{e}")

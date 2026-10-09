@@ -254,8 +254,9 @@ def _active_range(y: np.ndarray, fps: int = 50, floor: float | None = None):
     return (loud[0] / fps, (loud[-1] + 1) / fps) if len(loud) else (0.0, len(y) / SR)
 
 
-def align_score(notes, audio_path: str, progress=None, refine: bool = True) -> Alignment:
-    """Time map from score time to the recording.  `notes`: (midi pitch, start, end, ...) in score seconds."""
+def align_score(notes, audio_path: str, progress=None, refine: bool = True, rolls=()) -> Alignment:
+    """Time map from score time to the recording.  `notes`: (midi pitch, start, end, ...) in score seconds;
+    `rolls`: the onset times of the notes of every rolled chord (`Score.rolls`)."""
     say = progress or (lambda f, s="": True)
     notes = sorted(notes, key=lambda n: n[1])
     if len(notes) < 8:
@@ -299,7 +300,7 @@ def align_score(notes, audio_path: str, progress=None, refine: bool = True) -> A
     est_dtw = est.copy()
     if refine:
         say(0.7, "Snapping notes to their attacks…")
-        est2, strength, clarity = _refine(ya, shifted, onsets, est)
+        est2, strength, clarity = _refine(ya, shifted, onsets, est, [tuple(t - s0 for t in r) for r in rolls])
         shifts = est2 - est
         est = est2
     est = np.maximum.accumulate(est)
@@ -403,12 +404,15 @@ SNAP_WINDOW = 0.55       # how far (s) from the DTW estimate an attack may be ta
 SNAP_SPARSE = 2.5        # ...and this many times the gap to the neighbouring notes in sparse music (a long pause)
 SNAP_MAX = 3.0
 SNAP_CANDIDATES = 10
+SNAP_CAP = 6.0           # attacks stronger than this (z) count no more
 SNAP_PEAK = 0.9          # an attack must stand this far (z) above the rest of the window to be a candidate
 SNAP_FREE_RATIO = 2.2    # an interval between two notes may differ from the DTW's by this factor at no cost
 SNAP_RATIO_COST = 1.5
+SNAP_MATCH = 5.0         # weight of how well the sound after an attack holds the pitches of its notes
 SNAP_NEAR = 0.2          # notes written closer than this (s) are expected to be played close together
 SNAP_EARLY = 0.25        # ...and one that lies more than this ahead of the next one is suspicious
 SNAP_TOGETHER = 0.03     # how close to the next note's attack a candidate must be to count as the same moment
+SNAP_GRACE = 0.05        # notes written closer than this (s) before a chord are grace notes, played with it or before
 
 
 RUN_MIN = 8              # this many notes or more, written evenly...
@@ -491,7 +495,36 @@ def _fit_runs(flux, fps, binhz, by_time, onsets, est):
     return est
 
 
-def _refine(ya, notes, onsets, est):
+ROLL_MATCH = 0.01        # how close (s) an onset must lie to a time of a roll to be one of its notes
+ROLL_REACH = 0.08        # the attacks of the notes of a roll lie within twice this (s) of each other
+
+
+def _events(onsets, rolls=()):
+    """The first and last onset of the event every onset belongs to: a single note or chord, or all the notes of
+    a rolled chord (which the score plays a few hundredths apart)."""
+    n = len(onsets)
+    first, last = np.arange(n), np.arange(n)
+    for r in rolls:
+        i = int(np.searchsorted(onsets, min(r) - ROLL_MATCH))
+        j = int(np.searchsorted(onsets, max(r) + ROLL_MATCH, side="right")) - 1
+        if j > i:
+            first[i:j + 1] = np.minimum(first[i:j + 1], first[i])
+            last[i:j + 1] = j
+    return first, last
+
+
+def _room(onsets, first, last) -> np.ndarray:
+    """Distance (s) from every onset to the nearest onset of another event.  The notes of a rolled chord are
+    written a few hundredths apart; measured note by note they would look like the densest music and only be
+    searched for close to the DTW estimate, even after a long pause the DTW got wrong (Heroic Polonaise m. 81:
+    the first of six identical E major chords was put into the silence before them)."""
+    n = len(onsets)
+    before = np.where(first > 0, onsets - onsets[np.maximum(first - 1, 0)], np.inf)
+    after = np.where(last < n - 1, onsets[np.minimum(last + 1, n - 1)] - onsets, np.inf)
+    return np.minimum(before, after)
+
+
+def _refine(ya, notes, onsets, est, rolls=()):
     """Choose, for every onset, the attack of its own pitches that makes the best monotone sequence.
 
     Candidates are the peaks of a per-pitch onset detector around the DTW estimate; a Viterbi pass
@@ -510,8 +543,8 @@ def _refine(ya, notes, onsets, est):
         by_time.setdefault(round(s, 4), []).append(p)
     est = _fit_runs(flux, fps, binhz, by_time, onsets, est)
 
-    gaps = np.diff(onsets)
-    room = np.minimum(np.r_[np.inf, gaps], np.r_[gaps, np.inf])        # distance to the nearest neighbouring onset
+    first, last = _events(onsets, rolls)
+    room = _room(onsets, first, last)
     cands = []     # per onset: (times, strengths); the DTW estimate is always one of them
     norm = []      # per onset: (mean, std) of its onset curve in its window, to judge other moments the same way
     own_bins = []  # per onset: the spectrum bins of its notes' pitches (for judging the attack afterwards)
@@ -540,21 +573,72 @@ def _refine(ya, notes, onsets, est):
             den = z[i - 1] - 2 * z[i] + z[i + 1]
             d = 0.5 * (z[i - 1] - z[i + 1]) / den if den else 0.0
             times.append((a + i + d) / fps - 0.005)
-            strength.append(min(z[i], 6.0))
+            strength.append(min(z[i], SNAP_CAP))
         times.append(e)
         strength.append(0.0)                            # no evidence for "keep the estimate"
         o = np.argsort(times)
         cands.append((np.array(times)[o], np.array(strength)[o]))
 
-    # Viterbi over the candidates
     n = len(onsets)
-    score = [cands[0][1].copy()]
+    if SNAP_MATCH:
+        # Is the sound right after a candidate more like this event than the one before?  The ring of a chord
+        # held through a pause otherwise passes for the attack of the next one (and every later chord of a run
+        # of identical ones then takes the attack of the chord before it).
+        fr = np.arange(nb) * binhz
+        ok = np.nonzero((fr > 60.0) & (fr < 2000.0))[0]
+        M = np.zeros((nb, 12))
+        M[ok, np.round(12 * np.log2(fr[ok] / 440.0) + 69).astype(int) % 12] = 1.0
+        cs = np.vstack([np.zeros(12), np.cumsum(L @ M, axis=0)])
+
+        def classes(g):
+            v = np.zeros(12)
+            for i in range(first[g], last[g] + 1):
+                for p in by_time.get(round(onsets[i], 4), ()):
+                    v[p % 12] = 1.0
+            return v / (np.linalg.norm(v) + 1e-9)
+        for k in range(1, n):
+            if first[k] == 0:
+                continue
+            v, u = classes(k), classes(first[k] - 1)
+            tk, sk = cands[k]
+            a = np.clip(((tk + 0.03) * fps).astype(int), 0, len(cs) - 2)
+            b = np.clip(((tk + 0.25) * fps).astype(int), a + 1, len(cs) - 1)
+            c = cs[b] - cs[a]
+            c = c / (np.linalg.norm(c, axis=1, keepdims=True) + 1e-9)
+            cands[k] = (tk, sk + SNAP_MATCH * (c @ v - c @ u))
+
+    # A roll is one event.  Its notes' attacks scatter by a few hundredths: gather them into clusters, each
+    # judged by how well all the notes start there, at the moment of its strongest attack.
+    for g in np.unique(first[last > first]):
+        e = last[g]
+        tt = np.concatenate([cands[k][0] for k in range(g, e + 1)])
+        ss = np.concatenate([cands[k][1] for k in range(g, e + 1)])
+        who = np.concatenate([np.full(len(cands[k][0]), k) for k in range(g, e + 1)])
+        o = np.argsort(tt)
+        tt, ss, who = tt[o], ss[o], who[o]
+        ts, st = [], []
+        i = 0
+        while i < len(tt):
+            j = i
+            while j + 1 < len(tt) and tt[j + 1] - tt[j] <= SNAP_TOGETHER and tt[j + 1] - tt[i] <= 2 * ROLL_REACH:
+                j += 1
+            best = {}
+            for t, v, k in zip(tt[i:j + 1], ss[i:j + 1], who[i:j + 1]):
+                best[k] = max(best.get(k, 0.0), v)
+            ts.append(tt[i + int(np.argmax(ss[i:j + 1]))])
+            st.append(sum(best.values()) / (e - g + 1))
+            i = j + 1
+        cands[g] = (np.array(ts), np.array(st))
+
+    # Viterbi over the candidates of the events (a roll by its first note)
+    heads = np.nonzero(first == np.arange(n))[0]
+    score = [cands[heads[0]][1].copy()]
     back = []
-    for k in range(1, n):
+    for h, k in zip(heads[:-1], heads[1:]):
         tk, sk = cands[k]
-        tp, _ = cands[k - 1]
-        d_est = max(est[k] - est[k - 1], 1e-3)
-        dt = tk[:, None] - tp[None, :]                  # (cand k, cand k-1)
+        tp, _ = cands[h]
+        d_est = max(est[k] - est[h], 1e-3)
+        dt = tk[:, None] - tp[None, :]                  # (cand k, cand h)
         ratio = np.abs(np.log(np.maximum(dt, 1e-3) / d_est))
         pen = SNAP_RATIO_COST * np.maximum(ratio - np.log(SNAP_FREE_RATIO), 0)
         pen = np.where(dt < 0.012, 1e3, pen)            # notes cannot be simultaneous or reversed
@@ -562,10 +646,15 @@ def _refine(ya, notes, onsets, est):
         j = np.argmax(tot, axis=1)
         score.append(sk + tot[np.arange(len(tk)), j])
         back.append(j)
-    idx = [int(np.argmax(score[-1]))]
-    for k in range(n - 2, -1, -1):
-        idx.append(int(back[k][idx[-1]]))
-    idx.reverse()
+    pick = [int(np.argmax(score[-1]))]
+    for i in range(len(heads) - 2, -1, -1):
+        pick.append(int(back[i][pick[-1]]))
+    pick.reverse()
+    idx = [0] * n
+    for h, j in zip(heads, pick):
+        idx[h] = j
+        for k in range(h + 1, last[h] + 1):             # the rest of a roll: at its first note's moment for now
+            cands[k] = (cands[h][0][j:j + 1], cands[h][1][j:j + 1])
     # A note written right before the next one (a bass note under the first note of a run) can be played at the
     # very same instant, which the pairwise search above forbids; it then ends up at some earlier, fainter
     # attack of its own bins.  If a note sits far ahead of its neighbour while its own pitches also start at the
@@ -576,22 +665,40 @@ def _refine(ya, notes, onsets, est):
         lo, hi = max(k - 4, 0), min(k + 4, n - 1)
         if onsets[hi] > onsets[lo]:
             tempo[k] = (est[hi] - est[lo]) / (onsets[hi] - onsets[lo])
+
+    def attack(k, t):
+        """How strongly the pitches of onset k start at moment t (z, as its candidates are judged)."""
+        if norm[k] is None:
+            return 0.0
+        f = int(round((t + 0.005) * fps))
+        tol = int(round(SNAP_TOGETHER * fps))
+        z = (flux[max(f - tol, 0):f + tol + 1][:, own_bins[k]].sum(axis=1) - norm[k][0]) / norm[k][1]
+        return min(float(z.max()), SNAP_CAP) if len(z) else 0.0
     for k in range(n - 1):
         near = onsets[k + 1] - onsets[k]
         t_k, t_next = cands[k][0][idx[k]], cands[k + 1][0][idx[k + 1]]
         if near < SNAP_NEAR and t_next - t_k > max(SNAP_EARLY, 2.5 * near * tempo[k]):
+            # ...unless it is the next note that is late: grace notes struck in time, the chord they lead to
+            # put at a later, weaker bump because its own attack lay outside the window searched.
+            early = attack(k + 1, t_k) if near < SNAP_GRACE else 0.0
+            if early > SNAP_PEAK and attack(k, t_k) + early > attack(k, t_next) + attack(k + 1, t_next):
+                tn, sn = cands[k + 1]
+                cands[k + 1] = (np.r_[tn, t_k], np.r_[sn, early])
+                idx[k + 1] = len(tn)
+                continue
             tk, sk = cands[k]
             close = [j for j in range(len(tk)) if abs(tk[j] - t_next) <= SNAP_TOGETHER and sk[j] > 0]
             if close:
                 idx[k] = max(close, key=lambda j: sk[j])
-            elif norm[k] is not None:
-                f = int(round((t_next + 0.005) * fps))
-                tol = int(round(SNAP_TOGETHER * fps))
-                z = (flux[max(f - tol, 0):f + tol + 1][:, own_bins[k]].sum(axis=1) - norm[k][0]) / norm[k][1]
-                if len(z) and z.max() > SNAP_PEAK:
-                    cands[k] = (np.r_[tk, t_next], np.r_[sk, min(z.max(), 6.0)])
+            else:
+                z = attack(k, t_next)
+                if z > SNAP_PEAK:
+                    cands[k] = (np.r_[tk, t_next], np.r_[sk, z])
                     idx[k] = len(tk)
     final = np.array([cands[k][0][idx[k]] for k in range(n)])
+    # A roll unfolds from its moment at its written speed.
+    for g in np.unique(first[last > first]):
+        final[g:last[g] + 1] = final[g] + onsets[g:last[g] + 1] - onsets[g]
     # How specific is the attack at the chosen moment?  The onset energy in the note's own bins against the
     # average onset energy of the pitch range: about 1 for an unrelated moment (or noise), well above for a
     # note that really starts there.

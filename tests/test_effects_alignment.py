@@ -201,6 +201,32 @@ class TestAlignment(unittest.TestCase):
         self.assertGreater(np.abs(ahead - played).max(), 0.3)
         self.assertLess(np.abs(fitted - played).max(), 0.03)
 
+    def test_identical_rolled_chords_after_a_pause_each_find_their_own_attack(self):
+        """Heroic Polonaise mm. 80-82: a chord rings into a pause longer than written, then six identical rolled
+        chords.  The DTW puts the first roll in the pause and every later one an attack early; a roll's notes
+        (written a few hundredths apart) are one event, and the ring of the chord before is not its attack."""
+        tmp = Path(tempfile.mkdtemp())
+        ab, e = (44, 56, 60, 63, 68), [(40, 56), (47, 59), (52, 64), (68,)]
+        score, perf = [(p, 0.5, 1.2, 90) for p in ab], [(p, 0.5, 2.2, 90) for p in ab]
+        played = [3.0, 3.7, 4.37, 5.0, 5.66, 6.31]
+        rolls = []
+        for i, t in enumerate(played):
+            s = 1.23 + 0.73 * i
+            rolls.append(tuple(round(s + 0.03 * j, 4) for j in range(len(e))))
+            for j, ps in enumerate(e):
+                score += [(p, s + 0.03 * j, s + 0.7, 90) for p in ps]
+                perf += [(p, t + 0.02 * j, t + 0.6, 90) for p in ps]
+        wav = tmp / "rolls.wav"
+        audio.write_wav(wav, audio.synthesize(perf, 7.5))
+        y = analysis.decode_audio(str(wav))
+        onsets = np.array(sorted({round(n[1], 4) for n in score}))
+        lag = np.interp(onsets, [0.5, 1.23, 1.23 + 0.73 * 5], [0.0, -1.2, -0.3])   # the DTW: early from the pause on
+        est = np.interp(onsets, [0.5] + [r[0] for r in rolls], [0.5] + played) + lag
+        final = analysis._refine(y, score, onsets, est, rolls)[0]
+        heads = [int(np.argmin(np.abs(onsets - r[0]))) for r in rolls]
+        self.assertLess(abs(final[0] - 0.5), 0.03)
+        self.assertLess(np.abs(final[heads] - np.array(played)).max(), 0.06)        # was 1.7 s (the first)
+
     def test_a_held_final_chord_does_not_drag_the_ending_late(self):
         """The recording rings on for seconds after the last attack (a fermata): the last notes must still be
         found at their attacks, not stretched over the ring."""

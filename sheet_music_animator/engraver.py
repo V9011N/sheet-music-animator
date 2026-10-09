@@ -118,6 +118,7 @@ class Score:
     line_starts: list[int] = field(default_factory=list)  # index of the first measure of every line
     notes: list[tuple] = field(default_factory=list)      # (midi pitch, start, end, velocity)
     nominal_notes: list[tuple] = field(default_factory=list)   # the same before `warp` (the score's own timing)
+    rolls: list[tuple] = field(default_factory=list)   # the onset times (score's own timing) of every rolled chord
     duration: float = 0.0
     _now_cache: dict = field(default_factory=dict, repr=False)
 
@@ -1108,6 +1109,8 @@ def engrave(path, layout: str = "pages", ink: str = "#000000", progress=None,
         if "measureOn" in ev:
             measures.append(t)
 
+    rolls = _rolls(tk, on)
+
     say("Splitting layers…")
     root = etree.fromstring(svg.encode("utf8"), etree.XMLParser(remove_blank_text=True))
     if hidden_ids:
@@ -1126,7 +1129,39 @@ def engrave(path, layout: str = "pages", ink: str = "#000000", progress=None,
     score.title = FsPath(path).stem
     score.measures = [(t, i + 1) for i, t in enumerate(measures)]
     score.duration = max([off.get(k, 0) for k in off] + [u.end for u in score.units] + [0])
+    score.rolls = rolls
     return score
+
+
+def _rolls(tk, on) -> list[tuple]:
+    """The onset times (score seconds) of the notes of every rolled chord.  Verovio plays a roll as notes a few
+    hundredths apart; the alignment must know they are one event, not a fast run.  Rolls sharing a moment (one
+    per staff) are one."""
+    try:
+        root = etree.fromstring(tk.getMEI().encode("utf8"), etree.XMLParser(huge_tree=True))
+    except etree.XMLSyntaxError:
+        return []
+    xid = "{http://www.w3.org/XML/1998/namespace}id"
+    by_id = {e.get(xid): e for e in root.iter() if e.get(xid)}
+    groups = []
+    for arp in root.iter(f"{{{MEI_NS}}}arpeg"):
+        times = set()
+        for ref in (arp.get("plist") or "").split():
+            e = by_id.get(ref.lstrip("#"))
+            if e is None:
+                continue
+            for n in [e] + list(e.iter(f"{{{MEI_NS}}}note")):
+                if n.get(xid) in on:
+                    times.add(round(on[n.get(xid)], 4))
+        if len(times) > 1:
+            groups.append(times)
+    merged = []
+    for g in sorted(groups, key=min):
+        if merged and merged[-1] & g:
+            merged[-1] |= g
+        else:
+            merged.append(g)
+    return [tuple(sorted(g)) for g in merged]
 
 
 class _Builder:
