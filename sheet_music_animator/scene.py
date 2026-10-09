@@ -9,10 +9,25 @@ from PySide6.QtGui import QBrush, QColor, QLinearGradient, QPainter, QPainterPat
 from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import (QGraphicsItem, QGraphicsScene, QGraphicsView, QLabel, QStyle, QWidget)
 
-from .engraver import FONT_TOKEN, NOTE_KINDS, REST_KINDS, Score
+from .engraver import FONT_TOKEN, SYMBOL_TOKEN, NOTE_KINDS, REST_KINDS, Score
 from .project import CATEGORIES, FIXED_KINDS, Project
 
 SELECTABLE = NOTE_KINDS | REST_KINDS
+_SYMBOL_FONT: str | None = None
+
+
+def symbol_font() -> str:
+    """A installed font that has music symbols (half notes, 16th notes...), found once."""
+    global _SYMBOL_FONT
+    if _SYMBOL_FONT is None:
+        from PySide6.QtGui import QFont, QFontMetrics
+        _SYMBOL_FONT = "serif"
+        for fam in ("Segoe UI Symbol", "Noto Music", "Bravura Text", "Bravura", "Symbola", "Musica", "FreeSerif",
+                    "DejaVu Sans", "Noto Sans Symbols 2", "Arial Unicode MS", "Cambria Math", "Apple Symbols"):
+            if QFontMetrics(QFont(fam)).inFontUcs4(0x1D15E):
+                _SYMBOL_FONT = fam
+                break
+    return _SYMBOL_FONT
 
 
 class SvgItem(QGraphicsItem):
@@ -62,7 +77,10 @@ class SvgItem(QGraphicsItem):
             # One family only: Qt's SVG renderer ignores a family that is followed by a fallback list
             # ("'Arial', serif"), and the font box would then change nothing.
             family = ("'%s'" % self.font.replace("'", "")).encode("utf8")
-            QSvgRenderer(QByteArray(self._svg.replace(FONT_TOKEN, family))).render(p, self._rect)
+            svg = self._svg.replace(FONT_TOKEN, family)
+            if SYMBOL_TOKEN in svg:
+                svg = svg.replace(SYMBOL_TOKEN, ("'%s'" % symbol_font()).encode("utf8"))
+            QSvgRenderer(QByteArray(svg)).render(p, self._rect)
             p.end()
         self._picture.play(painter)
 

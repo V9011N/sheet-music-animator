@@ -393,6 +393,9 @@ SNAP_MAX = 3.0
 SNAP_CANDIDATES = 10
 SNAP_FREE_RATIO = 2.2    # an interval between two notes may differ from the DTW's by this factor at no cost
 SNAP_RATIO_COST = 1.5
+SNAP_NEAR = 0.2          # notes written closer than this (s) are expected to be played close together
+SNAP_EARLY = 0.25        # ...and one that lies more than this ahead of the next one is suspicious
+SNAP_TOGETHER = 0.03     # how close to the next note's attack a candidate must be to count as the same moment
 
 
 def _refine(ya, notes, onsets, est):
@@ -466,6 +469,23 @@ def _refine(ya, notes, onsets, est):
     for k in range(n - 2, -1, -1):
         idx.append(int(back[k][idx[-1]]))
     idx.reverse()
+    # A note written right before the next one (a bass note under the first note of a run) can be played at the
+    # very same instant, which the pairwise search above forbids; it then ends up at some earlier, fainter
+    # attack of its own bins.  If a note sits far ahead of its neighbour while it has a candidate at the
+    # neighbour's moment, move it there.
+    tempo = np.ones(n)
+    for k in range(n):
+        lo, hi = max(k - 4, 0), min(k + 4, n - 1)
+        if onsets[hi] > onsets[lo]:
+            tempo[k] = (est[hi] - est[lo]) / (onsets[hi] - onsets[lo])
+    for k in range(n - 1):
+        near = onsets[k + 1] - onsets[k]
+        t_k, t_next = cands[k][0][idx[k]], cands[k + 1][0][idx[k + 1]]
+        if near < SNAP_NEAR and t_next - t_k > max(SNAP_EARLY, 2.5 * near * tempo[k]):
+            tk, sk = cands[k]
+            close = [j for j in range(len(tk)) if abs(tk[j] - t_next) <= SNAP_TOGETHER and sk[j] > 0]
+            if close:
+                idx[k] = max(close, key=lambda j: sk[j])
     final = np.array([cands[k][0][idx[k]] for k in range(n)])
     # How specific is the attack at the chosen moment?  The onset energy in the note's own bins against the
     # average onset energy of the pitch range: about 1 for an unrelated moment (or noise), well above for a

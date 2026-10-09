@@ -2,6 +2,8 @@
 which the next engraving appears."""
 from __future__ import annotations
 
+from bisect import bisect_left
+
 from PySide6.QtCore import QEvent, QObject, QPoint, Qt, QTimer
 from PySide6.QtGui import QKeySequence
 from PySide6.QtWidgets import (QApplication, QComboBox, QDialog, QFormLayout, QLabel, QPushButton, QVBoxLayout)
@@ -43,16 +45,26 @@ class TapDialog(QDialog):
 
 def tap_events(score, mode: str) -> list:
     """[(score time, [units that appear then])]: one entry per tap.  A note that only continues a tie is not
-    struck, so it is not an event; with `mode == "notes_rests"` rests are."""
+    struck, so it is not an event; with `mode == "notes_rests"` rests are.  Every other element that appears
+    with a note (ledger lines, accidentals, dots, articulations, fingering, beams, slurs, dynamics, text...)
+    belongs to that tap's event, so it is retimed together with the note."""
     kinds = NOTE_KINDS | (REST_KINDS if mode == "notes_rests" else set())
-    groups: dict = {}
+    times = set()
     for u in score.units:
         if u.kind not in kinds or u.static:
             continue
         if u.kind in NOTE_KINDS and u.heads and all(h[5] for h in u.heads):
             continue
-        groups.setdefault(round(u.time, 3), []).append(u)
-    return sorted(groups.items())
+        times.add(round(u.time, 3))
+    ts = sorted(times)
+    groups: dict = {t: [] for t in ts}
+    for u in score.units:
+        if u.static or not ts:
+            continue
+        i = bisect_left(ts, u.time - 0.0015)
+        if i < len(ts) and abs(ts[i] - u.time) <= 0.0015:
+            groups[ts[i]].append(u)
+    return [(t, groups[t]) for t in ts]
 
 
 class TapSession(QObject):

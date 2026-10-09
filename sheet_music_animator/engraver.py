@@ -51,6 +51,7 @@ DRAWABLE = {"path", "use", "polygon", "polyline", "rect", "ellipse", "text", "li
 CSS = "ellipse,path,polygon,polyline,rect{stroke:currentColor}"
 CROSS_STAFF_SPACING = 20   # Verovio's default is 12; cross-staff beams then run into the notes of the staff below
 FONT_TOKEN = b"@@FONT@@"   # stands for the font family in every SVG; filled in when drawing
+SYMBOL_TOKEN = b"@@SYMBOLS@@"   # a font that has music symbols (note values), picked when drawing
 POSITION_TOLERANCE = 160.0  # how far left of a control event a note may sit and still "start" it
 
 LAYOUTS = {
@@ -386,8 +387,42 @@ def _layer_events(layer):
 
 _TEXT_STYLE = ("font-size", "font-family", "font-weight", "font-style", "fill")
 _TEXT_POS = ("x", "y", "dx", "dy")
-# Leipzig (Verovio's music font) glyphs that occur in text, with a plain-text stand-in
-_TEXT_GLYPHS = {"\ueca5": "\u2669", "\ueca7": "\u266a"}   # SMuFL metronome marks: quarter, eighth
+# Leipzig (Verovio's music font) is not available to Qt, so the glyphs that Verovio writes as *text* (a dynamic
+# in front of words, the note of a metronome mark) would show as empty boxes or unrelated symbols.
+_NOTE_GLYPHS = {"\uecA2": "\U0001D15D", "\ueca3": "\U0001D15E", "\ueca5": "\u2669", "\ueca7": "\u266a",
+                "\ueca9": "\U0001D161", "\uecab": "\U0001D162", "\uecb7": "."}   # SMuFL metronome marks, whole..32nd, dot
+_DYN_GLYPHS = {"\ue520": "p", "\ue521": "m", "\ue522": "f", "\ue523": "r", "\ue524": "s", "\ue525": "z",
+               "\ue526": "n", "\ue527": "pppppp", "\ue528": "ppppp", "\ue529": "pppp", "\ue52a": "ppp", "\ue52b": "pp",
+               "\ue52c": "mp", "\ue52d": "mf", "\ue52e": "pf", "\ue52f": "ff", "\ue530": "fff", "\ue531": "ffff",
+               "\ue532": "fffff", "\ue533": "ffffff", "\ue534": "fp", "\ue535": "fz", "\ue536": "sf", "\ue537": "sfp",
+               "\ue538": "sfpp", "\ue539": "sfz", "\ue53a": "sfzp", "\ue53b": "sffz", "\ue53c": "rf", "\ue53d": "rfz"}
+
+
+def _fix_text_glyphs(root) -> None:
+    """Give the Leipzig glyphs inside <text> a stand-in that Qt can draw: dynamics become bold italic letters,
+    metronome notes become Unicode music symbols (drawn with a font that has them); anything else is dropped
+    rather than shown as a box."""
+    for text in root.iter(f"{{{SVG_NS}}}text"):    # keep the spaces between the pieces ("f  risoluto")
+        text.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
+    for ts in root.iter(f"{{{SVG_NS}}}tspan"):
+        if ts.text and "\xa0" in ts.text:      # Qt's SVG renderer swallows no-break spaces
+            ts.text = ts.text.replace("\xa0", " ")
+        if ts.get("font-family") != "Leipzig" or not ts.text:
+            continue
+        text = ts.text
+        if all(c in _DYN_GLYPHS or c.isspace() for c in text):
+            ts.text = "".join(_DYN_GLYPHS.get(c, c) for c in text)
+            del ts.attrib["font-family"]
+            ts.set("font-style", "italic")
+            ts.set("font-weight", "bold")
+            ts.set("font-size", "520px")
+        elif any(c in _NOTE_GLYPHS for c in text):
+            ts.text = "".join(_NOTE_GLYPHS.get(c, c) for c in text)
+            ts.set("font-family", SYMBOL_TOKEN.decode())
+            ts.set("font-size", "760px")
+        else:
+            ts.text = "".join(c for c in text if not 0xE000 <= ord(c) <= 0xF8FF)
+            del ts.attrib["font-family"]
 
 
 def _flatten_text(root) -> None:
@@ -420,9 +455,7 @@ def _flatten_text(root) -> None:
             text.remove(ch)
         for st, ps, string in leaves:
             ts = etree.SubElement(text, f"{{{SVG_NS}}}tspan", **st, **ps)
-            ts.text = "".join(_TEXT_GLYPHS.get(c, c) for c in string)
-            if st.get("font-family") == "Leipzig" and string and string[0] in _TEXT_GLYPHS:
-                ts.set("font-family", "serif")
+            ts.text = string
 
 
 def _clef_attrs(el):
@@ -1027,6 +1060,7 @@ class _Builder:
     # -- svg documents -------------------------------------------------------------------
     def _doc(self, el, rect):
         _flatten_text(el)
+        _fix_text_glyphs(el)
         hrefs = {(u.get(_HREF) or "").lstrip("#") for u in el.iter(_USE)}
         defs = b"".join(self.defs_xml[h] for h in hrefs if h in self.defs_xml)
         x, y, w, h = rect
