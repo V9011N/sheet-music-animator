@@ -398,6 +398,7 @@ SNAP_WINDOW = 0.55       # how far (s) from the DTW estimate an attack may be ta
 SNAP_SPARSE = 2.5        # ...and this many times the gap to the neighbouring notes in sparse music (a long pause)
 SNAP_MAX = 3.0
 SNAP_CANDIDATES = 10
+SNAP_PEAK = 0.9          # an attack must stand this far (z) above the rest of the window to be a candidate
 SNAP_FREE_RATIO = 2.2    # an interval between two notes may differ from the DTW's by this factor at no cost
 SNAP_RATIO_COST = 1.5
 SNAP_NEAR = 0.2          # notes written closer than this (s) are expected to be played close together
@@ -426,6 +427,7 @@ def _refine(ya, notes, onsets, est):
     gaps = np.diff(onsets)
     room = np.minimum(np.r_[np.inf, gaps], np.r_[gaps, np.inf])        # distance to the nearest neighbouring onset
     cands = []     # per onset: (times, strengths); the DTW estimate is always one of them
+    norm = []      # per onset: (mean, std) of its onset curve in its window, to judge other moments the same way
     own_bins = []  # per onset: the spectrum bins of its notes' pitches (for judging the attack afterwards)
     for (t, e), rm in zip(zip(onsets, est), room):
         win = float(np.clip(SNAP_SPARSE * rm, SNAP_WINDOW, SNAP_MAX))
@@ -440,10 +442,12 @@ def _refine(ya, notes, onsets, est):
         a, b = max(int((e - win) * fps), 1), min(int((e + win) * fps) + 1, len(flux) - 1)
         if not bins or b - a < 5:
             cands.append((np.array([e]), np.array([0.0])))
+            norm.append(None)
             continue
         curve = flux[a:b][:, bins].sum(axis=1)
-        z = (curve - curve.mean()) / (curve.std() + 1e-6)
-        peaks = [i for i in range(1, len(z) - 1) if z[i] >= z[i - 1] and z[i] > z[i + 1] and z[i] > 1.0]
+        norm.append((curve.mean(), curve.std() + 1e-6))
+        z = (curve - norm[-1][0]) / norm[-1][1]
+        peaks = [i for i in range(1, len(z) - 1) if z[i] >= z[i - 1] and z[i] > z[i + 1] and z[i] > SNAP_PEAK]
         peaks = sorted(peaks, key=lambda i: -z[i])[:SNAP_CANDIDATES]
         times, strength = [], []
         for i in peaks:
@@ -478,8 +482,9 @@ def _refine(ya, notes, onsets, est):
     idx.reverse()
     # A note written right before the next one (a bass note under the first note of a run) can be played at the
     # very same instant, which the pairwise search above forbids; it then ends up at some earlier, fainter
-    # attack of its own bins.  If a note sits far ahead of its neighbour while it has a candidate at the
-    # neighbour's moment, move it there.
+    # attack of its own bins.  If a note sits far ahead of its neighbour while its own pitches also start at the
+    # neighbour's moment, move it there.  That moment may lie outside the window the note's candidates were
+    # taken from (the DTW can place such a note in the pause before the run), so it is judged directly.
     tempo = np.ones(n)
     for k in range(n):
         lo, hi = max(k - 4, 0), min(k + 4, n - 1)
@@ -493,6 +498,13 @@ def _refine(ya, notes, onsets, est):
             close = [j for j in range(len(tk)) if abs(tk[j] - t_next) <= SNAP_TOGETHER and sk[j] > 0]
             if close:
                 idx[k] = max(close, key=lambda j: sk[j])
+            elif norm[k] is not None:
+                f = int(round((t_next + 0.005) * fps))
+                tol = int(round(SNAP_TOGETHER * fps))
+                z = (flux[max(f - tol, 0):f + tol + 1][:, own_bins[k]].sum(axis=1) - norm[k][0]) / norm[k][1]
+                if len(z) and z.max() > SNAP_PEAK:
+                    cands[k] = (np.r_[tk, t_next], np.r_[sk, min(z.max(), 6.0)])
+                    idx[k] = len(tk)
     final = np.array([cands[k][0][idx[k]] for k in range(n)])
     # How specific is the attack at the chosen moment?  The onset energy in the note's own bins against the
     # average onset energy of the pitch range: about 1 for an unrelated moment (or noise), well above for a

@@ -163,6 +163,23 @@ class TestAlignment(unittest.TestCase):
         err = np.abs(al.actual - np.array([played_at[round(x, 4)] for x in al.nominal]))
         self.assertLess(err.max(), 0.1)                            # was 2.9 s (the last chord)
 
+    def test_a_bass_note_written_just_before_a_run_joins_its_first_note(self):
+        """Measure 5 of Winter Wind: a bass note written a 32nd before the run is struck with the run's first note
+        after a pause.  The DTW can put the bass note in the pause, so far ahead that the run's attack lies outside
+        the window its candidates come from, and a faint earlier bump of its own pitch must not win."""
+        tmp = Path(tempfile.mkdtemp())
+        run = [76, 77, 79, 81, 83, 84, 86, 88]
+        score = [(60, 0.0, 0.5, 80), (45, 1.0, 1.6, 90)] + [(p, 1.07 + 0.07 * k, 1.14 + 0.07 * k, 80) for k, p in enumerate(run)]
+        perf = [(60, 0.0, 0.5, 80), (45, 1.4, 1.5, 20), (45, 2.0, 2.6, 90)] + \
+               [(p, 2.0 + 0.08 * k, 2.08 + 0.08 * k, 80) for k, p in enumerate(run)]
+        wav = tmp / "bass.wav"
+        audio.write_wav(wav, audio.synthesize(perf, 3.5))
+        y = analysis.decode_audio(str(wav))
+        onsets = np.array(sorted({n[1] for n in score}))
+        est = np.r_[0.0, 1.3, 2.0 + 0.08 * np.arange(len(run))]   # the bass note placed in the pause
+        final = analysis._refine(y, score, onsets, est)[0]
+        self.assertLess(abs(final[1] - final[2]), 0.03)
+
     def test_a_held_final_chord_does_not_drag_the_ending_late(self):
         """The recording rings on for seconds after the last attack (a fermata): the last notes must still be
         found at their attacks, not stretched over the ring."""
