@@ -9,7 +9,7 @@ from dataclasses import fields
 from pathlib import Path
 
 from .layers import Layer, schema
-from .project import LANE, Key, Project, Settings, auto_camera, is_lane
+from .project import LANE, Key, Project, Settings, is_lane
 from .stacks import BUILTIN
 
 USER_DIR = Path.home() / ".sheet_music_animator" / "looks"
@@ -104,7 +104,7 @@ def apply_look(look: dict, project: Project, score) -> list[str]:
     fx.impulses = [{"t": round(resolve(i["at"], score, notes), 3), "s": float(i["s"])} for i in ev.get("impulses", [])]
     fx.hits = [{"m0": int(h["m0"]) - 1, "m1": int(h["m1"]) - 1, "s": float(h["s"])} for h in ev.get("hits", [])]
     if restyle or not look.get("layers"):          # the look decides the camera framing: start from the automatic path
-        project.channels.update(auto_camera(score, s))
+        project.follow_music(score)
         project.keys_edited = False
     for plan in look.get("camera", []):
         if "focus" in plan:
@@ -126,15 +126,17 @@ def _focus(project: Project, score, plan: dict, notes: list) -> None:
         return
     s = project.settings
     cur = project.camera_at(t0)
-    for ch in ("pos", "size"):
+    for ch in ("x", "y", "size"):
         project.channels[ch] = [k for k in project.channels[ch] if k.t < t0 - 1e-6]
     if cur is not None:
-        project.channels["pos"].append(Key(t0, [cur[0], cur[1]]))
+        project.channels["x"].append(Key(t0, [cur[0]]))
+        project.channels["y"].append(Key(t0, [cur[1]]))
         project.channels["size"].append(Key(t0, [cur[2]]))
     h_line = line.rect[3] + 800
-    project.channels["pos"].append(Key(t1, [info.rect[0] + info.rect[2] / 2, line.rect[1] + line.rect[3] / 2 + 100]))
+    project.channels["x"].append(Key(t1, [info.rect[0] + info.rect[2] / 2]))
+    project.channels["y"].append(Key(t1, [line.rect[1] + line.rect[3] / 2 + 100]))
     project.channels["size"].append(Key(t1, [h_line / 0.8 * s.aspect]))
-    project.keys_edited = True
+    project.note_edit(("x", "y", "size"))
 
 
 # ---------------------------------------------------------------------------------------------- capture / save

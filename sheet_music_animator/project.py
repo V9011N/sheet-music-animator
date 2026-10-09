@@ -9,9 +9,9 @@ from .engraver import NOTE_KINDS, REST_KINDS, Score
 from .layers import Layer, legacy_layers, schema
 
 EASES = ("smooth", "linear", "hold")
-CAMERA_CHANNELS = ("pos", "size", "rot")
+CAMERA_CHANNELS = ("x", "y", "size", "rot")
 LANE = "lane:"                      # automation lanes live in `channels` under "lane:<name>"
-CHANNEL_LABELS = {"pos": "Position", "size": "Frame size", "rot": "Rotation"}
+CHANNEL_LABELS = {"x": "Position X", "y": "Position Y", "size": "Frame size", "rot": "Rotation"}
 
 
 def is_lane(channel: str) -> bool:
@@ -50,7 +50,7 @@ FIXED_KINDS = {"note", "chord", "beam", "beamSpan", "fTrem", "bTrem"}
 class Key:
     """A keyframe on one camera channel."""
     t: float
-    v: list                 # pos: [cx, cy]   size: [width in page units]   rot: [degrees, clockwise]
+    v: list                 # x: [cx]   y: [cy]   size: [width in page units]   rot: [degrees, clockwise]
     ease: str = "smooth"    # how the value travels from this key to the next
 
 
@@ -116,6 +116,14 @@ class Settings:
         return self.width / self.height
 
 
+def norm_transform(v) -> list:
+    """[dx, dy, sx, sy, rotation]; older projects stored [dx, dy, scale]."""
+    v = [float(x) for x in v]
+    if len(v) == 3:
+        v = [v[0], v[1], v[2], v[2], 0.0]
+    return (v + [1.0, 1.0, 0.0][len(v) - 2:])[:5] if len(v) < 5 else v[:5]
+
+
 def _blank_channels():
     return {c: [] for c in CAMERA_CHANNELS}
 
@@ -149,25 +157,43 @@ class Project:
     settings: Settings = field(default_factory=Settings)
     channels: dict[str, list[Key]] = field(default_factory=_blank_channels)
     overrides: dict[int, float] = field(default_factory=dict)   # unit uid -> extra seconds
-    keys_edited: bool = False
+    keys_edited: bool = False      # the automatic path (x and frame size) or the rotation was changed by hand
+    y_edited: bool = False         # the y position was changed by hand: the automatic path leaves it alone
     timed: set[int] = field(default_factory=set)   # clefs, barlines... (static units) that follow the music
     hidden: dict[int, set[str]] = field(default_factory=dict)   # measure index -> hidden CATEGORIES
-    transforms: dict[int, list[float]] = field(default_factory=dict)   # unit uid -> [dx, dy, scale]
+    transforms: dict[int, list[float]] = field(default_factory=dict)   # unit uid -> [dx, dy, scale x, scale y, rotation (degrees)]
+    deleted: set[int] = field(default_factory=set)                      # unit uids of engravings the user deleted
     line_starts: list[int] | None = None   # measure index that starts each line (None: every measures_per_line)
     effects: Effects = field(default_factory=Effects)
+    sync_conf: list = field(default_factory=list)   # [[recording seconds, confidence 0..1], ...] of that alignment
+    sync_overall: float = 0.0                       # the headline confidence (0..1) of that alignment
     time_map: list = field(default_factory=list)   # [[score seconds, recording seconds], ...] from aligning to audio
 
     # ---- camera ---------------------------------------------------------------------
     def has_keys(self) -> bool:
-        return bool(self.channels["pos"] and self.channels["size"])
+        return bool(self.channels["x"] and self.channels["y"] and self.channels["size"])
+
+    def follow_music(self, score: Score) -> None:
+        """Lay the automatic camera path down: x (and the frame size) follow the music; y, which only moves from
+        line to line, is laid down too unless the user has set it by hand."""
+        self.channels.update(auto_camera(score, self.settings, y=not (self.y_edited and self.channels["y"])))
+
+    def note_edit(self, channels) -> None:
+        """Keys of these channels were changed by hand."""
+        channels = set(channels)
+        if channels & {"x", "size", "rot"}:
+            self.keys_edited = True
+        if "y" in channels:
+            self.y_edited = True
 
     def camera_at(self, t: float):
         """(cx, cy, w, rotation) of the camera at time t, or None while it has no keyframes."""
-        pos, size = _interp(self.channels["pos"], t, "pos"), _interp(self.channels["size"], t, "size")
-        if pos is None or size is None:
+        x, y = _interp(self.channels["x"], t, "x"), _interp(self.channels["y"], t, "y")
+        size = _interp(self.channels["size"], t, "size")
+        if x is None or y is None or size is None:
             return None
         rot = _interp(self.channels["rot"], t, "rot")
-        return pos[0], pos[1], size[0], rot[0] if rot else 0.0
+        return x[0], y[0], size[0], rot[0] if rot else 0.0
 
     def camera_pose(self, t: float):
         """(cx, cy, w, h, rotation in degrees) of the camera window at time t in page units."""
@@ -188,14 +214,14 @@ class Project:
                    snap: float = 0.02, create: bool = True) -> list:
         """Store the camera pose at time t.  Only the channels whose value differs from what they
         evaluate to now get a keyframe (an existing key within `snap` seconds is updated), so moving the
-        camera does not touch the size or rotation channels.  With create=False only existing keys are
-        updated.  Returns the keys that were set."""
+        camera sideways does not touch y, the size or the rotation.  With create=False only existing keys
+        are updated.  Returns the keys that were set."""
         cur = self.camera_at(t)
-        wanted = {"pos": [cx, cy], "size": [w], "rot": [rot]}
-        now = {"pos": None, "size": None, "rot": [0.0]}
+        wanted = {"x": [cx], "y": [cy], "size": [w], "rot": [rot]}
+        now = {"x": None, "y": None, "size": None, "rot": [0.0]}
         if cur is not None:
-            now = {"pos": [cur[0], cur[1]], "size": [cur[2]], "rot": [cur[3]]}
-        out = []
+            now = {"x": [cur[0]], "y": [cur[1]], "size": [cur[2]], "rot": [cur[3]]}
+        out, touched = [], []
         for ch in CAMERA_CHANNELS:
             keys = self.channels[ch]
             if now[ch] is not None and all(abs(a - b) < 1e-6 for a, b in zip(now[ch], wanted[ch])):
@@ -204,13 +230,14 @@ class Project:
             if existing is not None:
                 existing.v = list(wanted[ch])
                 out.append(existing)
+                touched.append(ch)
             elif create:
                 k = Key(t, list(wanted[ch]))
                 keys.append(k)
                 keys.sort(key=lambda q: q.t)
                 out.append(k)
-        if out:
-            self.keys_edited = True
+                touched.append(ch)
+        self.note_edit(touched)
         return out
 
     def add_key(self, channel: str, t: float, snap: float = 0.02):
@@ -225,11 +252,10 @@ class Project:
             cur = self.camera_at(t)
             if cur is None:
                 return None
-            k = Key(t, {"pos": [cur[0], cur[1]], "size": [cur[2]], "rot": [cur[3]]}[channel])
+            k = Key(t, {"x": [cur[0]], "y": [cur[1]], "size": [cur[2]], "rot": [cur[3]]}[channel])
         keys.append(k)
         keys.sort(key=lambda q: q.t)
-        if channel in CAMERA_CHANNELS:
-            self.keys_edited = True
+        self.note_edit([channel])
         return k
 
     # ---- automation lanes ---------------------------------------------------------------
@@ -355,13 +381,15 @@ class Project:
 
     # ---- persistence -----------------------------------------------------------------------
     def to_dict(self) -> dict:
-        return {"version": 4, "xml_path": self.xml_path, "settings": asdict(self.settings),
+        return {"version": 5, "xml_path": self.xml_path, "settings": asdict(self.settings),
                 "channels": {ch: [{"t": k.t, "v": k.v, "ease": k.ease} for k in keys] for ch, keys in self.channels.items()},
                 "overrides": {str(k): v for k, v in sorted(self.overrides.items())},
-                "keys_edited": self.keys_edited, "timed": sorted(self.timed),
+                "keys_edited": self.keys_edited, "y_edited": self.y_edited, "timed": sorted(self.timed),
                 "hidden": {str(m): sorted(c) for m, c in sorted(self.hidden.items()) if c},
                 "transforms": {str(u): list(v) for u, v in sorted(self.transforms.items())},
-                "line_starts": self.line_starts, "effects": self.effects.to_dict(), "time_map": self.time_map}
+                "deleted": sorted(self.deleted),
+                "line_starts": self.line_starts, "effects": self.effects.to_dict(), "time_map": self.time_map,
+                "sync_conf": self.sync_conf, "sync_overall": self.sync_overall}
 
     def snapshot(self) -> str:
         return json.dumps(self.to_dict(), sort_keys=True)
@@ -378,16 +406,24 @@ class Project:
         legacy = {"mood": LANE + "Mood", "hush": LANE + "Hush", "lift": LANE + "Snow lift"}   # the first version's fixed lanes
         if "channels" in d:
             for ch, keys in d["channels"].items():
+                if ch == "pos":   # up to version 4: x and y in one channel
+                    for k in keys:
+                        self.channels["x"].append(Key(k["t"], [k["v"][0]], k.get("ease", "smooth")))
+                        self.channels["y"].append(Key(k["t"], [k["v"][1]], k.get("ease", "smooth")))
+                    continue
                 self.channels[legacy.get(ch, ch)] = [Key(k["t"], list(k["v"]), k.get("ease", "smooth")) for k in keys]
         else:   # version 1: one list of keys that carry position and size together
             for k in d.get("keys", []):
-                self.channels["pos"].append(Key(k["t"], [k["cx"], k["cy"]], k.get("ease", "smooth")))
+                self.channels["x"].append(Key(k["t"], [k["cx"]], k.get("ease", "smooth")))
+                self.channels["y"].append(Key(k["t"], [k["cy"]], k.get("ease", "smooth")))
                 self.channels["size"].append(Key(k["t"], [k["w"]], k.get("ease", "smooth")))
         self.overrides = {int(k): v for k, v in d.get("overrides", {}).items()}
         self.keys_edited = d.get("keys_edited", False)
+        self.y_edited = d.get("y_edited", self.keys_edited)   # older projects: a path edited by hand keeps its y
         self.timed = {int(u) for u in d.get("timed", [])}
         self.hidden = {int(m): set(c) for m, c in d.get("hidden", {}).items()}
-        self.transforms = {int(u): list(v) for u, v in d.get("transforms", {}).items()}
+        self.transforms = {int(u): norm_transform(v) for u, v in d.get("transforms", {}).items()}
+        self.deleted = {int(u) for u in d.get("deleted", [])}
         self.line_starts = d.get("line_starts")
         self.effects = Effects.from_dict(d.get("effects", {}))
         for ch in self.channels:             # a lane always has its entry in the effects
@@ -396,6 +432,8 @@ class Project:
         for name in self.effects.lanes:
             self.channels.setdefault(LANE + name, [])
         self.time_map = [list(p) for p in d.get("time_map", [])]
+        self.sync_conf = [list(p) for p in d.get("sync_conf", [])] if self.time_map else []
+        self.sync_overall = float(d.get("sync_overall", 0.0)) if self.sync_conf else 0.0
 
     def restore(self, snapshot: str) -> None:
         self.load_dict(json.loads(snapshot))
@@ -503,14 +541,24 @@ def _auto_keys(score: Score, settings: Settings) -> list:
     return keys
 
 
-def auto_camera(score: Score, settings: Settings) -> dict:
-    """The automatic camera path as keyframe channels (position changes often, frame size rarely).
-    Only the camera channels: `project.channels.update(auto_camera(...))` leaves the effect channels alone."""
-    out = {c: [] for c in CAMERA_CHANNELS}
+def auto_camera(score: Score, settings: Settings, y: bool = True) -> dict:
+    """The automatic camera path as keyframe channels: x follows the music (a key at every measure), the frame
+    size changes rarely, and y only moves from one line to the next (a key where the camera arrives at a line
+    and where it leaves it, none in between).  With y=False the y channel is not part of the result, so
+    `project.channels.update(...)` keeps the y keys the user has set.  Only camera channels: the effect
+    channels are left alone."""
+    out = {c: [] for c in CAMERA_CHANNELS if y or c != "y"}
+    keys = _auto_keys(score, settings)
     last_w = None
-    for k in _auto_keys(score, settings):
-        out["pos"].append(Key(k.t, [k.cx, k.cy], k.ease))
+    for k in keys:
+        out["x"].append(Key(k.t, [k.cx], k.ease))
         if last_w is None or abs(k.w - last_w) > 1.0:
             out["size"].append(Key(k.t, [k.w], "linear" if last_w is not None else k.ease))
             last_w = k.w
+    if y:
+        for i, k in enumerate(keys):     # the first and last key of every stretch at one height
+            first = i == 0 or abs(keys[i - 1].cy - k.cy) > 1e-6
+            last = i == len(keys) - 1 or abs(keys[i + 1].cy - k.cy) > 1e-6
+            if first or last:
+                out["y"].append(Key(k.t, [k.cy], k.ease))
     return out

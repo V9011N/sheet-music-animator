@@ -30,12 +30,20 @@ def relayout_project(project: Project, old: Score, new: Score) -> None:
     project.overrides = {tr(u): v for u, v in project.overrides.items() if tr(u) is not None}
     project.timed = {tr(u) for u in project.timed if tr(u) is not None}
     project.transforms = {tr(u): v for u, v in project.transforms.items() if tr(u) is not None}
-    if not project.keys_edited or not old.measure_infos or not new.measure_infos:
-        project.channels.update(auto_camera(new, project.settings))
+    project.deleted = {tr(u) for u in project.deleted if tr(u) is not None}
+    # keys set by hand move with the measure they are at; the automatic path is laid down again
+    can_move = bool(old.measure_infos and new.measure_infos)
+    keep_x, keep_y = project.keys_edited and can_move, project.y_edited and can_move
+    auto = auto_camera(new, project.settings, y=not keep_y)
+    if not keep_x:
+        project.channels.update({c: v for c, v in auto.items() if c != "y"})
         project.keys_edited = False
-        return
+    if not keep_y:
+        project.channels["y"] = auto["y"]
+        project.y_edited = False
     times = [m.time for m in old.measure_infos]
-    for k in project.channels["pos"]:
-        i = min(max(bisect_right(times, k.t) - 1, 0), len(old.measure_infos) - 1, len(new.measure_infos) - 1)
-        o, n = old.measure_infos[i].rect, new.measure_infos[i].rect
-        k.v = [n[0] + (k.v[0] - o[0]), n[1] + (k.v[1] - o[1])]
+    for ch, axis, keep in (("x", 0, keep_x), ("y", 1, keep_y)):
+        for k in project.channels[ch] if keep else []:
+            i = min(max(bisect_right(times, k.t) - 1, 0), len(old.measure_infos) - 1, len(new.measure_infos) - 1)
+            o, n = old.measure_infos[i].rect, new.measure_infos[i].rect
+            k.v = [n[axis] + (k.v[0] - o[axis])]

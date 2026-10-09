@@ -35,7 +35,7 @@ def render(args) -> int:
     from .build import build_score
     from .export import render_video, render_video_parallel, total_duration
     from . import looks
-    from .project import Project, auto_camera
+    from .project import Project
     from .scene import SheetScene
 
     src = Path(args.input)
@@ -57,10 +57,13 @@ def render(args) -> int:
             return 2
         print("Fitting the score to the recording…", flush=True)
         al = analysis.align_score(score.nominal_notes, s.audio,
-                                  lambda f, text="": print(f"  {100 * f:3.0f}% {text}", flush=True) or True)
+                                  lambda f, text="": print(f"  {100 * f:3.0f}% {text}", flush=True) or True,
+                                  rolls=score.rolls)
         project.time_map, s.align_audio = al.points(), s.audio
+        project.sync_conf, project.sync_overall = al.heat(), al.overall
         score = build_score(project)
         print(f"  score now lasts {score.duration:.1f} s ({len(al.nominal)} note positions fitted)")
+        print(f"  audio synced with {al.overall * 100:.0f}% confidence")
     if args.look:
         key = args.look
         if key not in looks.BUILTIN and not key.startswith(("user:", "file:")):
@@ -68,7 +71,7 @@ def render(args) -> int:
         for note in looks.apply_look(looks.get_look(key), project, score):
             print("  note:", note)
     if not project.has_keys():
-        project.channels.update(auto_camera(score, s))
+        project.follow_music(score)
     if args.fps:
         s.fps = args.fps
     if args.size:

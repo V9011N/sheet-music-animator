@@ -115,6 +115,132 @@ class TestAlignment(unittest.TestCase):
         self.assertLess(np.median(err), 0.04)
         self.assertLess(err.max(), 0.08)                           # every note, including the one after the pause
 
+    def test_follows_a_long_ritardando_and_a_faster_ending(self):
+        tmp = Path(tempfile.mkdtemp())
+        score = build_score(make_project(tmp))
+
+        def warp(t):                      # a ritardando to half speed, then faster than the score
+            return t if t < 9 else 9 + 2.2 * (t - 9) if t < 19 else 31 + 0.85 * (t - 19)
+        notes = [(p, warp(a), warp(b), v) for p, a, b, v in score.nominal_notes]
+        wav = tmp / "rit.wav"
+        audio.write_wav(wav, audio.synthesize(notes, warp(score.duration)))
+        al = analysis.align_score(score.nominal_notes, str(wav))
+        err = np.abs(al.actual - np.array([warp(x) for x in al.nominal]))
+        self.assertLess(err.max(), 0.1)
+
+    def test_broad_chords_then_a_fast_final_scale(self):
+        """The end of Winter Wind as Kissin plays it: pedalled A-minor-ish chords, each broader than written, the
+        last one cut short, then a written-out scale at three times its written speed.  The chords sound alike
+        and the low notes of the scale sound like their ring, so the alignment used to squeeze the chords and
+        start the scale early, then crawl up it."""
+        tmp = Path(tempfile.mkdtemp())
+        rng = random.Random(3)
+        score, perf = [], []                  # (pitch, start, end, velocity) as written and as played
+        for i in range(40):                   # a melody over a bass, played as written
+            n = rng.choice([60, 62, 64, 65, 67, 69, 71, 72, 74, 76])
+            score.append((n, 0.3 * i, 0.3 * i + 0.3, 80))
+            if i % 4 == 0:
+                score.append((45, 0.3 * i, 0.3 * i + 1.2, 70))
+        perf = list(score)
+        s = q = 12.0
+        am, dm, fm = (45, 52, 57, 60, 64, 69), (45, 50, 57, 62, 65, 69), (45, 53, 57, 60, 65, 69)
+        for chord, written, played in ((am, 0.87, 1.2), (dm, 0.87, 1.2), (am, 0.87, 1.25), (fm, 0.87, 1.3),
+                                       (am, 0.87, 1.4), (dm, 0.87, 1.5), (am, 1.74, 0.35)):
+            for n in chord:
+                score.append((n, s, s + written, 90))
+                perf.append((n, q, q + max(played, 0.9), 90))       # pedalled: rings on
+            s, q = s + written, q + played
+        for k, n in enumerate([45, 47, 48, 50, 52, 53, 55, 57, 59, 60, 62, 64, 65, 67, 69, 71, 72, 74, 76, 77, 79, 81]):
+            score.append((n, s + 0.217 * k, s + 0.217 * (k + 1), 90))
+            perf.append((n, q + 0.07 * k, q + 0.07 * (k + 1), 90))
+        s, q = s + 0.217 * 22, q + 0.07 * 22
+        score.append((81, s, s + 0.43, 100))
+        perf.append((81, q, q + 1.5, 100))
+        played_at = {round(a[1], 4): b[1] for a, b in zip(score, perf)}
+        wav = tmp / "coda.wav"
+        audio.write_wav(wav, audio.synthesize(perf, q + 2.0))
+        al = analysis.align_score(score, str(wav))
+        err = np.abs(al.actual - np.array([played_at[round(x, 4)] for x in al.nominal]))
+        self.assertLess(err.max(), 0.1)                            # was 2.9 s (the last chord)
+
+    def test_a_bass_note_written_just_before_a_run_joins_its_first_note(self):
+        """Measure 5 of Winter Wind: a bass note written a 32nd before the run is struck with the run's first note
+        after a pause.  The DTW can put the bass note in the pause, so far ahead that the run's attack lies outside
+        the window its candidates come from, and a faint earlier bump of its own pitch must not win."""
+        tmp = Path(tempfile.mkdtemp())
+        run = [76, 77, 79, 81, 83, 84, 86, 88]
+        score = [(60, 0.0, 0.5, 80), (45, 1.0, 1.6, 90)] + [(p, 1.07 + 0.07 * k, 1.14 + 0.07 * k, 80) for k, p in enumerate(run)]
+        perf = [(60, 0.0, 0.5, 80), (45, 1.4, 1.5, 20), (45, 2.0, 2.6, 90)] + \
+               [(p, 2.0 + 0.08 * k, 2.08 + 0.08 * k, 80) for k, p in enumerate(run)]
+        wav = tmp / "bass.wav"
+        audio.write_wav(wav, audio.synthesize(perf, 3.5))
+        y = analysis.decode_audio(str(wav))
+        onsets = np.array(sorted({n[1] for n in score}))
+        est = np.r_[0.0, 1.3, 2.0 + 0.08 * np.arange(len(run))]   # the bass note placed in the pause
+        final = analysis._refine(y, score, onsets, est)[0]
+        self.assertLess(abs(final[1] - final[2]), 0.03)
+
+    def test_a_fast_scale_in_octaves_is_timed_as_one_run(self):
+        """Heroic Polonaise m. 30: a scale in octaves, started slowly and speeding up.  Every note shares a pitch
+        with the note an octave further on, so note by note the attacks are ambiguous; an estimate that runs
+        ahead in the middle and waits at the top must be brought back onto the played curve."""
+        fps, binhz = 100.0, analysis.SR / 2048
+        scale = [33, 35, 36, 38, 40, 41, 43, 45, 47, 48, 50, 52, 53, 55, 57, 59, 60, 62, 64, 65, 67, 69]
+        onsets = 1.0 + 0.06 * np.arange(len(scale))                     # written evenly
+        u = np.linspace(0, 1, len(scale))
+        played = 2.0 + 1.6 * (u - 0.45 * u * (1 - u))                     # slow start, fast end
+        flux = np.zeros((500, 1025))
+        for t, p in zip(played, scale):
+            for q in (p, p + 12):
+                b = int(round(440 * 2 ** ((q - 69) / 12) / binhz))
+                flux[int(round(t * fps)), b - 1:b + 2] += 1.0
+        by_time = {round(t, 4): [p, p + 12] for t, p in zip(onsets, scale)}
+        ahead = 2.0 + 1.25 * u
+        ahead[-1] = played[-1]                                            # ...then waits at the top
+        fitted = analysis._fit_runs(flux, fps, binhz, by_time, onsets, ahead)
+        self.assertGreater(np.abs(ahead - played).max(), 0.3)
+        self.assertLess(np.abs(fitted - played).max(), 0.03)
+
+    def test_identical_rolled_chords_after_a_pause_each_find_their_own_attack(self):
+        """Heroic Polonaise mm. 80-82: a chord rings into a pause longer than written, then six identical rolled
+        chords.  The DTW puts the first roll in the pause and every later one an attack early; a roll's notes
+        (written a few hundredths apart) are one event, and the ring of the chord before is not its attack."""
+        tmp = Path(tempfile.mkdtemp())
+        ab, e = (44, 56, 60, 63, 68), [(40, 56), (47, 59), (52, 64), (68,)]
+        score, perf = [(p, 0.5, 1.2, 90) for p in ab], [(p, 0.5, 2.2, 90) for p in ab]
+        played = [3.0, 3.7, 4.37, 5.0, 5.66, 6.31]
+        rolls = []
+        for i, t in enumerate(played):
+            s = 1.23 + 0.73 * i
+            rolls.append(tuple(round(s + 0.03 * j, 4) for j in range(len(e))))
+            for j, ps in enumerate(e):
+                score += [(p, s + 0.03 * j, s + 0.7, 90) for p in ps]
+                perf += [(p, t + 0.02 * j, t + 0.6, 90) for p in ps]
+        wav = tmp / "rolls.wav"
+        audio.write_wav(wav, audio.synthesize(perf, 7.5))
+        y = analysis.decode_audio(str(wav))
+        onsets = np.array(sorted({round(n[1], 4) for n in score}))
+        lag = np.interp(onsets, [0.5, 1.23, 1.23 + 0.73 * 5], [0.0, -1.2, -0.3])   # the DTW: early from the pause on
+        est = np.interp(onsets, [0.5] + [r[0] for r in rolls], [0.5] + played) + lag
+        final = analysis._refine(y, score, onsets, est, rolls)[0]
+        heads = [int(np.argmin(np.abs(onsets - r[0]))) for r in rolls]
+        self.assertLess(abs(final[0] - 0.5), 0.03)
+        self.assertLess(np.abs(final[heads] - np.array(played)).max(), 0.06)        # was 1.7 s (the first)
+
+    def test_a_held_final_chord_does_not_drag_the_ending_late(self):
+        """The recording rings on for seconds after the last attack (a fermata): the last notes must still be
+        found at their attacks, not stretched over the ring."""
+        tmp = Path(tempfile.mkdtemp())
+        score = build_score(make_project(tmp))
+        warp = lambda t: 1.1 * t + 0.4 * np.sin(t / 3.0) + 0.5                              # noqa: E731
+        last = max(n[2] for n in score.nominal_notes)
+        notes = [(p, warp(a), warp(b) + (6.0 if b >= last - 0.01 else 0.0), v) for p, a, b, v in score.nominal_notes]
+        wav = tmp / "fermata.wav"
+        audio.write_wav(wav, audio.synthesize(notes, warp(score.duration) + 6.0))
+        al = analysis.align_score(score.nominal_notes, str(wav))
+        err = np.abs(al.actual - np.array([warp(x) for x in al.nominal]))
+        self.assertLess(err.max(), 0.1)
+
     def test_loudness_follows_the_music(self):
         tmp = Path(tempfile.mkdtemp())
         notes = [(60, 0.0, 1.0, 120), (60, 2.0, 3.0, 30)]

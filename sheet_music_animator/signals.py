@@ -50,8 +50,9 @@ class Signals:
 
         imps = []
         for u in score.units:
-            if fx.use_dynamics and u.kind == "dynam" and u.label in DYNAMIC_EVENT:
-                imps.append((project.start_of(u), DYNAMIC_EVENT[u.label]))
+            strength = max((DYNAMIC_EVENT.get(w, 0.0) for w in u.label.split()), default=0.0)   # "p sf": the sf
+            if fx.use_dynamics and u.kind == "dynam" and strength > 0:
+                imps.append((project.start_of(u), strength))
             elif fx.use_accents and u.kind == "artic" and u.label in ACCENT_EVENT:
                 imps.append((project.start_of(u), ACCENT_EVENT[u.label]))
         for im in fx.impulses:
