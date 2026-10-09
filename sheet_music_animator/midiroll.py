@@ -206,6 +206,7 @@ BLACK = {1, 3, 6, 8, 10}
 NAMES = ["C", "C♯", "D", "E♭", "E", "F", "F♯", "G", "A♭", "A", "B♭", "B"]
 STAFF_COLOURS = {1: QColor("#5aa9e6"), 2: QColor("#7bc67b"), 0: QColor("#9a9a9a")}
 SELECTED = QColor("#ff9f1c")
+SIDE_LINE = QColor("#4dd0e1")
 PLAYHEAD = QColor("#ff4d4d")
 
 
@@ -246,6 +247,15 @@ class _TimeBar(QWidget):
         p.fillRect(self.rect(), QColor("#202024"))
         w = self.width()
         t0, t1 = v.t(0), v.t(w)
+        if ed.heat is not None:                                         # the sync heat map, under the waveform
+            from .scene import heat_color
+            times, conf = ed.heat
+            xs = np.arange(0, w, 2)
+            ts = v.t(xs + 1.0)
+            cs = np.interp(ts, times, conf)
+            for x, t, c in zip(xs, ts, cs):
+                if times[0] <= t <= times[-1]:
+                    p.fillRect(QRectF(float(x), RULER_H, 2, WAVE_H), heat_color(float(c), 120))
         # the waveform
         if ed.wave is not None:
             rms, rate = ed.wave
@@ -287,10 +297,14 @@ class _TimeBar(QWidget):
             p.drawLine(QPointF(x, RULER_H - 5), QPointF(x, RULER_H))
             p.drawText(QPointF(x + 2, RULER_H - 2), f"{int(t // 60)}:{t % 60:04.1f}" if step < 60 else "")
             t += step
-        # the playhead
+        # the playhead, and the line of the select-left/right tool
         x = v.x(ed.t)
         p.setPen(QPen(PLAYHEAD, 2))
         p.drawLine(QPointF(x, 0), QPointF(x, self.height()))
+        if ed.side and ed.roll.hover_t is not None:
+            p.setPen(QPen(SIDE_LINE, 2, Qt.DashLine))
+            x = v.x(ed.roll.hover_t)
+            p.drawLine(QPointF(x, 0), QPointF(x, self.height()))
 
     def _measure_px(self):
         m = self.ed.score.measures if self.ed.score is not None else []
@@ -363,6 +377,7 @@ class _Roll(QWidget):
         self._cache = None        # the notes drawn for the current view
         self._scaling = None      # while an end of the selection is dragged: {side, i, anchor, grabbed, x}
         self._scale = None        # (anchor, factor) of the stretch being dragged
+        self.hover_t = None       # where the mouse is (s), for the select-left/right tool
 
     # ---- drawing ------------------------------------------------------------------------------------------------
     def invalidate(self):
@@ -385,6 +400,13 @@ class _Roll(QWidget):
         if self._snap_at is not None:
             p.setPen(QPen(QColor("#ffe066"), 1, Qt.DashLine))
             x = v.x(self._snap_at)
+            p.drawLine(QPointF(x, 0), QPointF(x, h))
+        if ed.side and self.hover_t is not None:                     # the select-left/right tool's line
+            x = v.x(self.hover_t)
+            shade = QColor(SIDE_LINE)
+            shade.setAlpha(28)
+            p.fillRect(QRectF(0, 0, x, h) if ed.side == "left" else QRectF(x, 0, self.width() - x, h), shade)
+            p.setPen(QPen(SIDE_LINE, 2, Qt.DashLine))
             p.drawLine(QPointF(x, 0), QPointF(x, h))
         if self._band is not None:
             p.setPen(QPen(QColor("#ffffff"), 1, Qt.DashLine))
@@ -487,6 +509,9 @@ class _Roll(QWidget):
         if e.button() != Qt.LeftButton or self.ed.model is None:
             return
         ed = self.ed
+        if ed.side:                                                 # select everything to one side of the line
+            ed.select_side(ed.view.t(pos.x()))
+            return
         edge = self.edge_at(pos) if not mods & (Qt.ControlModifier | Qt.ShiftModifier) else None
         if edge is not None:                                        # stretch the selection from that side
             i, side = edge
@@ -533,6 +558,11 @@ class _Roll(QWidget):
             v.t0 = max(t0 - (pos.x() - start.x()) / v.pps, -1.0)
             v.top = top + (pos.y() - start.y()) / v.rh
             ed.view_changed()
+            return
+        if ed.side:
+            self.hover_t = v.t(pos.x())
+            self.update()
+            ed.bar.update()
             return
         if self._scaling is not None:
             op = self._scaling
@@ -590,6 +620,13 @@ class _Roll(QWidget):
             self.ed.set_selection(set(int(k) for k in self.ed.model.group_of(i)))   # a click on a selected note
         self.ed.dragging(0.0)
 
+    def leaveEvent(self, e):
+        if self.hover_t is not None:
+            self.hover_t = None
+            self.update()
+            self.ed.bar.update()
+        super().leaveEvent(e)
+
     def wheelEvent(self, e):
         ed, v = self.ed, self.ed.view
         d = e.angleDelta()
@@ -614,6 +651,8 @@ class _Roll(QWidget):
         ed = self.ed
         if e.key() in (Qt.Key_Left, Qt.Key_Right) and e.modifiers() & Qt.ControlModifier and ed.selected:
             ed.move_selection(NUDGE * (1 if e.key() == Qt.Key_Right else -1))
+        elif e.key() == Qt.Key_Escape and ed.side:
+            ed.set_side(None)                                       # leave the tool; the selection stays
         elif e.key() == Qt.Key_Escape:
             ed.set_selection(set())
         elif e.key() == Qt.Key_A and e.modifiers() & Qt.ControlModifier and ed.model is not None:
@@ -644,6 +683,8 @@ class MidiEditor(QWidget):
         super().__init__(parent)
         self.project = self.score = self.model = None
         self.wave = None              # (rms, values per second) of the recording, or None
+        self.heat = None              # (times, confidence) of the sync, shown under the waveform, or None
+        self.side = None              # "left" / "right" while the select-left/right tool is on
         self.attack_times = np.zeros(0)
         self.selected: set[int] = set()
         self.anchor = None
@@ -665,6 +706,16 @@ class MidiEditor(QWidget):
                                  "(hold Alt to drag freely)")
         self.chk_snap.toggled.connect(lambda on: setattr(self, "snap", on))
         tools.addWidget(self.chk_snap)
+        self.btn_left = QPushButton("◀ Select all to the left")
+        self.btn_right = QPushButton("Select all to the right ▶")
+        for b, side in ((self.btn_left, "left"), (self.btn_right, "right")):
+            b.setCheckable(True)
+            b.setFocusPolicy(Qt.NoFocus)
+            b.setToolTip(f"A line follows the mouse; click to select every note to the {side} of it (again to "
+                         f"choose another place). Esc leaves the tool and keeps the selection.")
+            b.toggled.connect(lambda on, side=side: self.set_side(side if on else None) if on or self.side == side
+                              else None)
+            tools.addWidget(b)
         self.quant_gap, self.quant_even = 10, True     # the last choices in the Quantize dialog
         self.btn_quant = QPushButton("Quantize…")
         self.btn_quant.setToolTip("Space the selected notes out evenly (or in their written rhythm) over the time "
@@ -724,6 +775,43 @@ class MidiEditor(QWidget):
         self._needs_fit = True
         if self.isVisible():
             QTimer.singleShot(0, self.fit)
+
+    def set_heat(self, heat):
+        """The sync confidence [(time, confidence), ...] to show under the waveform, or None."""
+        if heat:
+            pts = np.array(heat, float)
+            self.heat = (pts[:, 0], pts[:, 1])
+        else:
+            self.heat = None
+        self.bar.update()
+
+    def set_side(self, side):
+        """Turn the select-left/right tool on ("left", "right") or off (None)."""
+        self.side = side
+        for b, s_ in ((self.btn_left, "left"), (self.btn_right, "right")):
+            b.blockSignals(True)
+            b.setChecked(side == s_)
+            b.blockSignals(False)
+        self.roll.setCursor(Qt.SplitHCursor if side else Qt.ArrowCursor)
+        if not side:
+            self.roll.hover_t = None
+        else:
+            self.roll.setFocus()
+        self._update_label()
+        self.roll.update()
+        self.bar.update()
+
+    def select_side(self, t: float):
+        """Select every note starting before `t` (the tool's left side) or from `t` on (right), with its chord."""
+        m = self.model
+        if m is None:
+            return
+        hit = m.start < t if self.side == "left" else m.start >= t
+        chosen = set()
+        for u in {int(x) for x in m.uid[hit] if x >= 0}:
+            chosen |= set(int(k) for k in m.groups[u])
+        chosen |= set(int(k) for k in np.nonzero(hit & (m.uid < 0))[0])
+        self.set_selection(chosen)
 
     def set_audio(self, wave, attack_times=None):
         """The waveform (rms, values per second) to show, or None; the attacks to snap to."""
@@ -837,6 +925,11 @@ class MidiEditor(QWidget):
     def _update_label(self):
         if self.model is None:
             self.lbl.setText("Open a score to see its notes.")
+            return
+        if self.side:
+            n = len(self.selected)
+            self.lbl.setText(f"Select all to the {self.side}: click where the line should be"
+                             + (f" ({n} notes selected)" if n else "") + ". Esc when done, then edit.")
             return
         n = len(self.selected)
         chords = len({int(self.model.uid[i]) for i in self.selected if self.model.uid[i] >= 0})

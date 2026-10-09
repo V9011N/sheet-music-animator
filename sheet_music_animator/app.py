@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from bisect import bisect_right
+from dataclasses import replace
 import sys
 import tempfile
 import threading
@@ -851,13 +852,35 @@ class MainWindow(QMainWindow):
         self.cfg.setValue("last_dir", str(Path(path).parent))
         if dlg.result_value:
             self.cfg.setValue("measures_per_line", dlg.result_value)
-        old = self.project.settings
-        self.project = Project(xml_path=path, settings=old)
+        # A new score starts on its own timing: the recording, the fit to it and its cached sound belong to the
+        # piece that was open (the look is kept).
+        settings = replace(self.project.settings, audio="synth", align_audio="", offset=0.0)
+        self._clear_audio_cache()
+        self.project = Project(xml_path=path, settings=settings)
         self.project.settings.measures_per_line = dlg.result_value
         self.project.settings.layout = "horizontal" if dlg.result_value == 0 else "pages"
         self.project_path = None
         self._sync_settings_to_ui()
         return self.load_score()
+
+    def _clear_audio_cache(self):
+        """Let go of the sound that is loaded and delete the cached audio (the synthesised sound, the decoded
+        loudness and attacks of recordings): a new score must not play or show the old piece's audio."""
+        self.pause()
+        if self.player is not None:
+            self.player.setSource(QUrl())
+        self.wav_path = None
+        self.synth = None
+        self._synth_job = self._pending_wav = None
+        self._wave_job += 1                      # a waveform still loading in the background is dropped
+        self.midi.set_audio(None)
+        self.midi.set_heat(None)
+        folder = Path(tempfile.gettempdir()) / "sheet_music_animator"
+        for f in list(folder.glob("*.wav")) + list(folder.glob("*.npy")):
+            try:
+                f.unlink()
+            except OSError:                      # still held by something: it is overwritten later anyway
+                pass
 
     def open_project(self):
         if not self._confirm_discard():
@@ -1811,8 +1834,10 @@ class MainWindow(QMainWindow):
     def _refresh_heat(self):
         if not self.a_heat.isChecked() or self.score is None or not self.project.sync_conf:
             self.editor.set_heat(None)
+            self.midi.set_heat(None)
             return
         self.editor.set_heat(self._heat_strips())
+        self.midi.set_heat(self.project.sync_conf)          # over the waveform, in the MIDI editor
 
     def _heat_strips(self):
         """One horizontal strip per line of music, coloured by the sync confidence of the notes along it."""

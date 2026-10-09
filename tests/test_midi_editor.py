@@ -358,6 +358,48 @@ class TestEditor(unittest.TestCase):
         self.assertTrue(np.allclose(np.diff(starts), np.diff(starts)[0]))
         self.assertTrue(self.win.history.can_undo())
 
+    def test_select_all_to_the_left_or_right_of_a_line(self):
+        m, roll, ed = self.ed.model, self.ed.roll, self.ed
+        from PySide6.QtGui import QKeyEvent
+        t = float(np.median(m.start))
+        x = ed.view.x(t)
+        ed.btn_right.click()
+        self.assertEqual(ed.side, "right")
+        press(roll, QEvent.MouseMove, QPointF(x, 40))
+        self.assertAlmostEqual(roll.hover_t, t, places=6)                    # the line follows the mouse
+        press(roll, QEvent.MouseButtonPress, QPointF(x, 40))
+        right = set(np.nonzero(m.start >= ed.view.t(x))[0].tolist())
+        self.assertEqual(ed.selected, right)
+        ed.btn_left.click()                                                  # the other side: one tool at a time
+        self.assertEqual(ed.side, "left")
+        self.assertFalse(ed.btn_right.isChecked())
+        press(roll, QEvent.MouseButtonPress, QPointF(x, 40))
+        self.assertEqual(ed.selected, set(range(len(m.start))) - right)
+        roll.keyPressEvent(QKeyEvent(QEvent.KeyPress, Qt.Key_Escape, Qt.NoModifier))
+        self.assertIsNone(ed.side)                                           # Esc leaves the tool...
+        self.assertFalse(ed.btn_left.isChecked())
+        self.assertEqual(ed.selected, set(range(len(m.start))) - right)      # ...and keeps the selection
+        i = min(ed.selected, key=lambda k: m.start[k])                        # which can now be edited
+        c = self.centre(i)
+        press(roll, QEvent.MouseButtonPress, c)
+        press(roll, QEvent.MouseMove, QPointF(c.x() + 0.1 * ed.view.pps, c.y()))
+        press(roll, QEvent.MouseButtonRelease, QPointF(c.x() + 0.1 * ed.view.pps, c.y()))
+        self.assertTrue(self.win.project.overrides)
+
+    def test_the_heat_map_over_the_waveform(self):
+        win = self.win
+        win.project.sync_conf = [[0.0, 0.9], [5.0, 0.2], [10.0, 0.8]]
+        win.a_heat.setEnabled(True)
+        win.a_heat.setChecked(True)
+        win.toggle_heat()
+        self.assertIsNotNone(self.ed.heat)
+        self.assertEqual(list(self.ed.heat[1]), [0.9, 0.2, 0.8])
+        self.ed.bar.grab()                                                   # draws
+        win.a_heat.setChecked(False)
+        win.toggle_heat()
+        self.assertIsNone(self.ed.heat)
+        win.project.sync_conf = []
+
     def test_notes_cannot_be_added_or_deleted(self):
         n = len(self.ed.model.pitch)
         roll = self.ed.roll
@@ -368,6 +410,40 @@ class TestEditor(unittest.TestCase):
         roll.keyPressEvent(QKeyEvent(QEvent.KeyPress, Qt.Key_Delete, Qt.NoModifier))
         self.assertEqual(len(self.ed.model.pitch), n)
         self.assertEqual(len(self.win.score.notes), n)
+
+
+class TestOpeningAnotherScore(unittest.TestCase):
+    def test_a_new_score_starts_on_its_own_timing_without_the_old_audio(self):
+        from sheet_music_animator import app as appmod
+        win = appmod.MainWindow()
+
+        def accept(dlg):
+            dlg.result_value = 4
+            return QDialog.Accepted
+        first = make_project(Path(tempfile.mkdtemp()))
+        with mock.patch.object(appmod.LayoutDialog, "exec", accept):
+            win.open_xml_path(first.xml_path)
+        # as after fitting a recording: its sound, the fit and a shift
+        rec = Path(tempfile.mkdtemp()) / "recording.wav"
+        audio.write_wav(rec, audio.synthesize(win.score.notes, win.score.duration))
+        s = win.project.settings
+        s.audio, s.align_audio, s.offset = str(rec), str(rec), 0.12
+        win.project.time_map = [[0.0, 0.5], [10.0, 11.0]]
+        cache = Path(tempfile.gettempdir()) / "sheet_music_animator"
+        cache.mkdir(exist_ok=True)
+        stale = [cache / "stale.wav", cache / "0123456789abcdef.npy"]
+        for f in stale:
+            f.write_bytes(b"x")
+        second = make_project(Path(tempfile.mkdtemp()))
+        with mock.patch.object(appmod.LayoutDialog, "exec", accept):
+            win.open_xml_path(second.xml_path)
+        s = win.project.settings
+        self.assertEqual((s.audio, s.align_audio, s.offset), ("synth", "", 0.0))
+        self.assertEqual(win.project.time_map, [])
+        self.assertFalse(any(f.exists() for f in stale))                      # the cache was emptied
+        self.assertNotEqual(win.wav_path, str(rec))
+        self.assertTrue(rec.exists())                                        # the recording itself is not touched
+        win.close()
 
 
 if __name__ == "__main__":
