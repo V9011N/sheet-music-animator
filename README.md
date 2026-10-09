@@ -42,6 +42,8 @@ python -m venv .venv
 
 Staves that MuseScore hid because they are empty (`print-object="no"` in the exported MusicXML) stay hidden for those systems; Verovio ignores this itself, so the animator removes them.
 
+### Interested in the project and want to help with further development? Join the Discord: https://discord.gg/HDRX89mQ9
+
 ## How it works
 
 * `engraver.py` – Verovio engraves the MusicXML to SVG and gives a timemap. The SVG is split into a
@@ -103,17 +105,6 @@ Recipes: a *fade to black* is a black *Solid colour* with *Appears at* −1.0 (o
 *Fades in over* 1.0; a *title* is a *Text* layer with *Appears at* and *Fades out over*; a *vignette* of colour
 is the *Dark corners* layer with another colour; a *flash on every note* is a *Solid colour* (add) linked to
 *Every note that starts*.
-
-## Recreating the Winter Wind video
-
-The "Winter Wind (storm)" look (calm Lento introduction, storm from measure 5, lit-up notes, shake on the loud
-chords, final spotlight on measure 96) is one of the built-in looks. You need the MusicXML of the piece
-(96 measures) and the recording.
-
-* In the editor: **Open ▸ Open XML…** (4 measures per line) → toolbar: **Fit Score to Recording…** →
-  Effects tab: Looks → *Winter Wind (storm)* → **Apply** → look at it with *Show the effects in the camera view*
-  → **Render video…**.
-* Or in one command: see below. Apply the look *after* fitting; it places its cues by measure number.
 
 ## Rendering without the editor
 
