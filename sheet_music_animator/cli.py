@@ -35,7 +35,7 @@ def render(args) -> int:
     from .build import build_score
     from .export import render_video, render_video_parallel, total_duration
     from . import looks
-    from .project import Project, auto_camera
+    from .project import Project
     from .scene import SheetScene
 
     src = Path(args.input)
@@ -70,7 +70,7 @@ def render(args) -> int:
         for note in looks.apply_look(looks.get_look(key), project, score):
             print("  note:", note)
     if not project.has_keys():
-        project.channels.update(auto_camera(score, s))
+        project.follow_music(score)
     if args.fps:
         s.fps = args.fps
     if args.size:

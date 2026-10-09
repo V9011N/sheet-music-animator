@@ -24,7 +24,7 @@ from .effects_ui import EffectsPanel
 from .export import (EffectsRenderer, default_workers, effect_loudness, render_frame, render_video,
                      render_video_parallel, total_duration)
 from . import looks
-from .project import (CAMERA_CHANNELS, CATEGORIES, FIXED_KINDS, LANE, Key, Project, auto_camera, is_lane,
+from .project import (CAMERA_CHANNELS, CATEGORIES, FIXED_KINDS, LANE, Key, Project, is_lane,
                       retimer)
 from .scene import EditorView, PreviewWidget, SheetScene
 from .layout import relayout_project
@@ -194,7 +194,7 @@ class MainWindow(QMainWindow):
         self.timeline.keysChanged.connect(self._keys_changed)
         self.timeline.keysEditFinished.connect(self.commit)
         self.timeline.addKeyRequested.connect(self.add_key_at)
-        shown = self.cfg.value("timeline_channels", "pos,size,rot")
+        shown = self.cfg.value("timeline_channels", "x,y,size,rot")
         self.timeline.set_visible_channels(str(shown).split(","))
         self.timeline.selectionChanged.connect(self._timeline_selection)
         self.timeline.channelsChanged.connect(
@@ -288,10 +288,11 @@ class MainWindow(QMainWindow):
         self.btn_follow = b
         f.addRow(row)
         hint = QLabel("Drag the orange window on the sheet to move it, drag a corner to resize it and the round "
-                      "handle above it to rotate (Shift snaps to 15°). Keyframes live on three channels "
-                      "(position, frame size, rotation) in the timeline; the Camera label there chooses which are "
-                      "shown. Double-click a lane to add a key; click/Ctrl+click/Shift+click/Ctrl+A to select; "
-                      "right-click for easing.")
+                      "handle above it to rotate (Shift snaps to 15°). Keyframes live on four channels "
+                      "(x, y, frame size, rotation) in the timeline; the Camera label there chooses which are "
+                      "shown. Follow music lays down x (and the frame size); y only moves from line to line and is "
+                      "never replaced once you have set it. Double-click a lane to add a key; "
+                      "click/Ctrl+click/Shift+click/Ctrl+A to select; right-click for easing.")
         hint.setWordWrap(True)
         hint.setStyleSheet("color:#9a9aa0")
         f.addRow(hint)
@@ -678,7 +679,6 @@ class MainWindow(QMainWindow):
         if self.tap_session is not None:
             self.tap_session.finish()
         self.pause()
-        s = self.project.settings
         QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
             self.status.showMessage("Engraving…")
@@ -694,7 +694,7 @@ class MainWindow(QMainWindow):
             self.editor.setScene(self.scene)
             self.preview.view.setScene(self.scene)
             if not self.project.has_keys():
-                self.project.channels.update(auto_camera(score, s))
+                self.project.follow_music(score)
             self._build_audio()
             self.timeline.set_data(self.project, score, total_duration(self.scene, self.project))
             self.scene.selectionChanged.connect(self._selection_changed)
@@ -899,7 +899,7 @@ class MainWindow(QMainWindow):
         """While the camera path is still the automatic one, it follows the lead/lag setting live."""
         if self._updating or self.score is None or self.project.keys_edited:
             return
-        self.project.channels.update(auto_camera(self.score, self.project.settings))
+        self.project.follow_music(self.score)
         self._keys_changed()
         self.commit()
 
@@ -908,9 +908,10 @@ class MainWindow(QMainWindow):
             return
         if self.project.keys_edited and QMessageBox.question(
                 self, "Replace camera path?",
-                "This replaces your camera keyframes with an automatic path that follows the music.") != QMessageBox.Yes:
+                "This replaces your x, frame size and rotation keyframes with an automatic path that follows the "
+                "music (keyframes you set on y stay).") != QMessageBox.Yes:
             return
-        self.project.channels.update(auto_camera(self.score, self.project.settings))
+        self.project.follow_music(self.score)
         self.project.keys_edited = False
         self.timeline.selected = set()
         self._keys_changed()
@@ -1415,7 +1416,7 @@ class MainWindow(QMainWindow):
             return
         old = getattr(self, "_lanes_for", None)
         self._lanes_for = sig
-        keep = [c for c in self.timeline.visible_channels if c in CAMERA_CHANNELS] or ["pos"]
+        keep = [c for c in self.timeline.visible_channels if c in CAMERA_CHANNELS] or ["x", "y"]
         lanes = [LANE + n for n in fx.lanes] if fx.enabled else []
         if old is not None and old[0] and fx.enabled:           # keep the lanes the user hid, show the new ones
             shown = [c for c in self.timeline.visible_channels if is_lane(c) and c[len(LANE):] in fx.lanes]

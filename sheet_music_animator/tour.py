@@ -404,8 +404,9 @@ def build_steps(win) -> list[Step]:
           "<b>double-click a lane</b>.<br><br>Add a key now.",
           target=lanes, setup=done_after(lambda t: (n_keys(), lambda b: n_keys() > b))),
         S("Channels",
-          "Position, frame size and rotation each have their own lane, so changing one never disturbs the "
-          "others. Click <b>Camera ▾</b> to choose which lanes are shown.", target=lambda: tl.label_rect()),
+          "Position X, position Y, frame size and rotation each have their own lane, so changing one never "
+          "disturbs the others: <i>Follow music</i> lays down x, and a height you set on y stays. Click "
+          "<b>Camera ▾</b> to choose which lanes are shown.", target=lambda: tl.label_rect()),
         S("Select several keys",
           "Click a key to select it; <b>Ctrl+click</b> toggles one, <b>Shift+click</b> selects a range and "
           "<b>Ctrl+A</b> selects them all. Dragging moves every selected key together; right-click for easing; "

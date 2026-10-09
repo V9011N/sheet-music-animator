@@ -9,7 +9,7 @@ from .engraver import NOTE_KINDS
 from .project import CAMERA_CHANNELS, EASES, LANE, Project, channel_label, is_lane
 
 GUTTER, RULER_H, NOTES_H, CAM_H = 84, 24, 30, 26
-CHANNEL_COLORS = {"pos": "#ff9f1a", "size": "#34c759", "rot": "#bf5af2"}
+CHANNEL_COLORS = {"x": "#ff9f1a", "y": "#0a84ff", "size": "#34c759", "rot": "#bf5af2"}
 LANE_COLORS = ["#5ac8fa", "#ffd60a", "#ff6b8a", "#7be0a0", "#c792ea", "#ff9f43", "#4dd0e1", "#a5d6a7"]
 
 
@@ -76,7 +76,8 @@ class Timeline(QWidget):
         return list(CAMERA_CHANNELS) + lanes
 
     def set_visible_channels(self, channels):
-        self.visible_channels = [c for c in self.all_channels() if c in channels] or ["pos"]
+        channels = set(channels) | ({"x", "y"} if "pos" in channels else set())   # saved before x and y were split
+        self.visible_channels = [c for c in self.all_channels() if c in channels] or ["x", "y"]
         self._update_height()
         self.update()
         self.channelsChanged.emit()
@@ -147,7 +148,6 @@ class Timeline(QWidget):
             p.setPen(dim)
             if i == 0:
                 p.drawText(QRectF(6, y, GUTTER - 8, CAM_H), Qt.AlignVCenter, "Camera ▾")
-            p.drawText(QRectF(GUTTER + 4, y, 90, CAM_H), Qt.AlignVCenter, channel_label(ch))
 
         # ruler ticks
         step = next((s for s in STEPS if s / self.view_span * (right - GUTTER) >= 70), STEPS[-1])
@@ -216,6 +216,16 @@ class Timeline(QWidget):
                     if is_lane(ch):   # the value of an automation key
                         p.setPen(dim)
                         p.drawText(QPointF(x + 8, cy - 5), f"{k.v[0]:.2f}")
+            # the name of each lane, on top of its keys (a busy lane, like x, would hide it otherwise)
+            fm = p.fontMetrics()
+            for i, ch in enumerate(self.visible_channels):
+                label = channel_label(ch)
+                box = QRectF(GUTTER + 2, self._lane_y(i) + 4, fm.horizontalAdvance(label) + 8, CAM_H - 10)
+                p.setPen(Qt.NoPen)
+                p.setBrush(QColor(30, 30, 32, 210))
+                p.drawRoundedRect(box, 3, 3)
+                p.setPen(dim)
+                p.drawText(box, Qt.AlignCenter, label)
 
         # playhead
         x = self._x(self.t)
@@ -309,7 +319,7 @@ class Timeline(QWidget):
                         k.t = max(k0 + dt, 0.0)
                     for keys in self.project.channels.values():
                         keys.sort(key=lambda q: q.t)
-                    self.project.keys_edited = True
+                    self._edited(starts)
                     self._drag = (kind, t0, starts)
                     self._dragged = True
                     self.seeked.emit(max(self._t(pos.x()), 0.0))
@@ -362,10 +372,14 @@ class Timeline(QWidget):
                        ).triggered.connect(self.delete_selected)
         menu.exec(global_pos)
 
+    def _edited(self, keys):
+        """These keys were changed by hand (the automatic path stops following the music on their channels)."""
+        self.project.note_edit(ch for ch, ks in self.project.channels.items() if any(k in keys for k in ks))
+
     def _set_ease(self, ease):
         for k in self.selected:
             k.ease = ease
-        self.project.keys_edited = True
+        self._edited(self.selected)
         self.keysChanged.emit()
         self.keysEditFinished.emit()
         self.update()
@@ -373,9 +387,9 @@ class Timeline(QWidget):
     def delete_selected(self):
         if not self.project or not self.selected:
             return
+        self._edited(self.selected)
         for ch in list(self.project.channels):
             self.project.channels[ch] = [k for k in self.project.channels[ch] if k not in self.selected]
-        self.project.keys_edited = True
         self.selected = set()
         self._anchor = None
         self.keysChanged.emit()
