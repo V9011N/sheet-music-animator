@@ -357,6 +357,244 @@ def has_cross_staff(path) -> bool:
     return False
 
 
+_GESTURAL = {"x": "ss", "xs": "ss", "sx": "ss", "ss": "ss", "s": "s", "f": "f", "ff": "ff", "n": "n"}
+
+
+def _fix_notes(root) -> bool:
+    """Two things exports get wrong that Verovio draws literally:
+    * beamed notes marked stemless (MuseScore 1 writes <stem>none</stem> on runs it draws with stems and a
+      beam): Verovio draws the beam alone, a thick bar floating between the staves, so the stems come back;
+    * hidden notes (the written-out notes of a trill, print-object="no") that carry an accidental: Verovio
+      hides the note but still draws its accidental, so it becomes a sounding (gestural) one."""
+    m = f"{{{MEI_NS}}}"
+    changed = False
+    beamed = [list(beam.iter(m + "note", m + "chord")) for beam in root.iter(m + "beam")] + _beam_spans(root)
+    restored: dict = {}      # measure -> [(staff of the group's layer, its events)]
+    for group in beamed:
+        stemless = [e for e in group if e.get("stem.visible") == "false" and e.get("visible") != "false"]
+        for e in stemless:
+            del e.attrib["stem.visible"]
+        if stemless:
+            staff = next(group[0].iterancestors(m + "staff"))
+            restored.setdefault(next(staff.iterancestors(m + "measure")), []).append((int(staff.get("n", 1)), stemless))
+            changed = True
+    for groups in restored.values():     # two such runs at once (one per hand): beam the upper one above, the lower one below
+        if len(groups) > 1:
+            top = min(n for n, _ in groups)
+            for n, events in groups:
+                for e in events:
+                    e.set("stem.dir", "up" if n == top else "down")
+    for n in root.iter(m + "note"):
+        if n.get("visible") != "false":
+            continue
+        for a in [n] + n.findall(m + "accid"):
+            if a.get("accid"):
+                if not a.get("accid.ges") and a.get("accid") in _GESTURAL:
+                    a.set("accid.ges", _GESTURAL[a.get("accid")])
+                del a.attrib["accid"]
+                changed = True
+    return changed
+
+
+def _beam_spans(root) -> list[list]:
+    """The notes and chords of every <beamSpan> (a beam between staves, which names only its first and last note)."""
+    m = f"{{{MEI_NS}}}"
+    spans = list(root.iter(m + "beamSpan"))
+    if not spans:
+        return []
+    by_id = {e.get(XML_ID): e for e in root.iter(m + "note", m + "chord")}
+    out = []
+    for span in spans:
+        first, last = by_id.get((span.get("startid") or "").lstrip("#")), by_id.get((span.get("endid") or "").lstrip("#"))
+        layer = next(first.iterancestors(m + "layer"), None) if first is not None else None
+        if layer is None or last is None:
+            continue
+        events = list(layer.iter(m + "note", m + "chord"))
+        if first in events and last in events:
+            out.append(events[events.index(first):events.index(last) + 1])
+    return out
+
+
+def _fix_run_slurs(root) -> bool:
+    """A slur over a run beamed between the staves goes on the side of its beam.  With two such runs at once
+    (one per hand, the upper beamed above and the lower below) Verovio puts both slurs above, and the lower
+    one arcs from the bottom staff over the whole system."""
+    m = f"{{{MEI_NS}}}"
+    side, run_of = {}, {}
+    for events in _beam_spans(root):
+        dirs = {e.get("stem.dir") for e in events}
+        if len(dirs) == 1 and dirs & {"up", "down"}:
+            ids = [e.get(XML_ID) for e in events]
+            side.update({i: "above" if dirs == {"up"} else "below" for i in ids})
+            run_of.update({i: ids for i in ids})
+    changed = False
+    for slur in root.iter(m + "slur"):
+        start = (slur.get("startid") or "").lstrip("#")
+        d = side.get(start)
+        if d and not slur.get("curvedir"):
+            slur.set("curvedir", d)
+            # A slur under the lower run that ends on the note after it (above the beam, often over a line
+            # break) would come up from under the bottom staff as an almost vertical stroke: it ends on the
+            # run's last note instead.
+            if d == "below" and (slur.get("endid") or "").lstrip("#") not in run_of[start]:
+                slur.set("endid", "#" + run_of[start][-1])
+            changed = True
+    return changed
+
+
+def _fix_long_ties(root) -> bool:
+    """A tie joins a note to the next one of the same pitch.  Verovio's MusicXML import sometimes pairs a tie
+    with a note of that pitch many measures later (Heroic Polonaise m. 48 -> m. 80: a line across the page).
+    Such a tie is re-attached to the next note of its pitch in the same voice (this measure or the next), or
+    dropped when there is none."""
+    m = f"{{{MEI_NS}}}"
+    measures = list(root.iter(m + "measure"))
+    where = {}
+    for i, meas in enumerate(measures):
+        for n in meas.iter(m + "note"):
+            where[n.get(XML_ID)] = i
+    changed = False
+    for tie in list(root.iter(m + "tie")):
+        a, b = (tie.get("startid") or "").lstrip("#"), (tie.get("endid") or "").lstrip("#")
+        if a not in where or (b in where and 0 <= where[b] - where[a] <= 1):
+            continue
+        note = next(e for e in measures[where[a]].iter(m + "note") if e.get(XML_ID) == a)
+        layer, staff = next(note.iterancestors(m + "layer"), None), next(note.iterancestors(m + "staff"), None)
+        cands = []
+        if layer is not None and staff is not None:
+            notes = list(layer.iter(m + "note"))
+            cands = notes[notes.index(note) + 1:]
+            if where[a] + 1 < len(measures):
+                for st in measures[where[a] + 1].findall(m + "staff"):
+                    if st.get("n") == staff.get("n"):
+                        for ly in st.findall(m + "layer"):
+                            if ly.get("n") == layer.get("n"):
+                                cands += list(ly.iter(m + "note"))
+        nxt = next((c for c in cands if (c.get("pname"), c.get("oct")) == (note.get("pname"), note.get("oct"))), None)
+        if nxt is not None:
+            tie.set("endid", "#" + nxt.get(XML_ID))
+        else:
+            tie.getparent().remove(tie)
+        changed = True
+    return changed
+
+
+def _stacked_trills(svg_root, calc) -> list:
+    """Trill signs that Verovio stacked on top of each other because several notes at one spot carry one (an
+    export that marks the grace notes before a trilled note as well as the note): the one with the trill line
+    (or the first) is kept, the others are returned for removal."""
+    trills = []
+    for g in svg_root.iter(_G):
+        if "trill" in _classes(g):
+            b = calc.box(g)
+            if b is not None:
+                trills.append((b, g))
+    out, seen = [], set()
+    for i, (a, ga) in enumerate(trills):
+        if i in seen:
+            continue
+        h = a[3] - a[1]
+        group = [(a, ga)] + [(b, gb) for j, (b, gb) in enumerate(trills[i + 1:], i + 1)
+                             if j not in seen and abs(b[0] - a[0]) < 2 * h and abs(b[1] - a[1]) < 3 * h
+                             and not seen.add(j)]
+        if len(group) > 1:
+            keep = max(group, key=lambda bg: bg[0][2] - bg[0][0])     # the widest: the one with the trill line
+            out += [g for _, g in group if g is not keep[1]]
+    return out
+
+
+SLUR_LOOP = 1200          # a slur that bulges further than this (Verovio units, ~2 staff heights)...
+SLUR_LOOP_RATIO = 0.6     # ...and further than this share of its length has been pushed into a loop
+
+
+def _looping_slurs(svg_root) -> dict[str, str]:
+    """{slur id: the side it was drawn on} of slurs that Verovio drew on the wrong side of their notes and then
+    pushed round everything in the way, e.g. right through the staff below and back up.  Drawn on the other
+    side they are ordinary arcs."""
+    out = {}
+    for g in svg_root.iter(_G):
+        if "slur" not in _classes(g) or not g.get("id"):
+            continue
+        for p in g.iter(f"{{{SVG_NS}}}path"):
+            v = [float(x) for x in _NUM.findall(p.get("d") or "")]
+            if len(v) < 8:
+                continue
+            x0, y0, _, y1, _, y2, x3, y3 = v[:8]
+            mid = (y0 + y3) / 2
+            if max(abs(y1 - mid), abs(y2 - mid)) > max(SLUR_LOOP, SLUR_LOOP_RATIO * abs(x3 - x0)):
+                out[g.get("id")] = "below" if y1 + y2 > 2 * mid else "above"
+    return out
+
+
+def _flip_slurs(tk, sides: dict[str, str]) -> bool:
+    """Re-load the score with the given slurs forced to the other side."""
+    root = etree.fromstring(tk.getMEI().encode("utf8"))
+    hit = False
+    for s in root.iter(f"{{{MEI_NS}}}slur"):
+        side = sides.get(s.get(XML_ID))
+        if side:
+            s.set("curvedir", "above" if side == "below" else "below")
+            hit = True
+    return hit and tk.loadData(etree.tostring(root, encoding="unicode"))
+
+
+_DYNAMIC_WORD = re.compile(r"^[pmfrszn]+$")
+
+
+def _merge_dynamics(root) -> bool:
+    """Dynamics written separately at the same moment of a staff ("p" and "sf" as two markings) are drawn on top
+    of each other by Verovio; they become one marking, "p sf", the way the notation programs set them."""
+    m = f"{{{MEI_NS}}}"
+    changed = False
+    for meas in root.iter(m + "measure"):
+        groups: dict = {}
+        for d in meas.findall(m + "dynam"):
+            text = "".join(d.itertext()).strip()
+            if len(d) == 0 and _DYNAMIC_WORD.match(text):
+                key = (d.get("staff"), d.get("tstamp"), d.get("startid"), d.get("place"))
+                groups.setdefault(key, []).append(d)
+        for ds in groups.values():
+            if len(ds) > 1:
+                ds[0].text = " ".join(d.text.strip() for d in ds)
+                for d in ds[1:]:
+                    meas.remove(d)
+                changed = True
+    return changed
+
+
+def numbered_arpeggios(path) -> bool:
+    """True when the MusicXML says which arpeggios of simultaneous chords belong together (their `number`)."""
+    root = _read_musicxml(path)
+    return root is not None and any(a.get("number") for a in root.iter("arpeggiate"))
+
+
+def _split_arpeggios(root) -> bool:
+    """One arpeggio per staff.  Verovio's import joins the arpeggios of simultaneous chords in both hands into one
+    line through both staves; without a `number` saying they belong together MusicXML means one per chord (and
+    the notation programs draw them so)."""
+    m = f"{{{MEI_NS}}}"
+    staff_of = {}
+    for st in root.iter(m + "staff"):
+        for e in st.iter(m + "note", m + "chord"):
+            staff_of[e.get(XML_ID)] = e.get("staff") or st.get("n")
+    changed = False
+    for arp in list(root.iter(m + "arpeg")):
+        refs = (arp.get("plist") or "").split()
+        groups: dict = {}
+        for r in refs:
+            groups.setdefault(staff_of.get(r.lstrip("#")), []).append(r)
+        if len(groups) < 2:
+            continue
+        for k, (_, rs) in enumerate(groups.items()):
+            a = arp if k == 0 else etree.Element(arp.tag, dict(arp.attrib))
+            a.set("plist", " ".join(rs))
+            if k:
+                a.set(XML_ID, f"{arp.get(XML_ID)}-{k}")
+                arp.addnext(a)
+        changed = True
+    return changed
+
+
 def _local(el) -> str:
     return el.tag.rsplit("}", 1)[-1] if isinstance(el.tag, str) else ""
 
@@ -505,7 +743,9 @@ def _fix_cross_staff_clefs(root) -> bool:
                                 now = attrs
                         wanted.setdefault((tgt, lay_n), []).append(now)
         for (tgt, lay_n), nows in wanted.items():
-            if not nows[0]:
+            # Only where it changes something: the clef at the start of the measure is the one Verovio uses
+            # anyway, and an invisible clef makes Verovio hide the clef at the start of every later line.
+            if not nows[0] or nows[0] == state.get(tgt, {}):
                 continue
             layer = etree.Element(f"{{{MEI_NS}}}layer", n=lay_n)
             etree.SubElement(layer, f"{{{MEI_NS}}}clef", visible="false", **nows[0])
@@ -699,12 +939,35 @@ def _regroup_beams(root, conflicts) -> bool:
     return changed
 
 
-def _adjust_mei(tk, path, hidden, cross, breaks=None, beams=None) -> set[str]:
+def _ties_of_hidden_notes(root) -> set[str]:
+    """Ids of the ties to or from a hidden note (print-object="no": the written-out notes of a trill, a chord held
+    on for playback).  Verovio hides the note but draws its ties; they stay in the score (they decide how long
+    the note sounds) and are only left out of the drawing.  Other marks of hidden notes are kept: exports hang
+    things that are meant to be seen on them (MuseScore 1 puts the trill line of a trill on its written-out
+    notes)."""
+    m = f"{{{MEI_NS}}}"
+    hidden = {n.get(XML_ID) for n in root.iter(m + "note") if n.get("visible") == "false"}
+    for c in root.iter(m + "chord"):
+        notes = c.findall(m + "note")
+        if c.get("visible") == "false" or (notes and all(n.get(XML_ID) in hidden for n in notes)):
+            hidden.add(c.get(XML_ID))
+    if not hidden:
+        return set()
+    return {t.get(XML_ID) for t in root.iter(m + "tie")
+            if {(t.get("startid") or "").lstrip("#"), (t.get("endid") or "").lstrip("#")} & hidden and t.get(XML_ID)}
+
+
+def _adjust_mei(tk, path, hidden, cross, breaks=None, beams=None, arpeggios=False) -> tuple[set[str], set[str]]:
     """Work around Verovio's MusicXML import by re-loading the score through MEI:
     * hidden staves (print-object="no"): marked invisible, their xml:ids returned so that
       `_remove_hidden_staves` can take them out of the SVG afterwards (only rest-only staves are touched);
-    * cross-staff clefs (see `_fix_cross_staff_clefs`).
-    Returns the ids of the hidden <staff> elements (and re-breaks the lines when `breaks` is given)."""
+    * cross-staff clefs (see `_fix_cross_staff_clefs`);
+    * stemless beamed notes and the accidentals of hidden notes (see `_fix_notes`), ties paired with a far
+      away note (`_fix_long_ties`), arpeggios joined across the staves (`_split_arpeggios`, when `arpeggios`),
+      dynamics drawn on top of each other (`_merge_dynamics`).
+    The score is only re-loaded when something changed.  Returns the ids of the hidden <staff> elements and of
+    the ties of hidden notes (`_ties_of_hidden_notes`), both to be taken out of the SVG (and re-breaks the
+    lines when `breaks` is given)."""
     ns = {"m": MEI_NS}
     root = etree.fromstring(tk.getMEI().encode("utf8"))
     changed = _fix_cross_staff_clefs(root) if cross else False
@@ -712,6 +975,13 @@ def _adjust_mei(tk, path, hidden, cross, breaks=None, beams=None) -> set[str]:
         changed = _regroup_beams(root, beams) or changed
     if cross:
         changed = _merge_slur_chains(root) or changed
+    changed = _fix_notes(root) or changed
+    changed = _fix_long_ties(root) or changed
+    if arpeggios:
+        changed = _split_arpeggios(root) or changed
+    changed = _merge_dynamics(root) or changed
+    if cross:
+        changed = _fix_run_slurs(root) or changed
     ids: set[str] = set()
     if hidden:
         for measure in root.iterfind(".//m:measure", ns):
@@ -726,12 +996,13 @@ def _adjust_mei(tk, path, hidden, cross, breaks=None, beams=None) -> set[str]:
         changed = changed or bool(ids)
     if breaks:
         changed = _set_line_breaks(root, breaks) or changed
+    ghosts = _ties_of_hidden_notes(root)
     if not changed:
-        return set()
+        return set(), ghosts
     if not tk.loadData(etree.tostring(root, encoding="unicode")):
-        tk.loadFile(str(path))   # could not be applied: keep the plain import
-        return set()
-    return ids
+        tk.loadFile(str(path))   # could not be applied: keep the plain import (whose ids are new)
+        return set(), set()
+    return ids, ghosts
 
 
 def _scale_y(d: str, top: float, k: float) -> str:
@@ -819,9 +1090,11 @@ def engrave(path, layout: str = "pages", ink: str = "#000000", progress=None,
     tk.setOptions(opts)
     if not tk.loadFile(str(path)):
         raise ValueError(f"Verovio could not read {path}")
-    hidden_ids = (_adjust_mei(tk, path, hidden, cross, breaks, beams)
-                  if hidden or cross or breaks or beams else set())
+    hidden_ids, ghost_ids = _adjust_mei(tk, path, hidden, cross, breaks, beams, not numbered_arpeggios(path))
     svg = tk.renderToSVG(1)
+    loops = _looping_slurs(etree.fromstring(svg.encode("utf8")))
+    if loops and _flip_slurs(tk, loops):
+        svg = tk.renderToSVG(1)
     timemap = tk.renderToTimemap({"includeRests": True, "includeMeasures": True})
     timemap = json.loads(timemap) if isinstance(timemap, str) else timemap
 
@@ -839,9 +1112,11 @@ def engrave(path, layout: str = "pages", ink: str = "#000000", progress=None,
     root = etree.fromstring(svg.encode("utf8"), etree.XMLParser(remove_blank_text=True))
     if hidden_ids:
         _remove_hidden_staves(root, hidden_ids)
+    defs = {e.get("id"): e for d in root.iter(f"{{{SVG_NS}}}defs") for e in d if e.get("id")}
+    for e in [e for e in root.iter(_G) if e.get("id") in ghost_ids] + _stacked_trills(root, BoxCalculator(defs)):
+        e.getparent().remove(e)
     inner = next(e for e in root if e.tag == _SVG)
     vb = [float(x) for x in inner.get("viewBox").split()]
-    defs = {e.get("id"): e for d in root.iter(f"{{{SVG_NS}}}defs") for e in d if e.get("id")}
     margin = next(e for e in inner.iter(_G) if "page-margin" in _classes(e))
 
     tied = {(e.get("data-endid") or "").lstrip("#") for e in inner.iter(_G) if "tie" in _classes(e)} - {""}
@@ -1126,9 +1401,11 @@ class _Builder:
                       "E539": "sfz", "E53A": "sffz", "E53B": "rf", "E53C": "rfz"}
 
     def _dynamic_label(self, el) -> str:
-        """What a dynamic marking says ("ff", "sfz"), read from the SMuFL glyphs it is drawn with."""
+        """What a dynamic marking says ("ff", "sfz"), read from the SMuFL glyphs it is drawn with, or from its
+        words when it is set as text (two markings merged into one, "p sf")."""
         glyphs = [(u.get(_HREF) or "").lstrip("#").split("-")[0] for u in el.iter(_USE)]
-        return "".join(self.DYNAMIC_GLYPHS.get(g, "") for g in glyphs)
+        text = "".join(self.DYNAMIC_GLYPHS.get(f"{ord(c):04X}", c) for c in "".join(el.itertext()))
+        return "".join(self.DYNAMIC_GLYPHS.get(g, "") for g in glyphs) or " ".join(text.split())
 
     def _heads(self, r) -> tuple:
         """Notehead rectangles (page space) of a note or chord, with the staff each one sits on."""
