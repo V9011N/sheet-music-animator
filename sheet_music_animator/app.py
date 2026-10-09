@@ -476,7 +476,7 @@ class MainWindow(QMainWindow):
             return a
 
         self.a_open_xml = act("Open XML…", self.open_xml, "Ctrl+O", "Open a MusicXML score (.mxl, .musicxml, .xml)")
-        self.a_open_pdf = act("Open PDF…", self.open_pdf, "Ctrl+Shift+P",
+        self.a_open_pdf = act("Open PDF (EXPERIMENTAL!)", self.open_pdf, "Ctrl+Shift+P",
                               "Read the music of an engraved PDF score (needs Audiveris or homr installed)")
         self.a_open = QAction("Open", self)
         self.a_open.setToolTip("Open a score: MusicXML, or a PDF to read the music from")
