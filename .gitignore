@@ -7,3 +7,5 @@ __pycache__/
 *.musicxml
 *.mp4
 *.wav
+# local reference material (scores, recordings, other renderers)
+debug files/

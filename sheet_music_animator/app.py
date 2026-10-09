@@ -8,16 +8,23 @@ import time
 from pathlib import Path
 
 from PySide6.QtCore import QElapsedTimer, QPointF, QRectF, QSettings, Qt, QTimer, QUrl
+import numpy as np
 from PySide6.QtGui import QAction, QColor, QFont, QImage, QKeySequence, QPalette
 from PySide6.QtWidgets import (QApplication, QCheckBox, QColorDialog, QComboBox, QDialog, QDoubleSpinBox,
                                QFileDialog, QFontComboBox, QFormLayout, QFrame, QGraphicsView, QGroupBox, QHBoxLayout,
-                               QLabel, QMainWindow, QMessageBox, QProgressDialog, QPushButton, QScrollArea, QSizePolicy, QSpinBox,
+                               QInputDialog,
+                               QLabel, QMainWindow, QMessageBox, QProgressDialog, QPushButton, QScrollArea, QSizePolicy,
+                               QSpinBox,
                                QSplitter, QTabWidget, QToolBar, QVBoxLayout, QWidget)
 
-from . import audio
-from .engraver import engrave
-from .export import render_frame, render_video, total_duration
-from .project import CATEGORIES, CHANNEL_LABELS, CHANNELS, FIXED_KINDS, Key, Project, auto_camera
+from . import analysis, audio
+from .build import build_score
+from .effects_ui import EffectsPanel
+from .export import (EffectsRenderer, default_workers, effect_loudness, render_frame, render_video,
+                     render_video_parallel, total_duration)
+from . import looks
+from .project import (CAMERA_CHANNELS, CATEGORIES, FIXED_KINDS, LANE, Key, Project, auto_camera, is_lane,
+                      retimer)
 from .scene import EditorView, PreviewWidget, SheetScene
 from .layout import relayout_project
 from .timeline import Timeline, fmt
@@ -152,6 +159,9 @@ class MainWindow(QMainWindow):
         self._updating = False
         self._clock = QElapsedTimer()
         self._sel_units, self._sel_measures, self._reselecting = [], [], False
+        self._fx = None                  # EffectsRenderer for the camera view (rebuilt when stale)
+        self._fx_dirty = True
+        self._fx_built = 0.0
         self.history = History()
         self._saved_state = self.project.snapshot()
         self._editor_clock = QElapsedTimer()
@@ -181,6 +191,7 @@ class MainWindow(QMainWindow):
         self.timeline.addKeyRequested.connect(self.add_key_at)
         shown = self.cfg.value("timeline_channels", "pos,size,rot")
         self.timeline.set_visible_channels(str(shown).split(","))
+        self.timeline.selectionChanged.connect(self._timeline_selection)
         self.timeline.channelsChanged.connect(
             lambda: self.cfg.setValue("timeline_channels", ",".join(self.timeline.visible_channels)))
 
@@ -197,14 +208,26 @@ class MainWindow(QMainWindow):
         pvl = QVBoxLayout(pv)
         pvl.setContentsMargins(4, 4, 4, 4)
         pvl.addWidget(self.preview)
-        sl.addWidget(pv, 3)
+        sl.addWidget(pv, 2)
         self.tabs = QTabWidget()
+        # tabs are always found through their widget, never by position: tabs get added in between
         self.tab_selection = self._note_tab()
-        self.tabs.addTab(self._camera_tab(), "Camera")
-        self.tabs.addTab(self._look_tab(), "Look && timing")   # a single & would be eaten as a shortcut marker
-        self.tabs.addTab(self._output_tab(), "Output")
+        self.tab_camera, self.tab_look = self._camera_tab(), self._look_tab()
+        self.tabs.addTab(self.tab_camera, "Camera")
+        self.tabs.addTab(self.tab_look, "Look && timing")
+        self.fx_panel = EffectsPanel(self)
+        self.fx_panel.changed.connect(self._effects_changed)
+        self.fx_panel.lookRequested.connect(self.apply_look)
+        self.fx_panel.saveLookRequested.connect(self.save_look)
+        self.fx_panel.deleteLookRequested.connect(self.delete_look)
+        self.fx_panel.structureChanged.connect(self._show_effect_lanes)
+        self.fx_panel.chk_preview.setChecked(str(self.cfg.value("fx_preview", "true")).lower() == "true")
+        self.fx_panel.chk_preview.toggled.connect(self._fx_preview_toggled)
+        self.tabs.addTab(self.fx_panel, "Effects")
+        self.tab_output = self._output_tab()
+        self.tabs.addTab(self.tab_output, "Output")
         self.tabs.addTab(self.tab_selection, "Selection")
-        sl.addWidget(self.tabs, 2)
+        sl.addWidget(self.tabs, 3)
 
         split = QSplitter(Qt.Horizontal)
         split.addWidget(self.editor)
@@ -335,6 +358,34 @@ class MainWindow(QMainWindow):
         f.addRow("Frame rate", self.cb_fps)
         f.addRow("Audio", self.cb_audio)
         f.addRow("", self.lbl_audio)
+        self.btn_align = QPushButton("Fit the score to a recording…")
+        self.btn_align.setToolTip("Listens to a recording of the piece and moves every note of the score to where it "
+                                  "is played, so lit-up notes and effects land on the sound.")
+        self.btn_align.clicked.connect(self.align_to_recording)
+        self.btn_unalign = QPushButton("Use the score's own timing")
+        self.btn_unalign.clicked.connect(self.remove_alignment)
+        self.lbl_align = QLabel("")
+        self.lbl_align.setWordWrap(True)
+        self.lbl_align.setStyleSheet("color:#9a9aa0")
+        row = QHBoxLayout()
+        row.addWidget(self.btn_align)
+        row.addWidget(self.btn_unalign)
+        f.addRow(row)
+        f.addRow(self.lbl_align)
+        self.sp_workers = QSpinBox()
+        self.sp_workers.setRange(1, 16)
+        self.sp_workers.setValue(default_workers())
+        self.sp_workers.setToolTip("Renders with effects use one process per slice of the video (about 0.3 GB each). "
+                                   "More than ~4 hardly speeds it up: memory bandwidth is the limit.")
+        self.sp_from, self.sp_to = spin(0, 36000, 1, 1, " s"), spin(0, 36000, 1, 1, " s")
+        self.sp_to.setSpecialValueText("end")
+        f.addRow("Render with effects using", self.sp_workers)
+        row = QHBoxLayout()
+        row.addWidget(QLabel("only from"))
+        row.addWidget(self.sp_from)
+        row.addWidget(QLabel("to"))
+        row.addWidget(self.sp_to)
+        f.addRow(row)
         b = QPushButton("Render video…")
         b.clicked.connect(self.render)
         b2 = QPushButton("Save current frame as PNG…")
@@ -550,10 +601,7 @@ class MainWindow(QMainWindow):
             e.ignore()
 
     def _engrave(self):
-        s = self.project.settings
-        return engrave(self.project.xml_path, s.layout, s.ink, None,
-                       measures_per_line=None if s.measures_per_line < 0 else s.measures_per_line,
-                       line_starts=self.project.line_starts)
+        return build_score(self.project)
 
     def load_score(self, old_score=None, fresh: bool = True) -> bool:
         """(Re)engrave the project's MusicXML and rebuild the scene.  With `old_score` the project is carried
@@ -575,13 +623,14 @@ class MainWindow(QMainWindow):
             self.editor.setScene(self.scene)
             self.preview.view.setScene(self.scene)
             if not self.project.has_keys():
-                self.project.channels = auto_camera(score, s)
+                self.project.channels.update(auto_camera(score, s))
             self._build_audio()
             self.timeline.set_data(self.project, score, total_duration(self.scene, self.project))
             self.scene.selectionChanged.connect(self._selection_changed)
             self.scene.geometryChanged.connect(self._geometry_changed)
             self.scene.editFinished.connect(self.commit)
             self._layout_key = self._layout_signature()
+            self._fx_dirty = True
             if fresh:
                 self.history.reset(self.project.snapshot())
                 self._saved_state = self.history.states[0]
@@ -601,7 +650,8 @@ class MainWindow(QMainWindow):
 
     def _layout_signature(self):
         s = self.project.settings
-        return (s.measures_per_line, tuple(self.project.line_starts or ()), s.ink, self.project.xml_path)
+        return (s.measures_per_line, tuple(self.project.line_starts or ()), s.ink, self.project.xml_path,
+                hash(str(self.project.time_map)))
 
     def _build_audio(self):
         self.wav_path = None
@@ -685,6 +735,7 @@ class MainWindow(QMainWindow):
             self.editor.viewport().update()
         self.preview.set_aspect(self.project.settings.aspect)
         self.preview.view.set_camera(pose)
+        self._show_fx_preview()
         self.timeline.set_time(self.t)
         self.lbl_time.setText(f"{fmt(self.t)} / {fmt(self.end_time())}")
         if pose:
@@ -751,6 +802,7 @@ class MainWindow(QMainWindow):
         self.commit()
 
     def _keys_changed(self):
+        self._fx_dirty = True
         self._refresh_time()
         self.timeline.update()
 
@@ -761,7 +813,7 @@ class MainWindow(QMainWindow):
                 self, "Replace camera path?",
                 "This replaces your camera keyframes with an automatic path that follows the music.") != QMessageBox.Yes:
             return
-        self.project.channels = auto_camera(self.score, self.project.settings)
+        self.project.channels.update(auto_camera(self.score, self.project.settings))
         self.project.keys_edited = False
         self.timeline.selected = set()
         self._keys_changed()
@@ -790,6 +842,12 @@ class MainWindow(QMainWindow):
         s = self.project.settings
         self._updating = True
         self.sp_follow.setValue(s.follow_width)
+        self.fx_panel.sync()
+        aligned = bool(self.project.time_map)
+        self.btn_unalign.setEnabled(aligned)
+        self.lbl_align.setText(f"Fitted to {Path(s.align_audio).name}" if aligned and s.align_audio else
+                               "The notes use the timing written in the score.")
+        self._show_effect_lanes()
         self.cb_reveal.setCurrentIndex(self.cb_reveal.findData(s.reveal))
         self.sp_fade.setValue(s.fade)
         self.sp_fade.setEnabled(s.reveal == "fade")
@@ -830,6 +888,7 @@ class MainWindow(QMainWindow):
         self.cb_res.setCurrentText(next((k for k, v in RESOLUTIONS.items() if v == (s.width, s.height)), "Custom"))
         self._updating = False
         if self.scene:
+            self._fx_dirty = True
             self.scene.refresh()
             self.timeline.duration = max(self.end_time(), 1.0)
             self._refresh_time()
@@ -912,6 +971,7 @@ class MainWindow(QMainWindow):
         """Record the current project state as an undo step (nothing happens if it did not change)."""
         if self.scene is None:
             return
+        self._fx_dirty = True
         if self.history.push(self.project.snapshot()):
             self._update_enabled()
         self._update_title()
@@ -928,6 +988,7 @@ class MainWindow(QMainWindow):
         before = self._layout_signature()
         self.pause()
         self.project.restore(state)
+        self._fx_dirty = True
         if self._layout_signature() != before:   # the lines were broken differently: engrave again
             self.load_score(fresh=False)
         else:
@@ -1100,6 +1161,9 @@ class MainWindow(QMainWindow):
         path, _ = QFileDialog.getSaveFileName(self, "Render video", default, "MP4 video (*.mp4)")
         if not path:
             return
+        if self.project.effects.enabled:
+            self._render_effects(path)
+            return
         total = int(self.end_time() * self.project.settings.fps)
         dlg = QProgressDialog("Rendering frames…", "Cancel", 0, max(total, 1), self)
         dlg.setWindowModality(Qt.WindowModal)
@@ -1135,6 +1199,38 @@ class MainWindow(QMainWindow):
             self.t = t_before
             self._refresh_time()
 
+    def _render_effects(self, path: str):
+        """Render with effects: one process per slice of the video, joined at the end."""
+        s, dur = self.project.settings, self.end_time()
+        start, end = self.sp_from.value(), self.sp_to.value() or None
+        total = max(int(((end or dur) - start) * s.fps), 1)
+        workers = self.sp_workers.value()
+        dlg = QProgressDialog("Starting the render processes…", "Cancel", 0, total, self)
+        dlg.setWindowModality(Qt.WindowModal)
+        dlg.setMinimumDuration(0)
+        dlg.setWindowTitle("Rendering with effects")
+        t0 = time.perf_counter()
+
+        def progress(done, total):
+            dlg.setMaximum(max(total, 1))
+            dlg.setValue(done)
+            el = time.perf_counter() - t0
+            eta = f" — about {el / done * (total - done) / 60:.1f} min left" if done > 10 else ""
+            dlg.setLabelText(f"Rendering with {workers} processes: frame {done} of {total}{eta}")
+            QApplication.processEvents()
+            return not dlg.wasCanceled()
+
+        try:
+            render_video_parallel(self.project, path, self._audio_for_render(), self._loudness_path(), dur,
+                                  progress, workers, None, start, end)
+        except Exception as e:
+            dlg.close()
+            QMessageBox.critical(self, "Render failed", str(e))
+        else:
+            dlg.close()
+            if Path(path).exists():
+                self.status.showMessage(f"Rendered {path} in {(time.perf_counter() - t0) / 60:.1f} min", 10000)
+
     def save_frame(self):
         if self.scene is None or not self.project.has_keys():
             return
@@ -1143,16 +1239,180 @@ class MainWindow(QMainWindow):
         if not path:
             return
         s = self.project.settings
-        img = QImage(s.width, s.height, QImage.Format_RGBA8888)
         self.scene.set_cache(False)
-        sel = self.scene.selectedItems()
-        self.scene.clearSelection()
-        render_frame(self.scene, self.project, self.t, img)
-        for it in sel:
-            it.setSelected(True)
-        self.scene.set_cache(True)
+        try:
+            if self.project.effects.enabled:
+                QApplication.setOverrideCursor(Qt.WaitCursor)
+                r = EffectsRenderer(self.scene, self.project, s.width - s.width % 2, s.height - s.height % 2, s.fps,
+                                    self.end_time(), effect_loudness(self.project, self._loudness_path()))
+                arr = np.ascontiguousarray(r.frame(int(self.t * s.fps)))
+                img = QImage(arr.data, arr.shape[1], arr.shape[0], 3 * arr.shape[1], QImage.Format_RGB888).copy()
+                QApplication.restoreOverrideCursor()
+            else:
+                img = QImage(s.width, s.height, QImage.Format_RGBA8888)
+                sel = self.scene.selectedItems()
+                self.scene.clearSelection()
+                render_frame(self.scene, self.project, self.t, img)
+                for it in sel:
+                    it.setSelected(True)
+        finally:
+            self.scene.set_cache(True)
+            self.scene.apply_time(self.t, force=True)
         img.save(path)
         self.status.showMessage(f"Saved {path}", 5000)
+
+    # ================================================================== effects
+    def _loudness_path(self):
+        return None if self.project.settings.audio == "none" else self.wav_path
+
+    def _show_effect_lanes(self):
+        """The automation lanes appear in the timeline while the effects are on (and when a lane is added)."""
+        fx = self.project.effects
+        sig = (fx.enabled, tuple(fx.lanes))
+        if sig == getattr(self, "_lanes_for", None):
+            return
+        old = getattr(self, "_lanes_for", None)
+        self._lanes_for = sig
+        keep = [c for c in self.timeline.visible_channels if c in CAMERA_CHANNELS] or ["pos"]
+        lanes = [LANE + n for n in fx.lanes] if fx.enabled else []
+        if old is not None and old[0] and fx.enabled:           # keep the lanes the user hid, show the new ones
+            shown = [c for c in self.timeline.visible_channels if is_lane(c) and c[len(LANE):] in fx.lanes]
+            lanes = shown + [c for c in lanes if c[len(LANE):] not in old[1]]
+        self.timeline.set_visible_channels(keep + lanes)
+
+    def _timeline_selection(self):
+        sel = list(self.timeline.selected)
+        key = sel[0] if len(sel) == 1 and any(sel[0] in ks for c, ks in self.project.channels.items() if is_lane(c)) else None
+        self.fx_panel.show_key(key)
+
+    def _effects_changed(self):
+        self._fx_dirty = True
+        self._show_effect_lanes()
+        self._refresh_time(follow=False)
+        self.commit()
+
+    def _fx_preview_toggled(self, on):
+        self.cfg.setValue("fx_preview", "true" if on else "false")
+        self._refresh_time(follow=False)
+
+    def _fx_wanted(self) -> bool:
+        return bool(self.scene and self.project.effects.enabled and self.project.has_keys()
+                    and self.fx_panel.chk_preview.isChecked())
+
+    def _show_fx_preview(self):
+        """The camera view with the effects, drawn small (the real render is at the output size)."""
+        if not self._fx_wanted():
+            self.preview.show_image(None)
+            return
+        s = self.project.settings
+        if self._fx is None or self._fx_dirty:
+            wait = 0.4 - (time.perf_counter() - self._fx_built)
+            if self._fx is not None and wait > 0:        # dragging a key: do not rebuild for every mouse move
+                QTimer.singleShot(int(wait * 1000) + 20, lambda: self._refresh_time(follow=False))
+            else:
+                W = 640
+                H = max(int(W / s.aspect) // 2 * 2, 2)
+                self._fx = EffectsRenderer(self.scene, self.project, W, H, s.fps, self.end_time(),
+                                           effect_loudness(self.project, self._loudness_path()))
+                self._fx_dirty, self._fx_built = False, time.perf_counter()
+        arr = np.ascontiguousarray(self._fx.frame(int(self.t * s.fps)))
+        self.preview.show_image(QImage(arr.data, arr.shape[1], arr.shape[0], 3 * arr.shape[1],
+                                       QImage.Format_RGB888).copy())
+
+    def apply_look(self, key: str):
+        if self.score is None:
+            return
+        try:
+            look = looks.get_look(key)
+        except (OSError, ValueError, KeyError) as e:
+            QMessageBox.critical(self, "Could not open the look", str(e))
+            return
+        if (self.project.effects.layers or self.project.effects.lanes) and QMessageBox.question(
+                self, "Apply look", f"“{look['name']}” replaces the effect layers, lanes and events (you can undo it). "
+                "Continue?") != QMessageBox.Yes:
+            return
+        ink = self.project.settings.ink
+        notes = looks.apply_look(look, self.project, self.score)
+        self.timeline.selected = set()
+        if self.project.settings.ink != ink:      # the ink colour is baked into the engraving
+            if self.load_score(old_score=self.score, fresh=False):
+                self.commit()
+            return
+        self.scene.refresh()
+        self.timeline.set_data(self.project, self.score, self.end_time())
+        self._sync_settings_to_ui()
+        self._fx_dirty = True
+        self._refresh_time(follow=False)
+        self.commit()
+        self.status.showMessage(" ".join(notes) or f"Applied “{look['name']}”.", 10000)
+
+    def save_look(self):
+        if self.score is None or not self.project.effects.layers:
+            self.status.showMessage("There are no layers to save yet.", 4000)
+            return
+        name, ok = QInputDialog.getText(self, "Save this look", "Name of the look:")
+        if not ok or not name.strip():
+            return
+        look = looks.capture_look(self.project, self.score, name.strip())
+        path = looks.save_user_look(look)
+        self.fx_panel.refresh_looks(f"user:{path.stem}")
+        self.status.showMessage(f"Saved the look to {path}", 8000)
+
+    def delete_look(self, key: str):
+        if key.startswith("user:") and QMessageBox.question(self, "Delete look", "Delete this look file?") == QMessageBox.Yes:
+            looks.delete_user_look(key)
+            self.fx_panel.refresh_looks()
+
+    # ================================================================== alignment to a recording
+    def align_to_recording(self):
+        if self.score is None:
+            return
+        path, _ = QFileDialog.getOpenFileName(self, "Choose the recording", self.cfg.value("last_dir", ""),
+                                              "Audio (*.wav *.mp3 *.flac *.ogg *.m4a *.aac *.mp4);;All files (*)")
+        if not path:
+            return
+        dlg = QProgressDialog("Listening to the recording…", None, 0, 100, self)
+        dlg.setWindowModality(Qt.WindowModal)
+        dlg.setMinimumDuration(0)
+        dlg.setWindowTitle("Fitting the score to the recording")
+
+        def progress(fraction, text=""):
+            dlg.setValue(int(fraction * 100))
+            if text:
+                dlg.setLabelText(text)
+            QApplication.processEvents()
+            return True
+
+        try:
+            al = analysis.align_score(self.score.nominal_notes, path, progress)
+        except Exception as e:
+            dlg.close()
+            QMessageBox.critical(self, "Could not fit the score", f"{e}")
+            return
+        dlg.close()
+        self.cfg.setValue("last_dir", str(Path(path).parent))
+        self._apply_time_map(al.points(), path)
+        self.status.showMessage(f"Fitted {len(al.nominal)} note positions to {Path(path).name}; "
+                                f"{np.mean(np.abs(al.shifts) > 0.001) * 100:.0f}% were snapped to an attack.", 10000)
+
+    def remove_alignment(self):
+        if self.score is not None and self.project.time_map:
+            self._apply_time_map([], "")
+
+    def _apply_time_map(self, points: list, audio_path: str):
+        """Re-time the score with `points` and move the keyframes along with the music."""
+        s = self.project.settings
+        grid = [n[1] for n in self.score.nominal_notes] + [0.0]
+        self.project.retime(retimer(self.project.time_map, points, grid))
+        self.project.time_map = points
+        s.align_audio = audio_path
+        if points:
+            s.audio = audio_path           # the recording is the soundtrack now
+        old = self.score
+        if self.load_score(old_score=old, fresh=False):
+            self._sync_settings_to_ui()
+            self.commit()
+
 
 def main():
     app = QApplication(sys.argv)

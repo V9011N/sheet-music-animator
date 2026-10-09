@@ -20,7 +20,7 @@ class Step:
     title: str
     text: str
     target: Callable | None = None      # -> QWidget, QRect (window coordinates), list of those, or None
-    tab: int | None = None              # side-panel tab to show first
+    tab: Callable | None = None         # -> the side-panel tab widget to show first
     setup: Callable | None = None       # setup(tour) -> done() ; the step waits for the user to do the task
     extra: tuple | None = None          # (button text, callback) for an optional shortcut
     kind: str = "step"                  # "welcome" | "step" | "end"
@@ -156,7 +156,7 @@ class Tour(QWidget):
         self.i = i
         step = self.steps[i]
         if step.tab is not None:
-            self.win.tabs.setCurrentIndex(step.tab)
+            self.win.tabs.setCurrentWidget(step.tab())
         self._done = step.setup(self) if step.setup else None
         self._finished_task = False
         n = len(self.steps)
@@ -394,49 +394,57 @@ def build_steps(win) -> list[Step]:
         S("Camera settings",
           "Exact numbers for the camera live here. Switch <b>Auto keyframe</b> off to move the camera without "
           "creating keys, or press <b>Follow music</b> to build a whole camera path that tracks the notes and "
-          "glides from line to line.", tab=0, target=tabs_and_panel,
+          "glides from line to line.", tab=lambda: win.tab_camera, target=tabs_and_panel,
           setup=flagged(lambda: win.btn_follow.clicked)),
         S("Appear instantly or fade in",
           "Under <b>Look &amp; timing</b>, <b>Note reveal</b> chooses whether notes pop in or fade in. Switch it "
           "and press Play to see the difference. The same tab has the font for all text, the faint "
           "“ghost” of unplayed notes, a global timing shift for audio sync and the ink and paper colours.",
-          tab=1, target=lambda: win.cb_reveal, setup=flagged(lambda: win.cb_reveal.activated)),
+          tab=lambda: win.tab_look, target=lambda: win.cb_reveal, setup=flagged(lambda: win.cb_reveal.activated)),
         S("Measures per line",
           "This sets how many measures share a line (or put the whole score on one line). The canvas and the "
-          "automatic camera follow. Change the number and press Enter.", tab=1,
+          "automatic camera follow. Change the number and press Enter.", tab=lambda: win.tab_look,
           target=lambda: [win.sp_mpl, win.btn_one_line],
           setup=changed(lambda: tuple(win.score.line_starts) if win.score else ())),
         S("Select a measure",
           "Click the <b>white space inside a measure</b> to select it (not a note). <b>Shift+click</b> selects "
           "a range, <b>Ctrl+click</b> adds one. The Selection tab then offers things to do with those measures."
-          "<br><br>Select a measure.", tab=3, target=lambda: win.editor,
+          "<br><br>Select a measure.", tab=lambda: win.tab_selection, target=lambda: win.editor,
           setup=lambda t: (lambda: bool(win.scene and win.scene.selected_measures()))),
         S("Hide kinds of engraving",
           "With measures selected you can hide a whole category — fingerings, tuplet numbers, dynamics, slurs, "
-          "ornaments… — just for those measures. Untick one of the categories.", tab=3, target=sel_group,
+          "ornaments… — just for those measures. Untick one of the categories.", tab=lambda: win.tab_selection, target=sel_group,
           setup=changed(lambda: repr(sorted((m, sorted(c)) for m, c in win.project.hidden.items())))),
         S("Change the line breaks",
           "Select a measure in the <i>middle</i> of a line and press <b>Move from here to the next line</b>: "
           "it and the rest of its line move down (a new line is made after the last one, with its own clefs, "
           "key signature and bracket). Select the <i>first</i> measure of a line and <b>Move this line up</b> "
-          "joins it to the previous line. The canvas and camera follow.", tab=3, target=line_buttons,
+          "joins it to the previous line. The canvas and camera follow.", tab=lambda: win.tab_selection, target=line_buttons,
           setup=changed(lambda: tuple(win.score.line_starts) if win.score else ())),
         S("Move and resize engravings",
           "Click almost any engraved element — clef, barline, slur, dynamic, text, accidental — then "
           "<b>drag it</b> to move it, or drag a <b>corner handle</b> to resize it. (Noteheads, note tails and "
           "beams stay put.) <i>Reset position and size</i> in the Selection tab undoes it.",
-          tab=3, target=lambda: win.editor, setup=changed(lambda: repr(sorted(win.project.transforms.items())))),
+          tab=lambda: win.tab_selection, target=lambda: win.editor, setup=changed(lambda: repr(sorted(win.project.transforms.items())))),
         S("Time one element",
           "Select any element, such as a note, and use <b>Reveal earlier / later</b> to shift when it appears. "
           "Clefs, barlines and the like at the start of a line are always visible unless you time them.",
-          tab=3, target=lambda: win.sp_note, setup=changed(lambda: repr(sorted(win.project.overrides.items())))),
+          tab=lambda: win.tab_selection, target=lambda: win.sp_note, setup=changed(lambda: repr(sorted(win.project.overrides.items())))),
         S("Undo and redo",
           "Every change can be undone — <b>↶</b> or <b>Ctrl+Z</b>; <b>↷</b> or <b>Ctrl+Y</b> redoes. Press "
           "undo now.", target=[act(win.a_undo), act(win.a_redo)], setup=flagged(lambda: win.a_undo.triggered)),
+        S("Looks and layers",
+          "The <b>Effects</b> tab turns the plain page into a produced look: a stack of layers — backdrops, "
+          "particles, glowing notes, spotlights, grading, text — that can move with the music. Start from one "
+          "of the <b>Looks</b>, or tick <b>Produced look</b> to begin your own, then add layers and link their "
+          "settings to the loudness, the notes or your own automation lanes.",
+          tab=lambda: win.fx_panel, target=lambda: [win.fx_panel.chk_enabled, win.fx_panel.cb_look],
+          setup=flagged(lambda: win.fx_panel.chk_enabled.toggled)),
         S("Output",
           "Choose the resolution and frame rate, and the audio: a built-in piano synth, your own recording, or "
-          "none. <b>Render video…</b> writes the MP4 of everything the camera sees; <b>Save current frame as "
-          "PNG…</b> grabs a single still.", tab=2, target=tabs_and_panel),
+          "none (<b>Fit the score to a recording…</b> even moves every note to where it is played in a "
+          "recording). <b>Render video…</b> writes the MP4 of everything the camera sees; <b>Save current "
+          "frame as PNG…</b> grabs a single still.", tab=lambda: win.tab_output, target=tabs_and_panel),
         S("Save your project",
           "<b>Save project</b> (Ctrl+S) stores the camera keys, timing, hidden items, moved elements and line "
           "breaks in a .smanim file. Closing with unsaved changes asks first.", target=act(win.a_save)),

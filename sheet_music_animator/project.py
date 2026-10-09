@@ -6,10 +6,21 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from .engraver import NOTE_KINDS, REST_KINDS, Score
+from .layers import Layer, legacy_layers, schema
 
 EASES = ("smooth", "linear", "hold")
-CHANNELS = ("pos", "size", "rot")
+CAMERA_CHANNELS = ("pos", "size", "rot")
+LANE = "lane:"                      # automation lanes live in `channels` under "lane:<name>"
 CHANNEL_LABELS = {"pos": "Position", "size": "Frame size", "rot": "Rotation"}
+
+
+def is_lane(channel: str) -> bool:
+    return channel.startswith(LANE)
+
+
+def channel_label(channel: str) -> str:
+    return CHANNEL_LABELS.get(channel) or channel[len(LANE):]
+
 
 # Categories of engravings that can be switched off per measure: name -> SVG classes that make them up.
 # A class that is a whole element (a fingering, a dynamic) hides that element; a class inside a
@@ -44,6 +55,40 @@ class Key:
 
 
 @dataclass
+class Effects:
+    """The produced look of the video: a stack of effect layers (see layers.py) drawn bottom to top, the
+    automation lanes they can follow, and how events are made from the music.  Unused unless `enabled`."""
+    enabled: bool = False
+    layers: list = field(default_factory=list)        # Layer objects, bottom to top
+    lanes: dict = field(default_factory=dict)         # lane name -> its value where it has no keyframes
+    use_dynamics: bool = True     # f, ff, fff, sfz ... markings make events
+    use_accents: bool = True      # accents and marcatos make events
+    impulses: list = field(default_factory=list)      # [{"t": seconds, "s": 0..1}]: events placed by hand
+    hits: list = field(default_factory=list)          # [{"m0": measure, "m1": measure, "s": 0..1}]: every note is an event
+    loud_floor_db: float = -40.0  # loudness 0 at this level...
+    loud_range_db: float = 26.0   # ...and 1 this many dB above
+    density_max: float = 14.0     # notes per second that count as "full density"
+
+    def to_dict(self) -> dict:
+        d = asdict(self)
+        d["layers"] = [lay.to_dict() for lay in self.layers]
+        return d
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "Effects":
+        d = dict(d)
+        known = cls.__dataclass_fields__
+        if "layers" not in d and ("bg_calm" in d or "flash_colors" in d):   # the first, fixed-feature version
+            d["layers"] = legacy_layers(d)
+            d["lanes"] = {"Mood": 1.0, "Hush": 0.0, "Snow lift": 0.0}
+        layers = [Layer.from_dict(x) if isinstance(x, dict) else x for x in d.get("layers", [])]
+        return cls(**{**{k: v for k, v in d.items() if k in known}, "layers": layers})
+
+    def layer(self, layer_id: str):
+        return next((x for x in self.layers if x.id == layer_id), None)
+
+
+@dataclass
 class Settings:
     layout: str = "pages"        # "pages" (lines stacked) or "horizontal" (one long line); see measures_per_line
     measures_per_line: int = 4   # measures in each line (0 = the whole score on one line)
@@ -61,7 +106,10 @@ class Settings:
     paper: str = "#ffffff"
     audio: str = "synth"         # "synth", "none", or a path to an audio file
     crf: int = 16
+    preset: str = "medium"       # x264 speed/size trade-off (ultrafast ... veryslow); faster = bigger files
     follow_width: float = 14000.0  # camera width (page units) used by the automatic camera path
+    follow_lead: float = 0.25    # where "now" sits in the frame (fraction from the left) when following the music
+    align_audio: str = ""        # recording the score timing was fitted to ("" = the score's own timing)
 
     @property
     def aspect(self) -> float:
@@ -69,7 +117,7 @@ class Settings:
 
 
 def _blank_channels():
-    return {c: [] for c in CHANNELS}
+    return {c: [] for c in CAMERA_CHANNELS}
 
 
 def _interp(keys, t, kind):
@@ -106,6 +154,8 @@ class Project:
     hidden: dict[int, set[str]] = field(default_factory=dict)   # measure index -> hidden CATEGORIES
     transforms: dict[int, list[float]] = field(default_factory=dict)   # unit uid -> [dx, dy, scale]
     line_starts: list[int] | None = None   # measure index that starts each line (None: every measures_per_line)
+    effects: Effects = field(default_factory=Effects)
+    time_map: list = field(default_factory=list)   # [[score seconds, recording seconds], ...] from aligning to audio
 
     # ---- camera ---------------------------------------------------------------------
     def has_keys(self) -> bool:
@@ -146,7 +196,7 @@ class Project:
         if cur is not None:
             now = {"pos": [cur[0], cur[1]], "size": [cur[2]], "rot": [cur[3]]}
         out = []
-        for ch in CHANNELS:
+        for ch in CAMERA_CHANNELS:
             keys = self.channels[ch]
             if now[ch] is not None and all(abs(a - b) < 1e-6 for a, b in zip(now[ch], wanted[ch])):
                 continue
@@ -169,17 +219,97 @@ class Project:
         existing = next((k for k in keys if abs(k.t - t) <= snap), None)
         if existing is not None:
             return existing
-        cur = self.camera_at(t)
-        if cur is None:
-            return None
-        k = Key(t, {"pos": [cur[0], cur[1]], "size": [cur[2]], "rot": [cur[3]]}[channel])
+        if is_lane(channel):
+            k = Key(t, [self.lane_at(channel[len(LANE):], t)])
+        else:
+            cur = self.camera_at(t)
+            if cur is None:
+                return None
+            k = Key(t, {"pos": [cur[0], cur[1]], "size": [cur[2]], "rot": [cur[3]]}[channel])
         keys.append(k)
         keys.sort(key=lambda q: q.t)
-        self.keys_edited = True
+        if channel in CAMERA_CHANNELS:
+            self.keys_edited = True
         return k
 
+    # ---- automation lanes ---------------------------------------------------------------
+    def lane_at(self, name: str, t: float) -> float:
+        """Value of a lane at time t."""
+        v = _interp(self.channels.get(LANE + name, []), t, "scalar")
+        return float(self.effects.lanes.get(name, 0.0)) if v is None else float(v[0])
+
+    def sample_lane(self, name: str, times):
+        """lane_at for many times at once (numpy arrays)."""
+        import numpy as np
+        t = np.asarray(times, dtype=np.float64)
+        keys = self.channels.get(LANE + name, [])
+        if not keys:
+            return np.full(len(t), float(self.effects.lanes.get(name, 0.0)), np.float32)
+        out = np.empty(len(t), np.float64)
+        out[:] = keys[-1].v[0]
+        out[t < keys[0].t] = keys[0].v[0]
+        for a, b in zip(keys, keys[1:]):
+            m = (t >= a.t) & (t < b.t)
+            if not m.any():
+                continue
+            if a.ease == "hold":
+                out[m] = a.v[0]
+                continue
+            u = (t[m] - a.t) / max(b.t - a.t, 1e-9)
+            if a.ease == "smooth":
+                u = u * u * (3 - 2 * u)
+            out[m] = a.v[0] + (b.v[0] - a.v[0]) * u
+        return out.astype(np.float32)
+
+    def add_lane(self, name: str, default: float = 0.0) -> str:
+        name = name.strip() or "Lane"
+        base, i = name, 2
+        while name in self.effects.lanes:
+            name, i = f"{base} {i}", i + 1
+        self.effects.lanes[name] = default
+        self.channels.setdefault(LANE + name, [])
+        return name
+
+    def remove_lane(self, name: str) -> None:
+        self.effects.lanes.pop(name, None)
+        self.channels.pop(LANE + name, None)
+        for lay in self.effects.layers:
+            for setting, bs in list(lay.bindings.items()):
+                lay.bindings[setting] = [b for b in bs if b.get("src") != LANE + name]
+
+    def rename_lane(self, old: str, new: str) -> str:
+        if old not in self.effects.lanes or not new.strip() or new == old:
+            return old
+        new = new.strip()
+        if new in self.effects.lanes:
+            return old
+        self.effects.lanes = {(new if k == old else k): v for k, v in self.effects.lanes.items()}
+        self.channels = {(LANE + new if k == LANE + old else k): v for k, v in self.channels.items()}
+        for lay in self.effects.layers:
+            for bs in lay.bindings.values():
+                for b in bs:
+                    if b.get("src") == LANE + old:
+                        b["src"] = LANE + new
+        return new
+
+    def retime(self, fn) -> None:
+        """Move everything that is placed in time (keyframes, events, layer timings) with `fn`, e.g. when the
+        score is aligned to a recording and its notes move."""
+        for ch, keys in self.channels.items():
+            for k in keys:
+                k.t = max(float(fn(k.t)), 0.0)
+            keys.sort(key=lambda q: q.t)
+        fx = self.effects
+        for im in fx.impulses:
+            im["t"] = float(fn(im["t"]))
+        for lay in fx.layers:
+            for prm in schema(lay.type):
+                v = lay.params.get(prm.name)
+                if prm.kind == "time" and isinstance(v, (int, float)) and v > 0:
+                    lay.params[prm.name] = float(fn(v))
+
     def all_keys(self):
-        return [(ch, k) for ch in CHANNELS for k in self.channels[ch]]
+        return [(ch, k) for ch, keys in self.channels.items() for k in keys]
 
     # ---- note reveal -------------------------------------------------------------------
     def start_of(self, unit) -> float:
@@ -225,13 +355,13 @@ class Project:
 
     # ---- persistence -----------------------------------------------------------------------
     def to_dict(self) -> dict:
-        return {"version": 2, "xml_path": self.xml_path, "settings": asdict(self.settings),
-                "channels": {ch: [{"t": k.t, "v": k.v, "ease": k.ease} for k in self.channels[ch]] for ch in CHANNELS},
+        return {"version": 4, "xml_path": self.xml_path, "settings": asdict(self.settings),
+                "channels": {ch: [{"t": k.t, "v": k.v, "ease": k.ease} for k in keys] for ch, keys in self.channels.items()},
                 "overrides": {str(k): v for k, v in sorted(self.overrides.items())},
                 "keys_edited": self.keys_edited, "timed": sorted(self.timed),
                 "hidden": {str(m): sorted(c) for m, c in sorted(self.hidden.items()) if c},
                 "transforms": {str(u): list(v) for u, v in sorted(self.transforms.items())},
-                "line_starts": self.line_starts}
+                "line_starts": self.line_starts, "effects": self.effects.to_dict(), "time_map": self.time_map}
 
     def snapshot(self) -> str:
         return json.dumps(self.to_dict(), sort_keys=True)
@@ -245,9 +375,10 @@ class Project:
         self.xml_path = d.get("xml_path", "")
         self.settings = Settings(**st)
         self.channels = _blank_channels()
+        legacy = {"mood": LANE + "Mood", "hush": LANE + "Hush", "lift": LANE + "Snow lift"}   # the first version's fixed lanes
         if "channels" in d:
-            for ch in CHANNELS:
-                self.channels[ch] = [Key(k["t"], list(k["v"]), k.get("ease", "smooth")) for k in d["channels"].get(ch, [])]
+            for ch, keys in d["channels"].items():
+                self.channels[legacy.get(ch, ch)] = [Key(k["t"], list(k["v"]), k.get("ease", "smooth")) for k in keys]
         else:   # version 1: one list of keys that carry position and size together
             for k in d.get("keys", []):
                 self.channels["pos"].append(Key(k["t"], [k["cx"], k["cy"]], k.get("ease", "smooth")))
@@ -258,6 +389,13 @@ class Project:
         self.hidden = {int(m): set(c) for m, c in d.get("hidden", {}).items()}
         self.transforms = {int(u): list(v) for u, v in d.get("transforms", {}).items()}
         self.line_starts = d.get("line_starts")
+        self.effects = Effects.from_dict(d.get("effects", {}))
+        for ch in self.channels:             # a lane always has its entry in the effects
+            if is_lane(ch):
+                self.effects.lanes.setdefault(ch[len(LANE):], 0.0)
+        for name in self.effects.lanes:
+            self.channels.setdefault(LANE + name, [])
+        self.time_map = [list(p) for p in d.get("time_map", [])]
 
     def restore(self, snapshot: str) -> None:
         self.load_dict(json.loads(snapshot))
@@ -270,6 +408,29 @@ class Project:
         p = cls()
         p.load_dict(json.loads(Path(path).read_text(encoding="utf8")))
         return p
+
+
+def time_map_function(points):
+    """f(t) for a time map [[score seconds, recording seconds], ...] (identity for an empty map)."""
+    import numpy as np
+    if not points or len(points) < 2:
+        return lambda t: t
+    xs = [float(p[0]) for p in points]
+    ys = [float(p[1]) for p in points]
+    lo, hi = ys[0] - xs[0], ys[-1] - xs[-1]
+    return lambda t: t + lo if t <= xs[0] else t + hi if t >= xs[-1] else float(np.interp(t, xs, ys))
+
+
+def retimer(old_points, new_points, grid):
+    """A function taking a time in the output of the old time map to the matching time of the new one.
+    `grid`: score times (seconds) at which both maps are compared."""
+    import numpy as np
+    f_old, f_new = time_map_function(old_points), time_map_function(new_points)
+    g = sorted(set(float(x) for x in grid))
+    old = np.array([f_old(x) for x in g])
+    new = np.array([f_new(x) for x in g])
+    o = np.maximum.accumulate(old)
+    return lambda t: float(new[0] + (t - o[0]) if t <= o[0] else new[-1] + (t - o[-1]) if t >= o[-1] else np.interp(t, o, new))
 
 
 # --------------------------------------------------------------------------------------------
@@ -328,7 +489,7 @@ def _auto_keys(score: Score, settings: Settings) -> list:
         lo, hi = x + fw / 2 - 150, x + w - fw / 2 + 150
 
         def at(t, i=i, fw=fw, lo=lo, hi=hi):
-            return min(max(score.now_x(i, t) + 0.25 * fw, lo), hi)
+            return min(max(score.now_x(i, t) + (0.5 - settings.follow_lead) * fw, lo), hi)
 
         keys.append(CameraKey(arrive, at(s.start), cy, fw, "linear"))
         for t, _ in score.measures:
@@ -343,8 +504,9 @@ def _auto_keys(score: Score, settings: Settings) -> list:
 
 
 def auto_camera(score: Score, settings: Settings) -> dict:
-    """The automatic camera path as keyframe channels (position changes often, frame size rarely)."""
-    out = _blank_channels()
+    """The automatic camera path as keyframe channels (position changes often, frame size rarely).
+    Only the camera channels: `project.channels.update(auto_camera(...))` leaves the effect channels alone."""
+    out = {c: [] for c in CAMERA_CHANNELS}
     last_w = None
     for k in _auto_keys(score, settings):
         out["pos"].append(Key(k.t, [k.cx, k.cy], k.ease))

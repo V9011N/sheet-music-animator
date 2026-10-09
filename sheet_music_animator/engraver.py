@@ -23,6 +23,7 @@ from bisect import bisect_left, bisect_right
 from dataclasses import dataclass, field
 from pathlib import Path as FsPath
 
+import numpy as np
 import verovio
 from lxml import etree
 from svgelements import Path as SvgPath
@@ -75,6 +76,10 @@ class Unit:
     # member has appeared) so the shape grows note by note instead of all at once.
     steps: tuple = ()
     measure: int = -1     # index of the measure the element belongs to (in drawing order)
+    # Notes and chords: (x0, y0, x1, y1, staff, tied, pitch) of every notehead in page space; `tied` marks a
+    # note that only continues a tie; `pitch` is the written MIDI pitch (without accidentals).  For the light-up effect.
+    heads: tuple = ()
+    label: str = ""       # dynamics: what is written ("ff", "sfz"); articulations: "acc", "marc", ...
 
 
 @dataclass
@@ -111,8 +116,37 @@ class Score:
     measure_infos: list[MeasureInfo] = field(default_factory=list)
     line_starts: list[int] = field(default_factory=list)  # index of the first measure of every line
     notes: list[tuple] = field(default_factory=list)      # (midi pitch, start, end, velocity)
+    nominal_notes: list[tuple] = field(default_factory=list)   # the same before `warp` (the score's own timing)
     duration: float = 0.0
     _now_cache: dict = field(default_factory=dict, repr=False)
+
+    def warp(self, points) -> None:
+        """Re-time the whole score with a time map of (score seconds, recording seconds) points, e.g. the
+        result of aligning it to a performance.  Times outside the map shift by the nearest end's offset."""
+        if not points or len(points) < 2:
+            return
+        xs = [float(p[0]) for p in points]
+        ys = [float(p[1]) for p in points]
+        lo_off, hi_off = ys[0] - xs[0], ys[-1] - xs[-1]
+
+        def f(t):
+            if t <= xs[0]:
+                return t + lo_off
+            if t >= xs[-1]:
+                return t + hi_off
+            return float(np.interp(t, xs, ys))
+        for u in self.units:
+            u.time, u.end = f(u.time), f(u.end)
+            if u.steps:
+                u.steps = tuple((uid, f(t), frac) for uid, t, frac in u.steps)
+        self.measures = [(f(t), n) for t, n in self.measures]
+        for m in self.measure_infos:
+            m.time, m.end = f(m.time), f(m.end)
+        for sy in self.systems:
+            sy.start, sy.end = f(sy.start), f(sy.end)
+        self.notes = [(p, f(a), f(b), *rest) for p, a, b, *rest in self.notes]
+        self.duration = f(self.duration)
+        self._now_cache.clear()
 
     def now_x(self, system: int, t: float) -> float:
         """Horizontal position of 'now' in a system, linear between note onsets."""
@@ -627,6 +661,7 @@ def engrave(path, layout: str = "pages", ink: str = "#000000", progress=None,
     say("Engraving with Verovio…")
     tk = verovio.toolkit()
     opts = {"scale": 40, "svgViewBox": True, "header": "none", "footer": "none",
+            "svgAdditionalAttribute": ["tie@endid", "artic@artic", "note@pname", "note@oct"],
             "pageMarginLeft": 40, "pageMarginRight": 40, "pageMarginTop": 60, "pageMarginBottom": 60}
     breaks = None
     if line_starts is not None or measures_per_line is not None:
@@ -666,7 +701,8 @@ def engrave(path, layout: str = "pages", ink: str = "#000000", progress=None,
     defs = {e.get("id"): e for d in root.iter(f"{{{SVG_NS}}}defs") for e in d if e.get("id")}
     margin = next(e for e in inner.iter(_G) if "page-margin" in _classes(e))
 
-    b = _Builder(defs, ink, margin.get("transform"))
+    tied = {(e.get("data-endid") or "").lstrip("#") for e in inner.iter(_G) if "tie" in _classes(e)} - {""}
+    b = _Builder(defs, ink, margin.get("transform"), tied)
     score = b.run(margin, on, off, tk)
     score.width, score.height = vb[2], vb[3]
     score.title = FsPath(path).stem
@@ -676,7 +712,8 @@ def engrave(path, layout: str = "pages", ink: str = "#000000", progress=None,
 
 
 class _Builder:
-    def __init__(self, defs, ink, margin_transform):
+    def __init__(self, defs, ink, margin_transform, tied_ids=()):
+        self.tied_ids = set(tied_ids)
         self.calc = BoxCalculator(defs)
         self.defs_xml = {k: etree.tostring(v, with_tail=False) for k, v in defs.items()}
         self.ink = ink
@@ -763,21 +800,25 @@ class _Builder:
 
     def _measure(self, el, si) -> int:
         """Register a measure; its rectangle is the extent of the staff lines of its staves."""
-        xs, ys = [], []
+        xs, ys, staves = [], [], []
         for st in el:
             if _tag(st) == "g" and "staff" in _classes(st):
+                sy = []
                 for p in st:
                     if _tag(p) == "path":
                         b = self.calc.box(p)
                         if b:
                             xs += [b[0], b[2]]
                             ys += [b[1], b[3]]
+                            sy += [b[1], b[3]]
+                if sy:
+                    staves.append(_xf_box((0, min(sy), 0, max(sy)), self.m)[1::2])
         if xs:
             x0, y0, x1, y1 = _xf_box((min(xs), min(ys), max(xs), max(ys)), self.m)
             rect = (x0, y0, x1 - x0, y1 - y0)
         else:
             rect = (0.0, 0.0, 0.0, 0.0)
-        self.measure_recs.append({"system": si, "rect": rect})
+        self.measure_recs.append({"system": si, "rect": rect, "staves": staves})
         return len(self.measure_recs) - 1
 
     PART_CLASSES = {"accid", "artic", "dots"}   # parts of a note that can be moved on their own
@@ -934,6 +975,37 @@ class _Builder:
             steps[i][2] = max(steps[i][2], steps[i - 1][2])
         return tuple(tuple(st) for st in steps)
 
+    DYNAMIC_GLYPHS = {"E520": "p", "E521": "m", "E522": "f", "E523": "r", "E524": "s", "E525": "z", "E526": "n",
+                      "E527": "pppppp", "E528": "ppppp", "E529": "pppp", "E52A": "ppp", "E52B": "pp", "E52C": "mp",
+                      "E52D": "mf", "E52E": "pf", "E52F": "ff", "E530": "fff", "E531": "ffff", "E532": "fffff",
+                      "E533": "ffffff", "E534": "fp", "E535": "fz", "E536": "sf", "E537": "sfp", "E538": "sfpp",
+                      "E539": "sfz", "E53A": "sffz", "E53B": "rf", "E53C": "rfz"}
+
+    def _dynamic_label(self, el) -> str:
+        """What a dynamic marking says ("ff", "sfz"), read from the SMuFL glyphs it is drawn with."""
+        glyphs = [(u.get(_HREF) or "").lstrip("#").split("-")[0] for u in el.iter(_USE)]
+        return "".join(self.DYNAMIC_GLYPHS.get(g, "") for g in glyphs)
+
+    def _heads(self, r) -> tuple:
+        """Notehead rectangles (page space) of a note or chord, with the staff each one sits on."""
+        el = r["el"]
+        notes = [e for e in el.iter(_G) if "note" in _classes(e)] if r["kind"] == "chord" else [el]
+        staves = (self.measure_recs[r["measure"]]["staves"] if 0 <= r["measure"] < len(self.measure_recs) else [])
+        out = []
+        for n in notes:
+            head = next((g for g in n.iter(_G) if "notehead" in _classes(g)), None)
+            b = self.calc.box(head) if head is not None else None
+            if b is None:
+                continue
+            x0, y0, x1, y1 = _xf_box(b, self.m)
+            cy = (y0 + y1) / 2
+            staff = min(range(len(staves)), key=lambda i: abs(cy - (staves[i][0] + staves[i][1]) / 2)) if staves else 0
+            pname, octave = n.get("data-pname"), n.get("data-oct")
+            pitch = (12 * (int(octave) + 1) + "cdefgab".index(pname) * 2 - (1 if "cdefgab".index(pname) > 2 else 0)
+                     ) if pname and octave and pname in "cdefgab" else 60
+            out.append((x0, y0, x1, y1, staff, (n.get("id") or "") in self.tied_ids, pitch))
+        return tuple(out)
+
     def _make_units(self):
         out = []
         for r in self.recs:
@@ -941,9 +1013,17 @@ class _Builder:
                 continue
             rect = self._page_rect(r["box"], 30)
             span = r["end"] - r["time"]
+            heads, label = (), ""
+            if r["kind"] in NOTE_KINDS:
+                heads = self._heads(r)
+            elif r["kind"] == "dynam":
+                label = self._dynamic_label(r["el"])
+            elif r["kind"] == "artic":
+                label = r["el"].get("data-artic") or ""
             out.append(Unit(uid=r["n"], kind=r["kind"], svg=self._doc(r["el"], rect), rect=rect,
                             time=r["time"], end=r["end"], system=r["system"],
                             wipe=r["kind"] in WIPE_KINDS and span > 0.12, static=r["static"], measure=r["measure"],
+                            heads=heads, label=label,
                             steps=self._steps(r, rect) if r["members"] else
                             self._line_steps(r, rect) if r["kind"] in LINE_KINDS and span > 0.12 else ()))
         return out
