@@ -108,7 +108,7 @@ class Settings:
     crf: int = 16
     preset: str = "medium"       # x264 speed/size trade-off (ultrafast ... veryslow); faster = bigger files
     follow_width: float = 14000.0  # camera width (page units) used by the automatic camera path
-    follow_lead: float = 0.25    # where "now" sits in the frame (fraction from the left) when following the music
+    follow_lead: float = 0.5     # where "now" sits in the frame (fraction from the left) when following the music
     align_audio: str = ""        # recording the score timing was fitted to ("" = the score's own timing)
 
     @property

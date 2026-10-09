@@ -39,7 +39,7 @@ PLAIN = _look(
     "Plain (white page, no effects)", "The blank slate: dark ink on white, nothing else. Fits any piece.",
     [], enabled=False,
     settings={"paper": "#ffffff", "ink": "#1a1a1a", "width": 1920, "height": 1080, "fps": 30, "crf": 16, "tail": 2.0,
-              "reveal": "instant", "fade": 0.25, "ghost": 0.0, "follow_width": 14000.0, "follow_lead": 0.25})
+              "reveal": "instant", "fade": 0.25, "ghost": 0.0, "follow_width": 14000.0, "follow_lead": 0.5})
 
 WINTER_WIND = _look(
     "Winter Wind (storm)",
