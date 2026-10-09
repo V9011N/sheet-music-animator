@@ -180,6 +180,27 @@ class TestAlignment(unittest.TestCase):
         final = analysis._refine(y, score, onsets, est)[0]
         self.assertLess(abs(final[1] - final[2]), 0.03)
 
+    def test_a_fast_scale_in_octaves_is_timed_as_one_run(self):
+        """Heroic Polonaise m. 30: a scale in octaves, started slowly and speeding up.  Every note shares a pitch
+        with the note an octave further on, so note by note the attacks are ambiguous; an estimate that runs
+        ahead in the middle and waits at the top must be brought back onto the played curve."""
+        fps, binhz = 100.0, analysis.SR / 2048
+        scale = [33, 35, 36, 38, 40, 41, 43, 45, 47, 48, 50, 52, 53, 55, 57, 59, 60, 62, 64, 65, 67, 69]
+        onsets = 1.0 + 0.06 * np.arange(len(scale))                     # written evenly
+        u = np.linspace(0, 1, len(scale))
+        played = 2.0 + 1.6 * (u - 0.45 * u * (1 - u))                     # slow start, fast end
+        flux = np.zeros((500, 1025))
+        for t, p in zip(played, scale):
+            for q in (p, p + 12):
+                b = int(round(440 * 2 ** ((q - 69) / 12) / binhz))
+                flux[int(round(t * fps)), b - 1:b + 2] += 1.0
+        by_time = {round(t, 4): [p, p + 12] for t, p in zip(onsets, scale)}
+        ahead = 2.0 + 1.25 * u
+        ahead[-1] = played[-1]                                            # ...then waits at the top
+        fitted = analysis._fit_runs(flux, fps, binhz, by_time, onsets, ahead)
+        self.assertGreater(np.abs(ahead - played).max(), 0.3)
+        self.assertLess(np.abs(fitted - played).max(), 0.03)
+
     def test_a_held_final_chord_does_not_drag_the_ending_late(self):
         """The recording rings on for seconds after the last attack (a fermata): the last notes must still be
         found at their attacks, not stretched over the ring."""

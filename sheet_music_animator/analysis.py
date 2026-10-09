@@ -411,6 +411,86 @@ SNAP_EARLY = 0.25        # ...and one that lies more than this ahead of the next
 SNAP_TOGETHER = 0.03     # how close to the next note's attack a candidate must be to count as the same moment
 
 
+RUN_MIN = 8              # this many notes or more, written evenly...
+RUN_GAP = 0.15           # ...at most this far apart (s), always going up or always going down, make a run
+RUN_MAX = 48             # (longer even passages keep their rubato: they are not runs)
+RUN_STEP = 5             # semitones a run moves at most from one note to the next (a scale, an arpeggio)
+RUN_SLACK = 0.6          # how far (s) the start and the end of a run may move from the DTW estimate
+RUN_BENDS = np.linspace(-0.75, 0.75, 13)   # accelerando (+) / ritardando (-) through a run
+
+
+def _runs(onsets, by_time) -> list[tuple[int, int]]:
+    """(first, last) onset index of every scale-like run: RUN_MIN to RUN_MAX notes written at one short, even
+    spacing whose lowest pitch keeps going the same way in small steps."""
+    gaps = np.diff(onsets)
+    low = [min(by_time.get(round(t, 4), [0])) for t in onsets]
+    out, i = [], 0
+    def step(k):     # the direction from note k to note k + 1, 0 when it is no run step
+        d = low[k + 1] - low[k]
+        return np.sign(d) if 0 < abs(d) <= RUN_STEP else 0
+
+    while i < len(gaps):
+        j, way = i, step(i)
+        while (j + 1 < len(gaps) and gaps[i] <= RUN_GAP and abs(gaps[j + 1] - gaps[i]) <= 0.05 * gaps[i]
+               and way != 0 and step(j + 1) == way):
+            j += 1
+        if gaps[i] <= RUN_GAP and RUN_MIN <= j - i + 2 <= RUN_MAX and way != 0:
+            out.append((i, j + 1))
+        i = j + 1
+    return out
+
+
+def _fit_runs(flux, fps, binhz, by_time, onsets, est):
+    """Re-time the DTW estimate of every run as one smooth curve.
+
+    In a fast, pedalled run (a scale in octaves) every note shares its pitches with the note an octave further
+    on, so neither the DTW nor the attack of a single note can tell where in the run the recording is; the DTW
+    can run ahead and then wait at the top.  The whole run can: its notes are placed on the curve from a start
+    to an end time, straight or bending (speeding up or slowing down), that best covers the attacks of each
+    note's own fundamentals, searched within RUN_SLACK of the DTW's start and end."""
+    est = np.array(est, float)
+    nb = flux.shape[1]
+    for i, j in _runs(onsets, by_time):
+        lo_t, hi_t = est[i] - RUN_SLACK - 0.1, est[j] + RUN_SLACK + 0.1
+        a, b = max(int(lo_t * fps), 2), min(int(hi_t * fps) + 1, len(flux))
+        if b - a < 10:
+            continue
+        Z = []
+        for k in range(i, j + 1):
+            bins = []
+            for p in by_time.get(round(onsets[k], 4), ()):
+                c = int(round(440.0 * 2 ** ((p - 69) / 12) / binhz))
+                if 1 <= c < nb - 1:
+                    bins += [c - 1, c, c + 1]
+            curve = flux[a:b][:, bins].sum(axis=1) if bins else np.zeros(b - a)
+            z = (curve - curve.mean()) / (curve.std() + 1e-6)
+            Z.append(np.maximum.reduce([z, np.r_[z[1:], z[-1]], np.r_[z[0], z[:-1]]]))   # a frame of slack
+        Z = np.array(Z)
+        u = (onsets[i:j + 1] - onsets[i]) / (onsets[j] - onsets[i])
+        lo_s = est[i - 1] + 0.02 if i > 0 else -np.inf
+        hi_e = est[j + 1] - 0.02 if j + 1 < len(est) else np.inf
+        starts = np.arange(max(est[i] - RUN_SLACK, lo_s), est[i] + RUN_SLACK, 1 / fps)
+        ends = np.arange(est[j] - RUN_SLACK, min(est[j] + RUN_SLACK, hi_e), 1 / fps)
+        best, arg = -np.inf, None
+        rows = np.arange(len(u))[:, None]
+        for bend in RUN_BENDS:
+            shape = u + bend * u * (1 - u)                      # monotone for |bend| < 1
+            for ts in starts:
+                span = ends - ts
+                ok = span > 0.5 * (onsets[j] - onsets[i])       # never squeeze a run to less than half its length
+                if not ok.any():
+                    continue
+                t = ts + shape[:, None] * span[None, ok]        # (notes, end times)
+                f = np.clip(np.round(t * fps).astype(int) - a, 0, b - a - 1)
+                score = Z[rows, f].sum(axis=0)
+                m = int(np.argmax(score))
+                if score[m] > best:
+                    best, arg = score[m], ts + shape * span[ok][m]
+        if arg is not None:
+            est[i:j + 1] = arg
+    return est
+
+
 def _refine(ya, notes, onsets, est):
     """Choose, for every onset, the attack of its own pitches that makes the best monotone sequence.
 
@@ -428,6 +508,7 @@ def _refine(ya, notes, onsets, est):
     by_time: dict[float, list] = {}
     for p, s, *_ in notes:
         by_time.setdefault(round(s, 4), []).append(p)
+    est = _fit_runs(flux, fps, binhz, by_time, onsets, est)
 
     gaps = np.diff(onsets)
     room = np.minimum(np.r_[np.inf, gaps], np.r_[gaps, np.inf])        # distance to the nearest neighbouring onset
