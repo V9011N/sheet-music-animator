@@ -86,7 +86,7 @@ def _band_matrix(n_fft: int, lo: int, hi: int):
 
 
 NORM_FLOOR = 0.25      # frames quieter than this fraction of the typical frame are not scaled up to full size
-PENALTY = 0.12         # extra cost of advancing only one of the two sequences
+PENALTY = 0.03         # extra cost of advancing only one of the two sequences
 START_SLACK = 0.0      # seconds the first note may come after the start of the (trimmed) recording
 START_PENALTY = 0.3    # cost per second of that delay
 OPEN_END = False       # (coarse stage) the whole recording is matched; the fine stage ends openly, inside a corridor

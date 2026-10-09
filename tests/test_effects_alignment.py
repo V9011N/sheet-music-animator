@@ -115,6 +115,19 @@ class TestAlignment(unittest.TestCase):
         self.assertLess(np.median(err), 0.04)
         self.assertLess(err.max(), 0.08)                           # every note, including the one after the pause
 
+    def test_follows_a_long_ritardando_and_a_faster_ending(self):
+        tmp = Path(tempfile.mkdtemp())
+        score = build_score(make_project(tmp))
+
+        def warp(t):                      # a ritardando to half speed, then faster than the score
+            return t if t < 9 else 9 + 2.2 * (t - 9) if t < 19 else 31 + 0.85 * (t - 19)
+        notes = [(p, warp(a), warp(b), v) for p, a, b, v in score.nominal_notes]
+        wav = tmp / "rit.wav"
+        audio.write_wav(wav, audio.synthesize(notes, warp(score.duration)))
+        al = analysis.align_score(score.nominal_notes, str(wav))
+        err = np.abs(al.actual - np.array([warp(x) for x in al.nominal]))
+        self.assertLess(err.max(), 0.1)
+
     def test_a_held_final_chord_does_not_drag_the_ending_late(self):
         """The recording rings on for seconds after the last attack (a fermata): the last notes must still be
         found at their attacks, not stretched over the ring."""
