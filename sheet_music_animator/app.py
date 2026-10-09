@@ -10,8 +10,8 @@ from pathlib import Path
 from PySide6.QtCore import QElapsedTimer, QPointF, QRectF, QSettings, Qt, QTimer, QUrl
 from PySide6.QtGui import QAction, QColor, QFont, QImage, QKeySequence, QPalette
 from PySide6.QtWidgets import (QApplication, QCheckBox, QColorDialog, QComboBox, QDialog, QDoubleSpinBox,
-                               QFileDialog, QFontComboBox, QFormLayout, QGraphicsView, QGroupBox, QHBoxLayout,
-                               QLabel, QMainWindow, QMessageBox, QProgressDialog, QPushButton, QSizePolicy, QSpinBox,
+                               QFileDialog, QFontComboBox, QFormLayout, QFrame, QGraphicsView, QGroupBox, QHBoxLayout,
+                               QLabel, QMainWindow, QMessageBox, QProgressDialog, QPushButton, QScrollArea, QSizePolicy, QSpinBox,
                                QSplitter, QTabWidget, QToolBar, QVBoxLayout, QWidget)
 
 from . import audio
@@ -21,6 +21,7 @@ from .project import CATEGORIES, CHANNEL_LABELS, CHANNELS, FIXED_KINDS, Key, Pro
 from .scene import EditorView, PreviewWidget, SheetScene
 from .layout import relayout_project
 from .timeline import Timeline, fmt
+from .tour import Tour
 
 try:
     from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
@@ -165,6 +166,7 @@ class MainWindow(QMainWindow):
                 self.player.setAudioOutput(self.audio_out)
             except Exception:
                 self.player = None
+        self.tour = None
         self._build_ui()
         self._build_actions()
         self._sync_settings_to_ui()
@@ -197,10 +199,11 @@ class MainWindow(QMainWindow):
         pvl.addWidget(self.preview)
         sl.addWidget(pv, 3)
         self.tabs = QTabWidget()
+        self.tab_selection = self._note_tab()
         self.tabs.addTab(self._camera_tab(), "Camera")
-        self.tabs.addTab(self._look_tab(), "Look & timing")
+        self.tabs.addTab(self._look_tab(), "Look && timing")   # a single & would be eaten as a shortcut marker
         self.tabs.addTab(self._output_tab(), "Output")
-        self.tabs.addTab(self._note_tab(), "Selection")
+        self.tabs.addTab(self.tab_selection, "Selection")
         sl.addWidget(self.tabs, 2)
 
         split = QSplitter(Qt.Horizontal)
@@ -245,6 +248,7 @@ class MainWindow(QMainWindow):
             b = QPushButton(text)
             b.clicked.connect(fn)
             row.addWidget(b)
+        self.btn_follow = b
         f.addRow(row)
         hint = QLabel("Drag the orange window on the sheet to move it, drag a corner to resize it and the round "
                       "handle above it to rotate (Shift snaps to 15°). Keyframes live on three channels "
@@ -383,10 +387,16 @@ class MainWindow(QMainWindow):
         f.addRow(self.lbl_geom)
         f.addRow(self.btn_reset_geom)
         f.addRow(self.grp_measures)
-        return w
+        # the category list is long: scroll it instead of making the window taller than the screen
+        self.sel_scroll = QScrollArea()
+        self.sel_scroll.setWidgetResizable(True)
+        self.sel_scroll.setFrameShape(QFrame.NoFrame)
+        self.sel_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.sel_scroll.setWidget(w)
+        return self.sel_scroll
 
     def _build_actions(self):
-        tb = QToolBar("Main")
+        tb = self.toolbar = QToolBar("Main")
         tb.setMovable(False)
         self.addToolBar(tb)
 
@@ -411,6 +421,7 @@ class MainWindow(QMainWindow):
         self.a_fit = act("Fit sheet", self.editor_fit, "F", "Fit the sheet to the editor (F)")
         self.a_cam = act("Show camera", self.editor_to_camera, "C", "Centre the editor on the camera (C)")
         self.a_render = act("Render…", self.render, "Ctrl+R")
+        self.a_guide = act("? Guide", self.start_tour, None, "Walk through the features with an interactive guide")
         for a in (self.a_open, self.a_openp, self.a_save, self.a_undo, self.a_redo):
             tb.addAction(a)
         tb.addSeparator()
@@ -425,6 +436,7 @@ class MainWindow(QMainWindow):
         spacer = QWidget()
         spacer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         tb.addWidget(spacer)
+        tb.addAction(self.a_guide)
         tb.addAction(self.a_render)
         for key, fn in (("Left", lambda: self.seek(self.t - 0.1)), ("Right", lambda: self.seek(self.t + 0.1)),
                         ("Shift+Left", lambda: self.seek(self.t - 1)), ("Shift+Right", lambda: self.seek(self.t + 1))):
@@ -432,6 +444,20 @@ class MainWindow(QMainWindow):
             a.setShortcut(QKeySequence(key))
             a.triggered.connect(fn)
             self.addAction(a)
+
+    # ================================================================== guide
+    def start_tour(self):
+        if self.tour is None:
+            self.tour = Tour(self)
+        if self.tour.active:
+            return
+        self.tour.chk_again.setChecked(False)
+        self.tour.start()
+
+    def maybe_start_tour(self):
+        """Offer the guide on the first run (until it has been finished or skipped)."""
+        if str(self.cfg.value("tour_done", "false")).lower() != "true":
+            self.start_tour()
 
     def _update_enabled(self):
         has = self.score is not None
@@ -926,7 +952,7 @@ class MainWindow(QMainWindow):
         units, measures = self._sel_units, self._sel_measures
         self._updating = True
         n = len(units) + len(measures)
-        self.tabs.setTabText(3, f"Selection ({n})" if n else "Selection")
+        self.tabs.setTabText(self.tabs.indexOf(self.tab_selection), f"Selection ({n})" if n else "Selection")
         static = [u for u in units if u.static]
         self.chk_timed.setVisible(bool(static))
         movable = [u for u in units if u.kind not in FIXED_KINDS]
@@ -1134,6 +1160,7 @@ def main():
     app.setPalette(dark_palette())
     win = MainWindow()
     win.show()
+    QTimer.singleShot(400, win.maybe_start_tour)
     if len(sys.argv) > 1:
         arg = Path(sys.argv[1])
         if arg.suffix == ".smanim":

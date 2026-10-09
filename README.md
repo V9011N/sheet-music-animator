@@ -17,6 +17,7 @@ python -m venv .venv
 
 | What | How |
 |---|---|
+| Guide | The first time the app opens it offers an interactive guide (skip it with *Skip guide*): it dims the window, spotlights one control at a time and waits for you to try it — open a score (a sample is included), move the camera, play, add and select keyframes, change the look, select measures, hide engravings, change line breaks, move elements, undo, output and save. Replay it any time with **? Guide** in the toolbar. |
 | Load a score | **Open MusicXML…** (`.mxl`, `.musicxml`, `.xml`). You are asked how many **measures go on each line** (or put the **whole score on one line**); this decides the canvas size and the automatic camera. Notes, rests, beams, ties, dynamics, … appear at the time they are heard in the file (tempo included), instantly by default. |
 | Play / pause / scrub | `Space`, click or drag in the timeline, `←/→` (0.1 s), `Shift+←/→` (1 s), `Home`. Ctrl+wheel zooms the timeline, middle-drag pans it. |
 | Camera | Drag the orange window in the editor to move it, drag a corner to resize (aspect ratio is locked to the output size), drag the round handle above it to rotate. Only the channel you change (position, frame size, rotation) gets a keyframe. Switch **Add keyframes automatically** off in the Camera tab to edit the camera at the playhead without creating keys. |

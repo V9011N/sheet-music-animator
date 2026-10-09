@@ -1,7 +1,7 @@
 """Timeline widget: ruler + note density + camera keyframe channels + playhead."""
 from __future__ import annotations
 
-from PySide6.QtCore import QPointF, QRectF, Qt, Signal
+from PySide6.QtCore import QPointF, QRect, QRectF, Qt, Signal
 from PySide6.QtGui import QColor, QFont, QPainter, QPen, QPolygonF
 from PySide6.QtWidgets import QMenu, QWidget
 
@@ -93,6 +93,16 @@ class Timeline(QWidget):
 
     def _lane_y(self, i):
         return RULER_H + NOTES_H + 2 + i * CAM_H
+
+    # -- rectangles of parts of the timeline (the in-app guide highlights them) ---------------------------
+    def ruler_rect(self) -> QRect:
+        return QRect(GUTTER, 0, self.width() - GUTTER, RULER_H + NOTES_H)
+
+    def label_rect(self) -> QRect:
+        return QRect(0, int(self._lane_y(0)), GUTTER, CAM_H)
+
+    def lanes_rect(self) -> QRect:
+        return QRect(GUTTER, int(self._lane_y(0)), self.width() - GUTTER, CAM_H * len(self.visible_channels))
 
     def _lane_at(self, y):
         i = int((y - (RULER_H + NOTES_H + 2)) // CAM_H)
