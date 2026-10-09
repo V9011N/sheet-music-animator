@@ -366,8 +366,9 @@ def build_steps(win) -> list[Step]:
           "and asks you to try it for real.<br><br>You can leave at any time, and bring the guide back with "
           "the <b>? Guide</b> button in the toolbar.", kind="welcome"),
         S("Open a score",
-          "Start with <b>Open MusicXML…</b> (Ctrl+O): pick a .mxl, .musicxml or .xml file. You will be asked how "
-          "many <b>measures go on each line</b> — that sets the size of the canvas.<br><br>No file at hand? "
+          "Start with <b>Open ▸ Open XML…</b> (Ctrl+O): pick a .mxl, .musicxml or .xml file. You will be asked "
+          "how many <b>measures go on each line</b> — that sets the size of the canvas. <b>Open ▸ Open PDF…</b> "
+          "reads the music of an engraved PDF instead (with Audiveris or homr installed).<br><br>No file at hand? "
           "Use the sample score.", target=act(win.a_open), setup=lambda t: scene_ready,
           extra=("Use the sample score", use_sample)),
         S("The sheet",

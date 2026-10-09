@@ -13,11 +13,11 @@ from PySide6.QtGui import QAction, QColor, QFont, QImage, QKeySequence, QPalette
 from PySide6.QtWidgets import (QApplication, QCheckBox, QColorDialog, QComboBox, QDialog, QDoubleSpinBox,
                                QFileDialog, QFontComboBox, QFormLayout, QFrame, QGraphicsView, QGroupBox, QHBoxLayout,
                                QInputDialog,
-                               QLabel, QMainWindow, QMessageBox, QProgressDialog, QPushButton, QScrollArea, QSizePolicy,
-                               QSpinBox,
-                               QSplitter, QTabWidget, QToolBar, QVBoxLayout, QWidget)
+                               QLabel, QMainWindow, QMenu, QMessageBox, QProgressDialog, QPushButton, QScrollArea,
+                               QSizePolicy, QSpinBox,
+                               QSplitter, QTabWidget, QToolBar, QToolButton, QVBoxLayout, QWidget)
 
-from . import analysis, audio
+from . import analysis, audio, pdfimport
 from .engraver import NOTE_KINDS, REST_KINDS
 from .build import build_score
 from .effects_ui import EffectsPanel
@@ -475,7 +475,17 @@ class MainWindow(QMainWindow):
                 a.setToolTip(tip)
             return a
 
-        self.a_open = act("Open MusicXML…", self.open_xml, "Ctrl+O")
+        self.a_open_xml = act("Open XML…", self.open_xml, "Ctrl+O", "Open a MusicXML score (.mxl, .musicxml, .xml)")
+        self.a_open_pdf = act("Open PDF…", self.open_pdf, "Ctrl+Shift+P",
+                              "Read the music of an engraved PDF score (needs Audiveris or homr installed)")
+        self.a_open = QAction("Open", self)
+        self.a_open.setToolTip("Open a score: MusicXML, or a PDF to read the music from")
+        open_menu = QMenu(self)
+        open_menu.addAction(self.a_open_xml)
+        open_menu.addAction(self.a_open_pdf)
+        self.a_open.setMenu(open_menu)
+        self.addAction(self.a_open_xml)          # the shortcuts work with the menu closed
+        self.addAction(self.a_open_pdf)
         self.a_openp = act("Open project…", self.open_project, "Ctrl+Shift+O")
         self.a_save = act("Save project", self.save_project, "Ctrl+S")
         self.a_play = act("▶  Play", self.toggle_play, "Space")
@@ -500,6 +510,7 @@ class MainWindow(QMainWindow):
         self.a_guide = act("? Guide", self.start_tour, None, "Walk through the features with an interactive guide")
         for a in (self.a_open, self.a_openp, self.a_save, self.a_undo, self.a_redo):
             tb.addAction(a)
+        self._open_button().setPopupMode(QToolButton.InstantPopup)
         tb.addSeparator()
         for a in (self.a_home, self.a_play):
             tb.addAction(a)
@@ -608,6 +619,87 @@ class MainWindow(QMainWindow):
             "MusicXML (*.mxl *.musicxml *.xml);;All files (*)")
         if path:
             self.open_xml_path(path)
+
+    def _open_button(self) -> QToolButton:
+        return self.toolbar.widgetForAction(self.a_open)
+
+    def open_pdf(self):
+        if not self._confirm_discard():
+            return
+        path, _ = QFileDialog.getOpenFileName(self, "Open PDF", self.cfg.value("last_dir", ""),
+                                              "PDF score (*.pdf);;All files (*)")
+        if path:
+            self.open_pdf_path(path)
+
+    def _progress(self, title: str, text: str, cancel: bool):
+        dlg = QProgressDialog(text, "Cancel" if cancel else None, 0, 100, self)
+        dlg.setWindowModality(Qt.WindowModal)
+        dlg.setMinimumDuration(0)
+        dlg.setWindowTitle(title)
+
+        def progress(fraction, text=""):
+            dlg.setValue(int(fraction * 100))
+            if text:
+                dlg.setLabelText(text)
+            QApplication.processEvents()
+            return not dlg.wasCanceled()
+        return dlg, progress
+
+    def open_pdf_path(self, path: str) -> bool:
+        """Read the music of a PDF into MusicXML and start a new project from it.  The PDF is checked first:
+        every page must hold engraved music (staves with notes on them)."""
+        name = Path(path).name
+        self.cfg.setValue("last_dir", str(Path(path).parent))
+        dlg, progress = self._progress("Opening a PDF", "Looking for music…", True)
+        try:
+            check = pdfimport.check_pdf(path, progress)
+        except pdfimport.PdfError as e:
+            dlg.close()
+            if str(e) != "Cancelled.":
+                QMessageBox.critical(self, "Not a score this program can read", str(e))
+            return False
+        dlg.close()
+        pages = check.music_pages
+        if check.other_pages:
+            box = QMessageBox(QMessageBox.Warning, "Some pages are not sheet music",
+                              f"{len(check.other_pages)} of the {len(check.pages)} pages of {name} do not look like "
+                              f"engraved music:\n\n{check.report()}\n\nRead the music from the other "
+                              f"{len(pages)} page{'s' if len(pages) > 1 else ''} only?", parent=self)
+            read = box.addButton(f"Read {len(pages)} page{'s' if len(pages) > 1 else ''}", QMessageBox.AcceptRole)
+            box.addButton(QMessageBox.Cancel)
+            box.exec()
+            if box.clickedButton() is not read:
+                return False
+        engines = pdfimport.engines()
+        if not engines:
+            QMessageBox.information(self, "No music reader installed", pdfimport.NO_ENGINE)
+            return False
+        try:
+            out = pdfimport.output_path(path)
+        except pdfimport.OmrError as e:
+            QMessageBox.critical(self, "Could not read the music", str(e))
+            return False
+        dlg, progress = self._progress("Reading the music", f"Starting {engines[0]}…", True)
+        try:
+            pdfimport.recognize(path, pages, out, progress, engines[0])
+        except pdfimport.OmrError as e:
+            dlg.close()
+            if str(e) != "Cancelled.":
+                QMessageBox.critical(self, "Could not read the music", str(e))
+            return False
+        except Exception as e:      # an engine's output this program does not understand
+            dlg.close()
+            QMessageBox.critical(self, "Could not read the music", f"{engines[0]} gave a result that could not be "
+                                 f"used ({e}).")
+            return False
+        dlg.close()
+        if not self.open_xml_path(str(out)):
+            return False
+        parts, measures, notes = pdfimport.score_stats(pdfimport.read_musicxml(out))
+        self.status.showMessage(f"Read {measures} measures ({notes} notes) from {name} with {engines[0]}, saved as "
+                                f"{out.name}. Recognition makes mistakes: correct that file in a notation program "
+                                f"if notes are wrong.", 20000)
+        return True
 
     def open_xml_path(self, path: str) -> bool:
         """Start a new project from a MusicXML file, asking how many measures go on a line."""
@@ -1630,6 +1722,8 @@ def main():
             win.project_path = str(arg)
             win._sync_settings_to_ui()
             win.load_score()
+        elif arg.suffix.lower() == ".pdf":
+            win.open_pdf_path(str(arg))
         else:
             win.open_xml_path(str(arg))
     sys.exit(app.exec())
