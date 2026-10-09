@@ -26,6 +26,8 @@ LINK_PITCH = 2          # ...with a notehead written within this many semitones 
 LOW, HIGH = 21, 108     # the piano
 SNAP_PX = 8             # a dragged note snaps to an attack or another note this close (pixels)
 NUDGE = 0.01            # Ctrl+Left/Right moves the selection by this much (s)
+MIN_LEN = 0.02          # the shortest a note can be made (s)
+EDGE_PX = 5             # pressing this close to the end of a selected note scales instead of moving
 
 
 # ================================================================================================ the data
@@ -50,10 +52,11 @@ def link_notes(score) -> list[tuple[int | None, int]]:
 
 
 def edited_notes(project, score, links) -> list[tuple]:
-    """The notes of the score where they are played now: each moved by the nudge of its element."""
-    ov = project.overrides
-    return [(p, s + ov.get(uid, 0.0), e + ov.get(uid, 0.0), *rest)
-            for (p, s, e, *rest), (uid, _) in zip(score.notes, links)]
+    """The notes of the score where they are played now: each moved by the nudge of its element, and made longer
+    or shorter by its length change."""
+    ov, ends = project.overrides, project.ends
+    return [(p, s + ov.get(uid, 0.0), max(e + ov.get(uid, 0.0) + ends.get(uid, 0.0), s + ov.get(uid, 0.0) + MIN_LEN),
+             *rest) for (p, s, e, *rest), (uid, _) in zip(score.notes, links)]
 
 
 def move_units(project, uids, dt: float) -> None:
@@ -115,8 +118,12 @@ class RollModel:
     def refresh(self):
         """Take the project's nudges again (after an edit anywhere)."""
         ov = self.project.overrides if self.project is not None else {}
-        shift = np.array([ov.get(int(u), 0.0) if u >= 0 else 0.0 for u in self.uid]) if len(self.uid) else np.zeros(0)
-        self.start, self.end = self.base_s + shift, self.base_e + shift
+        ends = self.project.ends if self.project is not None else {}
+        n = len(self.uid)
+        shift = np.array([ov.get(int(u), 0.0) if u >= 0 else 0.0 for u in self.uid]) if n else np.zeros(0)
+        longer = np.array([ends.get(int(u), 0.0) if u >= 0 else 0.0 for u in self.uid]) if n else np.zeros(0)
+        self.start = self.base_s + shift
+        self.end = np.maximum(self.base_e + shift + longer, self.start + MIN_LEN)
         self.order = np.argsort(self.start, kind="stable")
         self.sorted_start = self.start[self.order]
         self.max_len = float((self.end - self.start).max()) if len(self.start) else 0.0
@@ -131,6 +138,64 @@ class RollModel:
     def group_of(self, i: int) -> np.ndarray:
         u = int(self.uid[i])
         return self.groups.get(u, np.array([i])) if u >= 0 else np.array([i])
+
+    # ---- edits: every one is a start nudge and a length change per element, so the animation can follow ----------
+    def _set(self, uid: int, start: float, end: float):
+        """Play element `uid` from `start` to `end` (its first note from start, its longest note to end)."""
+        idx = self.groups[uid]
+        base_s, base_e = float(self.base_s[idx].min()), float(self.base_e[idx].max())
+        shift = start - base_s
+        longer = max(end, start + MIN_LEN) - base_e - shift
+        for d, v in ((self.project.overrides, shift), (self.project.ends, longer)):
+            if abs(v) < 1e-4:
+                d.pop(uid, None)
+            else:
+                d[uid] = v
+
+    def span(self, uid: int) -> tuple[float, float]:
+        """Where element `uid` sounds now: its first start, its last end."""
+        idx = self.groups[uid]
+        return float(self.start[idx].min()), float(self.end[idx].max())
+
+    def scale(self, uids, anchor: float, k: float):
+        """Stretch the elements `uids` in time by `k` about `anchor` (their starts and ends alike): one chord's
+        length about its start or its end, or a whole section about its first start or its last end."""
+        for uid in uids:
+            s, e = self.span(uid)
+            self._set(uid, anchor + (s - anchor) * k, anchor + (e - anchor) * k)
+        self.refresh()
+
+    def quantize(self, uids, gap: float, even: bool = True):
+        """Space the elements `uids` out over the time they take now: the moments written together stay together,
+        and either every moment gets the same time (`even`) or their written proportions are kept.  Every note is
+        then shortened by `gap` (a fraction) of the time to where it ends, which leaves that much silence between
+        notes that follow each other."""
+        uids = [u for u in uids if u in self.groups]
+        if not uids:
+            return
+        nominal = getattr(self.score, "nominal_notes", None) or self.score.notes
+        ns = {u: min(nominal[i][1] for i in self.groups[u]) for u in uids}
+        ne = {u: max(nominal[i][2] for i in self.groups[u]) for u in uids}
+        moments = sorted({round(v, 3) for v in ns.values()})
+        a = min(self.span(u)[0] for u in uids)
+        b = max(self.span(u)[1] for u in uids)
+        if even:
+            slot = (b - a) / len(moments)
+            at = {m: a + k * slot for k, m in enumerate(moments)}
+        else:
+            w0, w1 = moments[0], max(ne.values())
+            at = {m: a + (m - w0) / max(w1 - w0, 1e-9) * (b - a) for m in moments}
+
+        def place(written_end):
+            if not even:
+                return a + (written_end - moments[0]) / max(max(ne.values()) - moments[0], 1e-9) * (b - a)
+            j = bisect.bisect_left(moments, round(written_end, 3) - 1e-6)
+            return at[moments[j]] if j < len(moments) else b
+        for u in uids:
+            s = at[round(ns[u], 3)]
+            e = min(place(ne[u]), b)
+            self._set(u, s, s + max(e - s, MIN_LEN) * (1 - gap))
+        self.refresh()
 
 
 # ================================================================================================ the widgets
@@ -296,6 +361,8 @@ class _Roll(QWidget):
         self._snap_at = None      # time of the attack or note snapped to, while dragging
         self._pan = None
         self._cache = None        # the notes drawn for the current view
+        self._scaling = None      # while an end of the selection is dragged: {side, i, anchor, grabbed, x}
+        self._scale = None        # (anchor, factor) of the stretch being dragged
 
     # ---- drawing ------------------------------------------------------------------------------------------------
     def invalidate(self):
@@ -330,6 +397,9 @@ class _Roll(QWidget):
     def _rect(self, i, dt) -> QRectF:
         m, v = self.ed.model, self.ed.view
         s, e = m.start[i] + dt, m.end[i] + dt
+        if self._scale is not None and i in self.ed.selected:          # being stretched
+            a, k = self._scale
+            s, e = a + (s - a) * k, a + (e - a) * k
         return QRectF(v.x(s), v.y(m.pitch[i] + 0.5) + 1, max((e - s) * v.pps, 3.0), max(v.rh - 2, 2.0))
 
     def _draw_notes(self) -> QPixmap:
@@ -355,7 +425,8 @@ class _Roll(QWidget):
                 if t0 <= t <= t1:
                     p.drawLine(QPointF(v.x(t), 0), QPointF(v.x(t), h))
         if m is not None:
-            idx = m.visible(t0 - abs(self._drag_dt), t1 + abs(self._drag_dt))
+            reach = abs(self._drag_dt) + (abs(self._scale[1] - 1) * (t1 - t0 + 60) if self._scale else 0.0)
+            idx = m.visible(t0 - reach, t1 + reach)
             idx = idx[(m.pitch[idx] >= lo - 1) & (m.pitch[idx] <= hi + 1)]
             outline = v.rh >= 6
             for i in idx:
@@ -389,6 +460,23 @@ class _Roll(QWidget):
         p_hi, p_lo = v.pitch(r.top()) + 0.5, v.pitch(r.bottom()) - 0.5
         return idx[(m.pitch[idx] <= p_hi) & (m.pitch[idx] >= p_lo)]
 
+    def edge_at(self, pos) -> tuple[int, str] | None:
+        """(note, "left" or "right") when `pos` is on an end of a selected note: there it is stretched."""
+        ed = self.ed
+        if ed.model is None or not ed.selected_units():
+            return None
+        pitch = int(round(ed.view.pitch(pos.y())))
+        best = None
+        for i in ed.selected:
+            if ed.model.pitch[i] != pitch or ed.model.uid[i] < 0:
+                continue
+            r = self._rect(i, 0.0)
+            for side, x in (("left", r.left()), ("right", r.right())):
+                d = abs(pos.x() - x)
+                if d <= EDGE_PX and (best is None or d < best[0]):
+                    best = (d, i, side)
+        return (best[1], best[2]) if best else None
+
     # ---- mouse --------------------------------------------------------------------------------------------------
     def mousePressEvent(self, e):
         self.setFocus()
@@ -398,8 +486,17 @@ class _Roll(QWidget):
             return
         if e.button() != Qt.LeftButton or self.ed.model is None:
             return
-        i = self.note_at(pos)
         ed = self.ed
+        edge = self.edge_at(pos) if not mods & (Qt.ControlModifier | Qt.ShiftModifier) else None
+        if edge is not None:                                        # stretch the selection from that side
+            i, side = edge
+            spans = [ed.model.span(u) for u in ed.selected_units()]
+            a, b = min(sp[0] for sp in spans), max(sp[1] for sp in spans)
+            grabbed = float(ed.model.end[i] if side == "right" else ed.model.start[i])
+            self._scaling = {"side": side, "i": i, "anchor": a if side == "right" else b, "grabbed": grabbed,
+                             "x": pos.x()}
+            return
+        i = self.note_at(pos)
         if i is None:
             if not mods & (Qt.ControlModifier | Qt.ShiftModifier):
                 ed.set_selection(set())
@@ -437,7 +534,21 @@ class _Roll(QWidget):
             v.top = top + (pos.y() - start.y()) / v.rh
             ed.view_changed()
             return
+        if self._scaling is not None:
+            op = self._scaling
+            want = op["grabbed"] + (pos.x() - op["x"]) / v.pps
+            self._snap_at = None
+            if ed.snap and not (e.modifiers() & Qt.AltModifier):
+                want, self._snap_at = ed.snap_time(want)
+            span = op["grabbed"] - op["anchor"]
+            if abs(span) > 1e-6:
+                k = (want - op["anchor"]) / span
+                self._scale = (op["anchor"], max(k, 0.05))
+                ed.dragging(0.0)
+            return
         if self._press is None:
+            edge = self.edge_at(pos)
+            self.setCursor(Qt.SizeHorCursor if edge else Qt.ArrowCursor)
             i = self.note_at(pos)
             self.setToolTip(self._tip(i) if i is not None else "")
             return
@@ -461,6 +572,12 @@ class _Roll(QWidget):
     def mouseReleaseEvent(self, e):
         if e.button() == Qt.MiddleButton:
             self._pan = None
+            return
+        if self._scaling is not None:
+            scale, self._scaling, self._scale, self._snap_at = self._scale, None, None, None
+            if scale is not None and abs(scale[1] - 1) > 1e-6:
+                self.ed.scale_selection(*scale)
+            self.ed.dragging(0.0)
             return
         if self._press is None:
             return
@@ -548,6 +665,14 @@ class MidiEditor(QWidget):
                                  "(hold Alt to drag freely)")
         self.chk_snap.toggled.connect(lambda on: setattr(self, "snap", on))
         tools.addWidget(self.chk_snap)
+        self.quant_gap, self.quant_even = 10, True     # the last choices in the Quantize dialog
+        self.btn_quant = QPushButton("Quantize…")
+        self.btn_quant.setToolTip("Space the selected notes out evenly (or in their written rhythm) over the time "
+                                  "they take now, with a gap between notes")
+        self.btn_quant.setFocusPolicy(Qt.NoFocus)
+        self.btn_quant.setEnabled(False)
+        self.btn_quant.clicked.connect(self.quantize_selection)
+        tools.addWidget(self.btn_quant)
         for text, tip, fn in (("−", "Zoom out in time (Ctrl+wheel)", lambda: self.zoom_time(1 / 1.5)),
                               ("+", "Zoom in in time (Ctrl+wheel)", lambda: self.zoom_time(1.5)),
                               ("↕−", "Smaller rows (Alt+wheel)", lambda: self.zoom_pitch(1 / 1.3)),
@@ -706,6 +831,7 @@ class MidiEditor(QWidget):
     def set_selection(self, chosen: set):
         self.selected = set(chosen)
         self._update_label()
+        self.btn_quant.setEnabled(len(self.selected_units()) >= 2)
         self.roll.invalidate()
 
     def _update_label(self):
@@ -715,13 +841,15 @@ class MidiEditor(QWidget):
         n = len(self.selected)
         chords = len({int(self.model.uid[i]) for i in self.selected if self.model.uid[i] >= 0})
         if n:
+            ends = ("drag an end of a note to make the chord longer or shorter" if chords == 1 else
+                    "drag an end of a note to stretch the section from that side")
             self.lbl.setText(f"{n} note{'s' if n > 1 else ''} selected ({chords} chord{'s' if chords != 1 else ''}"
-                             f" / note{'s' if chords != 1 else ''} of the score). Drag left or right to retime "
-                             f"them; Ctrl+←/→ nudges by 10 ms.")
+                             f" / note{'s' if chords != 1 else ''} of the score). Drag to move them, {ends}; "
+                             f"Ctrl+←/→ nudges by 10 ms.")
         else:
             self.lbl.setText(f"{len(self.model.pitch)} notes. Click, Ctrl+click, Shift+click or drag a rectangle to "
-                             f"select; a note moves with its chord. Ctrl+wheel / Alt+wheel zoom, Shift+wheel and "
-                             f"middle-drag pan.")
+                             f"select; a note moves with its chord; drag an end to stretch. Ctrl+wheel / Alt+wheel zoom, "
+                             f"Shift+wheel and middle-drag pan.")
 
     def selected_units(self) -> list[int]:
         m = self.model
@@ -730,16 +858,73 @@ class MidiEditor(QWidget):
     def snapped(self, grabbed: int, dt: float) -> tuple[float, float | None]:
         """`dt` moved so the grabbed note lands on an attack of the recording or on another note's start, when
         one is within SNAP_PX; and where it snapped (or None)."""
+        start = float(self.model.start[grabbed])
+        t, at = self.snap_time(start + dt)
+        return t - start, at
+
+    def snap_time(self, t: float) -> tuple[float, float | None]:
+        """`t`, or the attack of the recording or start of an unselected note within SNAP_PX of it, and where it
+        snapped (or None)."""
         m = self.model
-        want = m.start[grabbed] + dt
         reach = SNAP_PX / self.view.pps
-        others = m.start[[i for i in m.visible(want - reach, want + reach) if i not in self.selected]]
-        cands = np.concatenate([self.attack_times[np.abs(self.attack_times - want) <= reach], others])
-        cands = cands[np.abs(cands - want) <= reach]
+        others = m.start[[i for i in m.visible(t - reach, t + reach) if i not in self.selected]]
+        cands = np.concatenate([self.attack_times[np.abs(self.attack_times - t) <= reach], others])
+        cands = cands[np.abs(cands - t) <= reach]
         if not len(cands):
-            return dt, None
-        best = float(cands[np.argmin(np.abs(cands - want))])
-        return best - m.start[grabbed], best
+            return t, None
+        best = float(cands[np.argmin(np.abs(cands - t))])
+        return best, best
+
+    def scale_selection(self, anchor: float, k: float):
+        """Stretch the selected chords by `k` about `anchor`."""
+        uids = self.selected_units()
+        if not uids:
+            return
+        self.model.scale(uids, anchor, k)
+        self.roll.invalidate()
+        self.edited.emit()
+
+    def ask_quantize(self):
+        """(gap as a fraction, evenly?) from the user, or None."""
+        from PySide6.QtWidgets import QComboBox, QDialog, QDialogButtonBox, QFormLayout, QSpinBox
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Quantize")
+        f = QFormLayout(dlg)
+        units = self.selected_units()
+        info = QLabel(f"{len(units)} chords / notes are spaced out over the time they take now.")
+        info.setWordWrap(True)
+        f.addRow(info)
+        spacing = QComboBox()
+        spacing.addItems(["Evenly", "In their written rhythm"])
+        spacing.setCurrentIndex(0 if self.quant_even else 1)
+        spacing.setToolTip("Evenly: every moment gets the same time. Written rhythm: a quarter note gets twice "
+                           "the time of an eighth.")
+        f.addRow("Spacing", spacing)
+        gap = QSpinBox()
+        gap.setRange(0, 90)
+        gap.setSuffix(" %")
+        gap.setValue(self.quant_gap)
+        gap.setToolTip("Silence between one note and the next, as a share of the time from one to the next")
+        f.addRow("Gap between notes", gap)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        f.addRow(buttons)
+        if dlg.exec() != QDialog.Accepted:
+            return None
+        self.quant_gap, self.quant_even = gap.value(), spacing.currentIndex() == 0
+        return self.quant_gap / 100.0, self.quant_even
+
+    def quantize_selection(self):
+        uids = self.selected_units()
+        if len(uids) < 2:
+            return
+        choice = self.ask_quantize()
+        if choice is None:
+            return
+        self.model.quantize(uids, *choice)
+        self.roll.invalidate()
+        self.edited.emit()
 
     def dragging(self, dt: float):
         self.roll.invalidate()

@@ -66,6 +66,89 @@ class TestNotes(unittest.TestCase):
         m.refresh()
         self.assertAlmostEqual(m.start[3], self.score.notes[3][1] - 0.1)
 
+    def model(self):
+        p = make_project(Path(tempfile.mkdtemp()))
+        return p, RollModel(p, self.score)
+
+    def moments(self, m, n):
+        """The first `n` elements in time order, as (uid, its notes)."""
+        uids = sorted(m.groups, key=lambda u: m.span(u)[0])
+        return uids[:n]
+
+    def test_one_chord_made_longer_from_its_end_or_its_start(self):
+        p, m = self.model()
+        u = self.moments(m, 3)[1]
+        s, e = m.span(u)
+        m.scale([u], s, 2.0)                                     # the right end: the start stays
+        self.assertAlmostEqual(m.span(u)[0], s)
+        self.assertAlmostEqual(m.span(u)[1], s + 2 * (e - s))
+        self.assertNotIn(u, p.overrides)
+        notes = edited_notes(p, self.score, m.links)
+        i = int(m.groups[u][0])
+        self.assertAlmostEqual(notes[i][2] - notes[i][1], 2 * (self.score.notes[i][2] - self.score.notes[i][1]))
+        m.scale([u], m.span(u)[1], 0.5)                          # the left end: the end stays, the start moves
+        s2, e2 = m.span(u)
+        self.assertAlmostEqual(e2, s + 2 * (e - s))
+        self.assertAlmostEqual(s2, e2 - (e - s))
+        unit = next(x for x in self.score.units if x.uid == u)
+        self.assertAlmostEqual(p.start_of(unit) - unit.time - p.settings.offset, s2 - s)   # the animation follows
+
+    def test_a_section_stretched_proportionally_from_either_side(self):
+        p, m = self.model()
+        uids = self.moments(m, 6)
+        before = {u: m.span(u) for u in uids}
+        a, b = min(v[0] for v in before.values()), max(v[1] for v in before.values())
+        m.scale(uids, a, 1.5)                                    # from the right: the first start stays
+        for u in uids:
+            self.assertAlmostEqual(m.span(u)[0], a + (before[u][0] - a) * 1.5)
+            self.assertAlmostEqual(m.span(u)[1], a + (before[u][1] - a) * 1.5)
+        m.scale(uids, a + (b - a) * 1.5, 1 / 1.5)               # from the left, back: the last end stays
+        for u in uids:
+            self.assertAlmostEqual(m.span(u)[0], before[u][0] + (b - a) * 0.5, places=6)
+
+    def test_quantize_evenly_with_a_gap(self):
+        p, m = self.model()
+        uids = self.moments(m, 9)
+        p.overrides.update({u: 0.03 * ((k * 7) % 5 - 2) for k, u in enumerate(uids)})     # played unevenly
+        m.refresh()
+        a = min(m.span(u)[0] for u in uids)
+        b = max(m.span(u)[1] for u in uids)
+        m.quantize(uids, 0.2, even=True)
+        starts = sorted({round(m.span(u)[0], 6) for u in uids})
+        steps = np.diff(starts)
+        self.assertTrue(np.allclose(steps, steps[0]))           # every moment the same time
+        self.assertAlmostEqual(starts[0], a, places=6)
+        slot = (b - a) / len(starts)
+        self.assertAlmostEqual(steps[0], slot, places=6)
+        written = {u: min(self.score.nominal_notes[i][1] for i in m.groups[u]) for u in uids}
+        together = [u for u in uids if abs(written[u] - written[uids[0]]) < 1e-3]
+        self.assertEqual(len({round(m.span(u)[0], 6) for u in together}), 1)   # written together: still together
+        short = [u for u in uids if (lambda s, e: e - s < slot * 1.01)(*m.span(u))]
+        for u in short:                                          # a note one moment long leaves 20 % silence
+            s, e = m.span(u)
+            self.assertAlmostEqual(e - s, slot * 0.8, places=6)
+
+    def test_quantize_in_the_written_rhythm(self):
+        p, m = self.model()
+        uids = self.moments(m, 9)
+        m.quantize(uids, 0.0, even=False)
+        written = {u: min(self.score.nominal_notes[i][1] for i in m.groups[u]) for u in uids}
+        w = sorted(written.values())
+        s = {u: m.span(u)[0] for u in uids}
+        ratio = (s[uids[-1]] - s[uids[0]]) / (written[uids[-1]] - written[uids[0]])
+        for u in uids:
+            self.assertAlmostEqual(s[u] - s[uids[0]], (written[u] - w[0]) * ratio, places=6)
+
+    def test_lengths_are_saved_with_the_project(self):
+        from sheet_music_animator.project import Project
+        p, m = self.model()
+        u = self.moments(m, 2)[0]
+        m.scale([u], m.span(u)[0], 1.7)
+        q = Project()
+        q.load_dict(p.to_dict())
+        self.assertEqual(q.ends, p.ends)
+        self.assertIn(u, q.ends)
+
     def test_a_midi_file_of_the_edited_notes(self):
         p = make_project(Path(tempfile.mkdtemp()))
         move_units(p, [self.links[5][0]], 0.3)
@@ -123,6 +206,7 @@ class TestEditor(unittest.TestCase):
 
     def setUp(self):
         self.win.project.overrides.clear()
+        self.win.project.ends.clear()
         self.win.commit()
         self.ed.set_selection(set())
         self.ed.snap = False
@@ -215,6 +299,64 @@ class TestEditor(unittest.TestCase):
             time.sleep(0.02)
         self.assertNotEqual(win.wav_path, before)
         self.assertTrue(Path(win.wav_path).exists())
+
+    def test_dragging_the_end_of_one_chord_changes_its_length(self):
+        m, roll = self.ed.model, self.ed.roll
+        i = int(m.order[14])
+        u = int(m.uid[i])
+        self.ed.set_selection(set(int(k) for k in m.group_of(i)))
+        s, e = m.span(u)
+        r = roll._rect(i, 0.0)
+        grab = QPointF(r.right() - 1, r.center().y())
+        self.assertEqual(roll.edge_at(grab), (i, "right"))
+        dx = 0.25 * self.ed.view.pps
+        press(roll, QEvent.MouseButtonPress, grab)
+        press(roll, QEvent.MouseMove, QPointF(grab.x() + dx, grab.y()))
+        press(roll, QEvent.MouseButtonRelease, QPointF(grab.x() + dx, grab.y()))
+        self.assertAlmostEqual(m.span(u)[0], s, places=6)
+        self.assertAlmostEqual(m.span(u)[1], m.end[i], places=6)
+        self.assertAlmostEqual(m.end[i] - (self.win.score.notes[i][2]), 0.25, delta=0.01)
+        self.win.undo()
+        self.assertAlmostEqual(m.span(u)[1], e, places=6)
+
+    def test_dragging_the_start_of_a_section_stretches_it(self):
+        m, roll = self.ed.model, self.ed.roll
+        first = [int(k) for k in m.order[:12]]
+        chosen = set()
+        for k in first:
+            chosen |= set(int(g) for g in m.group_of(k))
+        self.ed.set_selection(chosen)
+        uids = self.ed.selected_units()
+        before = {u: m.span(u) for u in uids}
+        b = max(v[1] for v in before.values())
+        i = min(chosen, key=lambda k: m.start[k])
+        r = roll._rect(i, 0.0)
+        grab = QPointF(r.left() + 1, r.center().y())
+        self.assertEqual(roll.edge_at(grab)[1], "left")
+        dx = -0.5 * self.ed.view.pps
+        press(roll, QEvent.MouseButtonPress, grab)
+        press(roll, QEvent.MouseMove, QPointF(grab.x() + dx, grab.y()))
+        press(roll, QEvent.MouseButtonRelease, QPointF(grab.x() + dx, grab.y()))
+        k = (b - (m.start[i])) / (b - before[int(m.uid[i])][0])
+        self.assertGreater(k, 1.0)
+        for u in uids:                                            # all about the section's last end
+            self.assertAlmostEqual(m.span(u)[0], b - (b - before[u][0]) * k, places=4)
+            self.assertAlmostEqual(m.span(u)[1], b - (b - before[u][1]) * k, places=4)
+
+    def test_the_quantize_button(self):
+        m = self.ed.model
+        self.ed.set_selection({int(m.order[0])})
+        self.assertFalse(self.ed.btn_quant.isEnabled())           # one chord: nothing to space out
+        chosen = set()
+        for k in m.order[:10]:
+            chosen |= set(int(g) for g in m.group_of(int(k)))
+        self.ed.set_selection(chosen)
+        self.assertTrue(self.ed.btn_quant.isEnabled())
+        with mock.patch.object(self.ed, "ask_quantize", return_value=(0.25, True)):
+            self.ed.btn_quant.click()
+        starts = sorted({round(m.span(u)[0], 6) for u in self.ed.selected_units()})
+        self.assertTrue(np.allclose(np.diff(starts), np.diff(starts)[0]))
+        self.assertTrue(self.win.history.can_undo())
 
     def test_notes_cannot_be_added_or_deleted(self):
         n = len(self.ed.model.pitch)
