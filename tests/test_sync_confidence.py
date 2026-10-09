@@ -59,6 +59,17 @@ class TestConfidence(unittest.TestCase):
         self.assertLess(inside.mean(), outside.mean() - 0.2)
         self.assertLess(al.overall, 0.9)
 
+    def test_very_high_notes_do_not_break_the_judging(self):
+        # the harmonics of these notes lie above the range the attack check looks at (this once crashed with
+        # "index ... is out of bounds")
+        rng = np.random.default_rng(5)
+        notes = [(int(rng.integers(86, 102)), 0.5 * i, 0.5 * i + 0.4, 90) for i in range(24)]
+        wav = self.tmp / "high.wav"
+        audio.write_wav(wav, audio.synthesize(notes, 13.0))
+        al = analysis.align_score(notes, str(wav))
+        self.assertEqual(len(al.confidence), len(al.nominal))
+        self.assertTrue(np.isfinite(al.confidence).all())
+
     def test_overall_penalises_lost_notes(self):
         good = np.full(40, 0.96)
         lost = good.copy()

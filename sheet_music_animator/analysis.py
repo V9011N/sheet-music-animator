@@ -297,12 +297,12 @@ def align_score(notes, audio_path: str, progress=None, refine: bool = True) -> A
 
 
 # ------------------------------------------------------------------------------------ confidence
-ATTACK_FULL = 3.0        # attack specificity (onset energy in the note's bins vs the average bin) that counts as unmistakable
-MATCH_FULL = 0.16        # how far the fit's similarity must stand above that of unrelated moments to be fully convincing
+ATTACK_FLOOR, ATTACK_FULL = 1.5, 2.6        # attack specificity (onset energy in the note's bins vs the average bin) that counts as unmistakable
+MATCH_FULL = 0.13        # how far the fit's similarity must stand above that of unrelated moments to be fully convincing
 MATCH_DECOYS = (-4.0, -2.5, -1.2, 1.2, 2.5, 4.0)   # seconds the recording is shifted by for the comparison
 SIM_WINDOW = 0.15        # seconds after the onset over which the match is averaged
-STEADY_FREE = 0.7        # a note's tempo may differ from its neighbours' by e^0.7 = 2x at no cost
-STEADY_SPAN = 0.9
+STEADY_FREE = 0.9        # a note's tempo may differ from its neighbours' by e^0.9 = 2.5x at no cost
+STEADY_SPAN = 1.0
 SNAP_FREE = 0.10         # snapping an onset by less than this (s) says nothing against it
 SNAP_SPAN = 0.30
 CONF_WEIGHTS = {"attack": 0.40, "match": 0.35, "steady": 0.15, "snap": 0.10}
@@ -341,7 +341,7 @@ def onset_confidence(Xf, Yf, wf, onsets, est, shifts, strength, ff):
             match[k] = float(np.mean((sim - base)[i:i + w][m]))
             sim_raw[k] = float(np.mean(sim[i:i + w][m]))
     match_c = np.clip(match / MATCH_FULL, 0, 1)
-    attack_c = np.clip((strength - 1.0) / (ATTACK_FULL - 1.0), 0, 1)
+    attack_c = np.clip((strength - ATTACK_FLOOR) / (ATTACK_FULL - ATTACK_FLOOR), 0, 1)
 
     steady_c = np.ones(n)
     if n > 2:
@@ -456,6 +456,7 @@ def _refine(ya, notes, onsets, est):
     for k, (t, bins) in enumerate(zip(final, own_bins)):
         f = int(round(t * fps))
         seg = flux[max(f - 2, 0):f + 3, :top]
-        if bins and len(seg):
-            spec[k] = float(seg[:, bins].mean() / (seg.mean() + 1e-6))
+        own = [b for b in bins if b < top]      # harmonics above the compared range do not count
+        if own and len(seg):
+            spec[k] = float(seg[:, own].mean() / (seg.mean() + 1e-6))
     return final, spec
