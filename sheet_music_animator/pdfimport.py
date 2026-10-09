@@ -430,7 +430,94 @@ def tidy(root) -> int:
             d.remove(dt)
             if d.find("direction-type") is None:
                 d.getparent().remove(d)
-    return len(gone)
+    return len(gone) + place_clefs(root)
+
+
+STEPS = "CDEFGAB"
+CLEF_BOTTOM = {("G", "2"): 4 * 7 + 2, ("F", "4"): 2 * 7 + 4, ("C", "3"): 3 * 7 + 3, ("C", "4"): 2 * 7 + 5,
+               ("C", "1"): 3 * 7 + 0, ("G", "1"): 4 * 7 + 4, ("F", "3"): 2 * 7 + 6}   # the bottom line, in steps
+
+
+def _outside(clef, step: str, octave: int) -> int:
+    """How many steps a note lies above or below the five lines of a staff with this clef."""
+    bottom = CLEF_BOTTOM.get(clef)
+    if bottom is None:
+        return 0
+    d = octave * 7 + STEPS.index(step)
+    return max(bottom - d, 0) + max(d - (bottom + 8), 0)
+
+
+AFTER_CLEF = ("staff-details", "transpose", "for-part", "directive", "measure-style")
+
+
+def place_clefs(root) -> int:
+    """Put clef changes back where they belong.  Audiveris writes a clef change inside a measure next to the
+    clef the measure starts with, so the change seems to happen before the first note (and the staff shows the
+    first clef until a later measure: the music below or above it on ledger lines).  The change goes where it
+    leaves the fewest notes outside the staff, after at least one note or rest (no score prints a clef that is
+    cancelled before anything is written under it).  Returns how many clefs were moved."""
+    moved = 0
+    for part in root.findall("part"):
+        measures = part.findall("measure")
+        for k, m in enumerate(measures):
+            first = m.find("attributes")
+            if first is None:
+                continue
+            clefs = first.findall("clef")
+            staves = [c.get("number", "1") for c in clefs]
+            later = [c for i, c in enumerate(clefs) if c.get("number", "1") in staves[:i]]
+            if not later:
+                continue
+            # the notes of the measure: (position, staff, element, step, octave)
+            events, pos, last = [], 0, 0
+            for e in m:
+                if e.tag == "backup":
+                    pos -= int(e.findtext("duration") or 0)
+                elif e.tag == "forward":
+                    pos += int(e.findtext("duration") or 0)
+                elif e.tag == "note":
+                    at = last if e.find("chord") is not None else pos
+                    p = e.find("pitch")
+                    events.append((at, e.findtext("staff") or "1", e,
+                                   p.findtext("step") if p is not None else None,
+                                   int(p.findtext("octave")) if p is not None else None))
+                    if e.find("chord") is None and e.find("grace") is None:
+                        last, pos = pos, pos + int(e.findtext("duration") or 0)
+            for clef in later:
+                staff = clef.get("number", "1")
+                before = next(c for c in clefs if c.get("number", "1") == staff and c is not clef)
+                key = lambda c: (c.findtext("sign"), c.findtext("line"))        # noqa: E731
+                mine = sorted((ev for ev in events if ev[1] == staff), key=lambda ev: ev[0])
+                times = sorted({ev[0] for ev in mine})
+                first.remove(clef)
+                moved += 1
+                if len(times) < 2:                      # nothing to go after: it takes effect in the next measure
+                    nxt = measures[k + 1] if k + 1 < len(measures) else None
+                    if nxt is not None:
+                        a = nxt.find("attributes")
+                        if a is None:
+                            a = etree.Element("attributes")
+                            nxt.insert(0, a)
+                        if not any(c.get("number", "1") == staff for c in a.findall("clef")):
+                            after = [e for e in a if e.tag in AFTER_CLEF]    # MusicXML orders the attributes
+                            if after:
+                                after[0].addprevious(clef)
+                            else:
+                                a.append(clef)
+                    clefs = [c for c in clefs if c is not clef]
+                    continue
+                best = None
+                for t in times[1:]:
+                    cost = sum(_outside(key(before) if ev[0] < t else key(clef), ev[3], ev[4])
+                               for ev in mine if ev[3] is not None)
+                    if best is None or cost <= best[0]:  # equal: as late as possible, just before what needs it
+                        best = (cost, t)
+                note = next(ev[2] for ev in mine if ev[0] == best[1])
+                change = etree.Element("attributes")
+                change.append(clef)
+                note.addprevious(change)
+                clefs = [c for c in clefs if c is not clef]
+    return moved
 
 
 ENGRAVE_CHECK = ("import sys; sys.path.insert(0, sys.argv[1]); from sheet_music_animator.engraver import engrave; "
@@ -454,9 +541,27 @@ def _check_result(root, name: str) -> tuple[int, int, int]:
     return parts, measures, notes
 
 
-def recognize(pdf, pages: list[int], out_path, progress=None, engine: str | None = None) -> Path:
+def dropped_measures(log: Path) -> dict[int, list[int]]:
+    """The measures Audiveris read but could not export (their rhythm did not add up), by page: they are missing
+    from its MusicXML.  From its log: "Error visiting Measure{#8} in {Page#3.1}"."""
+    import re
+    out: dict[int, list[int]] = {}
+    try:
+        text = log.read_text("utf8", "replace")
+    except OSError:
+        return out
+    for m, p in re.findall(r"Error visiting Measure\{#(\d+)\} in \{Page#(\d+)", text):
+        out.setdefault(int(p), [])
+        if int(m) not in out[int(p)]:
+            out[int(p)].append(int(m))
+    return {p: sorted(ms) for p, ms in sorted(out.items())}
+
+
+def recognize(pdf, pages: list[int], out_path, progress=None, engine: str | None = None,
+              notes: list | None = None) -> Path:
     """Read the music on `pages` (0-based) of `pdf` into a MusicXML file at `out_path` (returned).  Raises
-    OmrError with a message for the user."""
+    OmrError with a message for the user; what the user should know about a result that was read (measures
+    the engine lost) is added to `notes`."""
     say = progress or (lambda f, s="": True)
     found = engines()
     if not found:
@@ -468,6 +573,14 @@ def recognize(pdf, pages: list[int], out_path, progress=None, engine: str | None
     try:
         if engine == "Audiveris":
             root = _with_audiveris(Path(pdf), pages, work, log, say)
+            lost = dropped_measures(log)
+            if lost and notes is not None:
+                n = sum(len(v) for v in lost.values())
+                where = "; ".join(f"page {p}: measure{'s' if len(ms) > 1 else ''} {', '.join(map(str, ms))} of that page"
+                                  for p, ms in lost.items())
+                notes.append(f"Audiveris could not work out the rhythm of {n} measure{'s' if n > 1 else ''} and "
+                             f"left {'them' if n > 1 else 'it'} out of the score ({where}). The music there is "
+                             f"missing; add it in a notation program if you need it.")
         else:
             root = _with_homr(Path(pdf), pages, work, log, say)
         _check_result(root, engine)

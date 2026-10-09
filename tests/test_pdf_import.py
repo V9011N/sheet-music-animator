@@ -267,6 +267,45 @@ class TestRecognition(unittest.TestCase):
         self.assertEqual([len(n.findall("beam")) for n in notes[:2]], [1, 0])
         self.assertEqual([p.get("type") for p in root.iter("pedal")], ["start", "stop"])
 
+    def test_a_clef_change_written_at_the_start_of_the_measure_goes_back_where_it_is_printed(self):
+        """Heroic Polonaise m. 1 as Audiveris 5.11 wrote it: the right hand's change to the bass clef, printed
+        before the sixteenths, was put next to the treble clef the measure starts with, so the whole opening was
+        drawn in the treble clef, on ledger lines."""
+        def note(step, octave, dur, chord=False, rest=False):
+            pitch = "<rest/>" if rest else f"<pitch><step>{step}</step><octave>{octave}</octave></pitch>"
+            return f'<note>{"<chord/>" if chord else ""}{pitch}<duration>{dur}</duration><staff>1</staff></note>'
+        clef = '<clef number="1"><sign>{}</sign><line>{}</line></clef>'
+        body = (note("E", 3, 4) + note("E", 4, 4, chord=True) + note("", 0, 2, rest=True)
+                + "".join(note(st, 3, 1) for st in "EFFGGA"))
+        xml = ('<score-partwise><part-list><score-part id="P1"/></part-list><part id="P1"><measure number="1">'
+               f'<attributes><divisions>4</divisions>{clef.format("G", 2)}{clef.format("F", 4)}<staff-details/>'
+               f'</attributes>{body}</measure><measure number="2"><attributes>{clef.format("F", 4)}</attributes>'
+               f'{note("", 0, 12, rest=True)}</measure></part></score-partwise>')
+        root = etree.fromstring(xml.encode())
+        self.assertEqual(pdfimport.place_clefs(root), 1)
+        m = root.find("part/measure")
+        self.assertEqual([c.findtext("sign") for c in m.find("attributes").findall("clef")], ["G"])
+        self.assertEqual([e.tag for e in m][3:6], ["note", "attributes", "note"])   # after the rest, before the run
+        self.assertEqual(m.findall("attributes")[1].findtext("clef/sign"), "F")
+
+        lone = etree.fromstring(xml.replace(body, note("E", 4, 12)).replace(
+            f'<attributes>{clef.format("F", 4)}</attributes>', "").encode())
+        pdfimport.place_clefs(lone)                       # nothing to go after: it takes effect in the next measure
+        self.assertEqual(lone.findall("part/measure")[1].findtext("attributes/clef/sign"), "F")
+
+    def test_measures_audiveris_could_not_export_are_reported(self):
+        log = self.dir / "omr.log"
+        log.write_text("WARN  Error visiting Measure{#8} in {Page#3.1}\nWARN  Error visiting Measure{#4} in "
+                       "{Page#3.1}\nWARN  Error visiting Measure{#2} in {Page#6.1}\nINFO  fine\n")
+        self.assertEqual(pdfimport.dropped_measures(log), {3: [4, 8], 6: [2]})
+        exe = fake_engine(self.dir, "audiveris", audiveris(musicxml(2)) +
+                          'print("WARN  Error visiting Measure{#3} in {Page#1.1}")\n')
+        lost = []
+        with self.with_engine(audiveris=str(exe)):
+            pdfimport.recognize(self.pdf, [0], self.out, notes=lost)
+        self.assertEqual(len(lost), 1)
+        self.assertIn("page 1: measure 3", lost[0])
+
     def test_an_unclosed_8va_from_the_engine_is_tidied_and_opens(self):
         exe = fake_engine(self.dir, "audiveris", audiveris(with_lines(musicxml(3), [(2, "octave-shift", "down", "1", "1")])))
         with self.with_engine(audiveris=str(exe)):

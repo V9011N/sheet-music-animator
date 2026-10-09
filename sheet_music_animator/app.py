@@ -680,8 +680,9 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Could not read the music", str(e))
             return False
         dlg, progress = self._progress("Reading the music", f"Starting {engines[0]}…", True)
+        lost = []
         try:
-            pdfimport.recognize(path, pages, out, progress, engines[0])
+            pdfimport.recognize(path, pages, out, progress, engines[0], lost)
         except pdfimport.OmrError as e:
             dlg.close()
             if str(e) != "Cancelled.":
@@ -699,6 +700,8 @@ class MainWindow(QMainWindow):
         self.status.showMessage(f"Read {measures} measures ({notes} notes) from {name} with {engines[0]}, saved as "
                                 f"{out.name}. Recognition makes mistakes: correct that file in a notation program "
                                 f"if notes are wrong.", 20000)
+        if lost:
+            QMessageBox.warning(self, "Part of the music could not be read", "\n\n".join(lost))
         return True
 
     def open_xml_path(self, path: str) -> bool:
