@@ -31,28 +31,63 @@ def _voice(pitch: int, hold: float) -> np.ndarray:
 
 
 def synthesize(notes, duration: float, tail: float = 3.0) -> np.ndarray:
-    """notes: iterable of (midi pitch, start, end, velocity).  Returns mono float32.
+    """notes: iterable of (midi pitch, start, end, velocity).  Returns mono float32."""
+    return Synth(notes, duration, tail).render()
 
-    Notes with the same pitch and (rounded) length sound identical apart from their loudness, so
-    each such voice is computed once and mixed in at every position it is needed -- long pieces
-    repeat the same pitch/length combinations thousands of times.
-    """
-    out = np.zeros(int((duration + tail) * SR) + SR, dtype=np.float32)
-    groups: dict[tuple, list] = {}
-    for pitch, start, end, vel in notes:
-        hold = max(end - start, 0.05)
-        step = 0.02 if hold < 1.0 else 0.1                        # coarser rounding for long notes
-        groups.setdefault((int(pitch), round(hold / step) * step), []).append((start, vel))
-    for (pitch, hold), hits in groups.items():
-        voice = _voice(pitch, hold)
-        for start, vel in hits:
-            i = int(start * SR)
-            n = min(len(voice), len(out) - i - 1)
-            if n > 0:
-                out[i:i + n] += (vel / 127.0) * voice[:n]
-    peak = float(np.max(np.abs(out))) or 1.0
-    out = np.tanh(out / peak * 1.4) / np.tanh(1.4) * 0.9
-    return out
+
+def _hold_key(pitch, start, end) -> tuple:
+    hold = max(end - start, 0.05)
+    step = 0.02 if hold < 1.0 else 0.1                            # coarser rounding for long notes
+    return int(pitch), round(hold / step) * step
+
+
+class Synth:
+    """The mix of a list of notes, kept so that moving a few of them does not mean synthesising the whole
+    piece again (which takes seconds): each moved note is taken out where it was and mixed in where it now is.
+
+    Notes with the same pitch and (rounded) length sound identical apart from their loudness, so each such voice
+    is computed once and mixed in at every position it is needed -- long pieces repeat the same pitch/length
+    combinations thousands of times."""
+
+    def __init__(self, notes, duration: float, tail: float = 3.0):
+        self.notes = [tuple(n[:4]) for n in notes]
+        self._voices: dict[tuple, np.ndarray] = {}
+        self.mix = np.zeros(int((duration + tail) * SR) + SR, dtype=np.float32)
+        groups: dict[tuple, list] = {}
+        for pitch, start, end, vel in self.notes:
+            groups.setdefault(_hold_key(pitch, start, end), []).append((start, vel))
+        for key, hits in groups.items():
+            voice = self._voice(key)
+            for start, vel in hits:
+                self._add(voice, start, vel / 127.0)
+        self.peak = float(np.max(np.abs(self.mix))) or 1.0          # kept: an edit does not change the loudness
+
+    def _voice(self, key) -> np.ndarray:
+        if key not in self._voices:
+            self._voices[key] = _voice(*key)
+        return self._voices[key]
+
+    def _add(self, voice, start: float, gain: float):
+        i = int(max(start, 0.0) * SR)
+        if i + len(voice) + 1 > len(self.mix):                      # moved past the end
+            self.mix = np.concatenate([self.mix, np.zeros(i + len(voice) + 1 - len(self.mix), np.float32)])
+        self.mix[i:i + len(voice)] += gain * voice
+
+    def move(self, notes) -> int:
+        """Change the notes to `notes` (the same notes, some at other times).  Returns how many moved."""
+        moved = 0
+        for k, (old, new) in enumerate(zip(self.notes, notes)):
+            new = tuple(new[:4])
+            if abs(old[1] - new[1]) < 1e-6 and abs(old[2] - new[2]) < 1e-6:
+                continue
+            self._add(self._voice(_hold_key(*old[:3])), old[1], -old[3] / 127.0)
+            self._add(self._voice(_hold_key(*new[:3])), new[1], new[3] / 127.0)
+            self.notes[k] = new
+            moved += 1
+        return moved
+
+    def render(self) -> np.ndarray:
+        return np.tanh(self.mix / self.peak * 1.4) / np.tanh(1.4) * 0.9
 
 
 def write_wav(path, samples: np.ndarray):

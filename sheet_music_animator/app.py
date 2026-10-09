@@ -4,6 +4,7 @@ from __future__ import annotations
 from bisect import bisect_right
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -15,7 +16,8 @@ from PySide6.QtWidgets import (QApplication, QCheckBox, QColorDialog, QComboBox,
                                QInputDialog,
                                QLabel, QMainWindow, QMenu, QMessageBox, QProgressDialog, QPushButton, QScrollArea,
                                QSizePolicy, QSpinBox,
-                               QSplitter, QTabWidget, QToolBar, QToolButton, QVBoxLayout, QWidget)
+                               QSplitter, QStackedWidget, QTabBar, QTabWidget, QToolBar, QToolButton, QVBoxLayout,
+                               QWidget)
 
 from . import analysis, audio, pdfimport
 from .engraver import NOTE_KINDS, REST_KINDS
@@ -28,6 +30,7 @@ from .project import (CAMERA_CHANNELS, CATEGORIES, FIXED_KINDS, LANE, Key, Proje
                       retimer)
 from .scene import EditorView, PreviewWidget, SheetScene
 from .layout import relayout_project
+from .midiroll import MidiEditor, NotePlayer, edited_notes, write_midi
 from .timeline import Timeline, fmt
 from .tapmode import TapDialog, TapSession
 from .tour import Tour
@@ -181,6 +184,11 @@ class MainWindow(QMainWindow):
                 self.player = None
         self.tour = None
         self.tap_session = None
+        self.synth = None                # audio.Synth of the built-in sound, kept to follow timing edits
+        self._synth_job = None           # (thread, path) while the edited synth sound is being written
+        self._pending_wav = None         # a newer synth sound, put in place when playback pauses
+        self._wave_job = 0               # loading of the waveform for the MIDI editor: newest request
+        self.note_player = NotePlayer()
         self.speed = float(self.cfg.value("speed", 1.0) or 1.0)
         self._build_ui()
         self._build_actions()
@@ -241,13 +249,22 @@ class MainWindow(QMainWindow):
         split.setStretchFactor(0, 1)
         split.setSizes([1000, 420])
 
-        central = QWidget()
-        cl = QVBoxLayout(central)
+        animation = QWidget()
+        cl = QVBoxLayout(animation)
         cl.setContentsMargins(0, 0, 0, 0)
         cl.setSpacing(0)
         cl.addWidget(self.timeline)
         cl.addWidget(split, 1)
-        self.setCentralWidget(central)
+        # Two workspaces on the same project, like Blender's: the score animation and the MIDI editor
+        self.midi = MidiEditor()
+        self.midi.seeked.connect(self.seek)
+        self.midi.edited.connect(self._midi_edited)
+        self.midi.audition.connect(self.note_player.play)
+        self.midi.exportRequested.connect(self.export_midi)
+        self.stack = QStackedWidget()
+        self.stack.addWidget(animation)
+        self.stack.addWidget(self.midi)
+        self.setCentralWidget(self.stack)
         self.status = self.statusBar()
 
     def _camera_tab(self):
@@ -546,6 +563,23 @@ class MainWindow(QMainWindow):
             w.setFont(f)
         tb.addAction(self.a_heat)
         tb.addAction(self.a_tap)
+        tb.addSeparator()
+        self.view_tabs = QTabBar()
+        self.view_tabs.addTab("Score Animation")
+        self.view_tabs.addTab("MIDI Editor")
+        self.view_tabs.setTabToolTip(0, "The score, the camera and the effects (Ctrl+1)")
+        self.view_tabs.setTabToolTip(1, "The notes as a piano roll under the waveform: retime them (Ctrl+2)")
+        self.view_tabs.setExpanding(False)
+        self.view_tabs.setDrawBase(False)
+        self.view_tabs.setUsesScrollButtons(False)      # never squeezed: the toolbar overflows its last buttons instead
+        self.view_tabs.setElideMode(Qt.ElideNone)
+        self.view_tabs.currentChanged.connect(self.show_workspace)
+        tb.addWidget(self.view_tabs)
+        for i, key in enumerate(("Ctrl+1", "Ctrl+2")):
+            a = QAction(self)
+            a.setShortcut(QKeySequence(key))
+            a.triggered.connect(lambda _=False, i=i: self.view_tabs.setCurrentIndex(i))
+            self.addAction(a)
         spacer = QWidget()
         spacer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         tb.addWidget(spacer)
@@ -557,6 +591,110 @@ class MainWindow(QMainWindow):
             a.setShortcut(QKeySequence(key))
             a.triggered.connect(fn)
             self.addAction(a)
+
+    # ================================================================== workspaces
+    def show_workspace(self, i: int):
+        """0: the score animation, 1: the MIDI editor.  Both show the same project."""
+        self.stack.setCurrentIndex(i)
+        if self.view_tabs.currentIndex() != i:
+            self.view_tabs.setCurrentIndex(i)
+        if i == 1:
+            self.midi.set_time(self.t)
+            self.midi.roll.setFocus()
+
+    def _midi_edited(self):
+        """Notes were moved in the MIDI editor: their elements' nudges changed."""
+        if self.scene is None:
+            return
+        self.scene.apply_time(force=True)
+        self._refresh_time(follow=False)
+        self.commit()
+
+    def export_midi(self):
+        if self.score is None:
+            return
+        self.pause()
+        default = str(Path(self.project.xml_path).with_suffix(".mid")) if self.project.xml_path else ""
+        path, _ = QFileDialog.getSaveFileName(self, "Export MIDI", default, "MIDI file (*.mid)")
+        if not path:
+            return
+        try:
+            write_midi(path, edited_notes(self.project, self.score, self.midi.model.links))
+        except OSError as e:
+            QMessageBox.critical(self, "Could not save the MIDI file", str(e))
+            return
+        self.status.showMessage(f"Saved {path}", 6000)
+
+    def _load_wave(self):
+        """The waveform and the attacks of the recording, for the MIDI editor (in the background: decoding a long
+        recording the first time takes seconds)."""
+        mode = self.project.settings.audio
+        self._wave_job += 1
+        job = self._wave_job
+        if self.synth is not None:
+            y = self.synth.render()
+            hop = audio.SR // 100
+            n = len(y) // hop
+            rms = np.sqrt(np.mean(y[:n * hop].reshape(n, hop) ** 2, axis=1))
+            self.midi.set_audio((rms, audio.SR / hop))
+            return
+        if mode in ("synth", "none") or not Path(mode).exists():
+            self.midi.set_audio(None)
+            return
+        result = {}
+
+        def work():
+            try:
+                result["wave"] = analysis.loudness(mode)
+                result["attacks"] = analysis.attacks(mode)
+            except (OSError, ValueError):
+                pass
+        th = threading.Thread(target=work, daemon=True)
+        th.start()
+
+        def poll():
+            if job != self._wave_job:
+                return
+            if th.is_alive():
+                QTimer.singleShot(150, poll)
+                return
+            self.midi.set_audio(result.get("wave"), result.get("attacks"))
+        QTimer.singleShot(150, poll)
+
+    def _update_synth(self):
+        """The built-in sound plays the notes where they are timed now: re-mix the moved ones and write the sound
+        in the background; it is swapped in at once when paused, else when playback pauses."""
+        if self.synth is None or self.score is None or self.midi.model is None:
+            return
+        if not self.synth.move(edited_notes(self.project, self.score, self.midi.model.links)):
+            return
+        samples = self.synth.render()
+        out = Path(tempfile.gettempdir()) / "sheet_music_animator"
+        stem = Path(self.project.xml_path).stem
+        path = str(out / f"{stem}-{'b' if (self.wav_path or '').endswith('-a.wav') else 'a'}.wav")
+        th = threading.Thread(target=audio.write_wav, args=(path, samples), daemon=True)
+        th.start()
+        self._synth_job = (th, path)
+        self._load_wave()
+
+        def poll():
+            if self._synth_job is None or self._synth_job[1] != path:
+                return
+            if th.is_alive():
+                QTimer.singleShot(100, poll)
+                return
+            self._synth_job = None
+            self._pending_wav = path
+            if not self.playing:
+                self._swap_wav()
+        QTimer.singleShot(100, poll)
+
+    def _swap_wav(self):
+        if self._pending_wav is None:
+            return
+        self.wav_path, self._pending_wav = self._pending_wav, None
+        if self.player is not None:
+            self.player.setSource(QUrl.fromLocalFile(self.wav_path))
 
     # ================================================================== tap to keyframe
     def open_tap_mode(self):
@@ -596,6 +734,7 @@ class MainWindow(QMainWindow):
         self.a_undo.setEnabled(self.history.can_undo())
         self.a_redo.setEnabled(self.history.can_redo())
         self.tabs.setEnabled(True)
+        self.view_tabs.setTabEnabled(1, has)
 
     # ================================================================== loading
     def _confirm_discard(self) -> bool:
@@ -790,6 +929,7 @@ class MainWindow(QMainWindow):
             self.preview.view.setScene(self.scene)
             if not self.project.has_keys():
                 self.project.follow_music(score)
+            self.midi.set_data(self.project, score, total_duration(self.scene, self.project))
             self._build_audio()
             self.timeline.set_data(self.project, score, total_duration(self.scene, self.project))
             self.scene.selectionChanged.connect(self._selection_changed)
@@ -822,19 +962,23 @@ class MainWindow(QMainWindow):
 
     def _build_audio(self):
         self.wav_path = None
+        self.synth = None
+        self._synth_job = self._pending_wav = None
         mode = self.project.settings.audio
-        if self.player is None:
-            return
-        if mode == "synth" and self.score and self.score.notes:
+        if mode == "synth" and self.score and self.score.notes and self.player is not None:
             self.status.showMessage("Synthesising audio…")
             QApplication.processEvents()
             out = Path(tempfile.gettempdir()) / "sheet_music_animator"
             out.mkdir(exist_ok=True)
-            self.wav_path = str(out / f"{Path(self.project.xml_path).stem}.wav")
-            audio.write_wav(self.wav_path, audio.synthesize(self.score.notes, self.score.duration))
+            self.wav_path = str(out / f"{Path(self.project.xml_path).stem}-a.wav")
+            notes = edited_notes(self.project, self.score, self.midi.model.links) if self.midi.model else self.score.notes
+            self.synth = audio.Synth(notes, self.score.duration)
+            audio.write_wav(self.wav_path, self.synth.render())
         elif mode not in ("synth", "none") and Path(mode).exists():
             self.wav_path = mode
-        self.player.setSource(QUrl.fromLocalFile(self.wav_path) if self.wav_path else QUrl())
+        self._load_wave()
+        if self.player is not None:
+            self.player.setSource(QUrl.fromLocalFile(self.wav_path) if self.wav_path else QUrl())
 
     # ================================================================== time / playback
     def end_time(self) -> float:
@@ -882,6 +1026,7 @@ class MainWindow(QMainWindow):
         self.a_play.setText("▶  Play")
         if self.player:
             self.player.pause()
+        self._swap_wav()
 
     def current_time(self) -> float:
         """The playhead time right now (the display only updates every frame)."""
@@ -921,6 +1066,7 @@ class MainWindow(QMainWindow):
         self.preview.view.set_camera(pose)
         self._show_fx_preview()
         self.timeline.set_time(self.t)
+        self.midi.set_time(self.t, follow=self.playing)
         self.lbl_time.setText(f"{fmt(self.t)} / {fmt(self.end_time())}")
         if pose:
             self._updating = True
@@ -1180,6 +1326,8 @@ class MainWindow(QMainWindow):
         if self.history.push(self.project.snapshot()):
             self._update_enabled()
         self._update_title()
+        self.midi.project_changed()
+        self._update_synth()
 
     def undo(self):
         if self.history.can_undo():
@@ -1199,6 +1347,8 @@ class MainWindow(QMainWindow):
         else:
             self.scene.refresh()
             self.timeline.set_data(self.project, self.score, total_duration(self.scene, self.project))
+            self.midi.project_changed()
+            self._update_synth()
             self._refresh_time(follow=False)
         self._sync_settings_to_ui()
         self.scene.clearSelection()

@@ -90,7 +90,8 @@ def render(args) -> int:
     if s.audio == "synth":
         from . import audio
         audio_path = str(Path(args.out).with_suffix(".wav"))
-        audio.write_wav(audio_path, audio.synthesize(score.notes, score.duration))
+        from .midiroll import edited_notes, link_notes
+        audio.write_wav(audio_path, audio.synthesize(edited_notes(project, score, link_notes(score)), score.duration))
     out = str(Path(args.out))
     print(f"Rendering {duration:.1f} s at {s.width}x{s.height} {s.fps} fps…", flush=True)
     t0 = time.perf_counter()

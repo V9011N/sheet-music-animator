@@ -41,17 +41,41 @@ def _cache_path(path: str, tag: str) -> Path:
     return d / f"{key}.npy"
 
 
-def loudness(path: str, fps: int = 100) -> tuple[np.ndarray, int]:
-    """RMS amplitude of the recording, `fps` values per second (cached; first call decodes the file)."""
-    cache = _cache_path(path, f"rms{fps}")
-    if cache.exists():
-        return np.load(cache), fps
-    y = decode_audio(path)
+def loudness(path: str, fps: int = 100) -> tuple[np.ndarray, float]:
+    """RMS amplitude of the recording, about `fps` values per second, and their exact rate (the sample rate is
+    not a multiple of `fps`; taking `fps` itself drifts 0.4 s in three minutes).  Cached; the first call decodes
+    the file."""
     hop = SR // fps
+    cache = _cache_path(path, f"rms{fps}-exact")
+    if cache.exists():
+        return np.load(cache), SR / hop
+    y = decode_audio(path)
     n = len(y) // hop
     rms = np.sqrt(np.mean(y[:n * hop].reshape(n, hop).astype(np.float64) ** 2, axis=1)).astype(np.float32)
     np.save(cache, rms)
-    return rms, fps
+    return rms, SR / hop
+
+
+def attacks(path: str, fps: int = 100) -> np.ndarray:
+    """Times (s) where something is struck in the recording: peaks of the broadband onset strength that stand
+    out from the surrounding second (cached).  For snapping notes to the sound."""
+    cache = _cache_path(path, f"attacks{fps}")
+    if cache.exists():
+        return np.load(cache)
+    y = decode_audio(path)
+    hop = SR // fps
+    mag = stft_mag(y, 2048, hop)
+    L = np.log1p(30.0 * mag / (np.percentile(mag, 99.5) + 1e-9))
+    flux = np.zeros(len(L), np.float32)
+    flux[1:] = np.maximum(L[1:] - L[:-1], 0).sum(axis=1)
+    w = fps                                                   # judged against the second around it
+    pad = np.pad(flux, w, mode="edge")
+    windows = np.lib.stride_tricks.sliding_window_view(pad, 2 * w + 1)[:len(flux)]
+    z = (flux - np.median(windows, axis=1)) / (windows.std(axis=1) + 1e-9)
+    peak = (flux[1:-1] >= flux[:-2]) & (flux[1:-1] > flux[2:]) & (z[1:-1] > 1.5)
+    out = ((np.nonzero(peak)[0] + 1) * hop / SR).astype(np.float32)
+    np.save(cache, out)
+    return out
 
 
 # ------------------------------------------------------------------------------------ features
