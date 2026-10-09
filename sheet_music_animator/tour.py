@@ -381,6 +381,12 @@ def build_steps(win) -> list[Step]:
           "confident it is, and <b>Sync Heat Map</b> colours the score green where the sync is sure of itself and "
           "red where it is not. <b>Use the Score's Own Timing</b> goes back.",
           target=[act(win.a_align), act(win.a_unalign), act(win.a_heat)]),
+        S("Tap to Keyframe, and playback speed",
+          "Once a recording is fitted, <b>Tap to Keyframe</b> lets you time the notes yourself: it counts down "
+          "3 s, plays from the seeker, and every <b>Space</b> tap makes the next note appear (Space does not "
+          "pause; <b>Esc</b> ends the mode). The <b>Speed</b> box next to the time plays anything from 0.1x to "
+          "5.0x, which makes tapping along much easier.",
+          target=[act(win.a_tap), win.sp_speed]),
         S("The camera window",
           "The orange rectangle is what the video will show. <b>Drag it</b> to move it, drag a corner to "
           "resize it, drag the round handle above it to rotate it (hold Shift to snap).<br><br>Try moving it "

@@ -59,7 +59,9 @@ class SvgItem(QGraphicsItem):
             # and the SVG DOM can be dropped right away.
             self._picture = QPicture()
             p = QPainter(self._picture)
-            family = ("'%s', serif" % self.font.replace("'", "")).encode("utf8")
+            # One family only: Qt's SVG renderer ignores a family that is followed by a fallback list
+            # ("'Arial', serif"), and the font box would then change nothing.
+            family = ("'%s'" % self.font.replace("'", "")).encode("utf8")
             QSvgRenderer(QByteArray(self._svg.replace(FONT_TOKEN, family))).render(p, self._rect)
             p.end()
         self._picture.play(painter)
@@ -211,6 +213,7 @@ class SheetScene(QGraphicsScene):
         self.rendering = False       # while a frame is rendered selection marks are not drawn
         self._state: list[tuple | None] = [None] * len(self._items)
         self._cat_hidden = [False] * len(self._items)   # hidden by a category of its measure
+        self._gate = None     # (from, until): while tapping, nothing timed after `until` has appeared yet
         self._measure_times = [t for t, _ in score.measures]
         self._applied_t: float | None = None     # time the item states were last brought up to date for
         self._applied_end = 0.0
@@ -233,8 +236,17 @@ class SheetScene(QGraphicsScene):
         ones the user deleted."""
         hidden = self.project.hidden
         classes = {m: {c for cat in cats for c in CATEGORIES.get(cat, ())} for m, cats in hidden.items() if cats}
+        gate = self._gate
         for i, u in enumerate(self.score.units):
-            self._cat_hidden[i] = u.kind in classes.get(u.measure, ()) or u.uid in self.project.deleted
+            self._cat_hidden[i] = (u.kind in classes.get(u.measure, ()) or u.uid in self.project.deleted or
+                                   (gate is not None and not u.static and gate[0] - 1e-3 <= u.time and u.time > gate[1] + 1e-3))
+
+    def set_gate(self, gate):
+        """Hold back every timed element from `gate[0]` on whose time is later than `gate[1]` (tap mode reveals
+        them one tap at a time); None removes the hold."""
+        self._gate = gate
+        self.apply_categories()
+        self.apply_time(force=True)
 
     def apply_geometry(self):
         """Position every element as recorded in Project.transforms."""

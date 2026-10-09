@@ -29,6 +29,7 @@ from .project import (CAMERA_CHANNELS, CATEGORIES, FIXED_KINDS, LANE, Key, Proje
 from .scene import EditorView, PreviewWidget, SheetScene
 from .layout import relayout_project
 from .timeline import Timeline, fmt
+from .tapmode import TapDialog, TapSession
 from .tour import Tour
 
 try:
@@ -36,6 +37,7 @@ try:
 except ImportError:  # pragma: no cover - multimedia is optional, playback just goes silent
     QMediaPlayer = None
 
+SPEED_MIN, SPEED_MAX = 0.1, 5.0     # playback speed limits
 RESOLUTIONS = {"1920 × 1080 (16:9)": (1920, 1080), "1280 × 720 (16:9)": (1280, 720),
                "3840 × 2160 (4K)": (3840, 2160), "1080 × 1920 (vertical)": (1080, 1920),
                "1080 × 1080 (square)": (1080, 1080), "Custom": None}
@@ -148,7 +150,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Sheet Music Animator")
-        self.resize(1500, 900)
+        self.resize(1700, 900)   # the toolbar is long; the screen clamps this
         self.cfg = QSettings("SheetMusicAnimator", "SheetMusicAnimator")
         self.project = Project()
         self.project_path: str | None = None
@@ -178,6 +180,8 @@ class MainWindow(QMainWindow):
             except Exception:
                 self.player = None
         self.tour = None
+        self.tap_session = None
+        self.speed = float(self.cfg.value("speed", 1.0) or 1.0)
         self._build_ui()
         self._build_actions()
         self._sync_settings_to_ui()
@@ -457,6 +461,7 @@ class MainWindow(QMainWindow):
 
     def _build_actions(self):
         tb = self.toolbar = QToolBar("Main")
+        tb.setStyleSheet("QToolButton{padding:3px 4px;}")   # the toolbar is long: keep every button on one row
         tb.setMovable(False)
         self.addToolBar(tb)
 
@@ -489,6 +494,8 @@ class MainWindow(QMainWindow):
         self.a_heat = act("Sync Heat Map", self.toggle_heat, None,
                           "Colour the score by how sure the sync was: green = confident, red = unsure")
         self.a_heat.setCheckable(True)
+        self.a_tap = act("Tap to Keyframe", self.open_tap_mode, None,
+                         "Listen to the fitted recording and tap Space on every note to time the engravings yourself")
         self.a_guide = act("? Guide", self.start_tour, None, "Walk through the features with an interactive guide")
         for a in (self.a_open, self.a_openp, self.a_save, self.a_undo, self.a_redo):
             tb.addAction(a)
@@ -496,8 +503,25 @@ class MainWindow(QMainWindow):
         for a in (self.a_home, self.a_play):
             tb.addAction(a)
         self.lbl_time = QLabel("0:00.0 / 0:00.0")
-        self.lbl_time.setStyleSheet("font-family:Consolas,monospace; padding:0 10px;")
+        self.lbl_time.setStyleSheet("font-family:Consolas,monospace; padding:0 6px;")
         tb.addWidget(self.lbl_time)
+        self.sp_speed = QDoubleSpinBox()
+        self.sp_speed.setRange(SPEED_MIN, SPEED_MAX)
+        self.sp_speed.setSingleStep(0.1)
+        self.sp_speed.setDecimals(1)
+        self.sp_speed.setPrefix("Speed ")
+        self.sp_speed.setSuffix("x")
+        self.sp_speed.setKeyboardTracking(False)
+        self.sp_speed.setValue(min(max(self.speed, SPEED_MIN), SPEED_MAX))
+        self.sp_speed.setToolTip("Playback speed, 0.1x to 5.0x (the audio follows)")
+        self.sp_speed.valueChanged.connect(self.set_speed)
+        tb.addWidget(self.sp_speed)
+        self.btn_speed1 = QPushButton("1x")
+        self.btn_speed1.setToolTip("Back to normal speed")
+        self.btn_speed1.setFlat(True)
+        self.btn_speed1.setStyleSheet("padding:2px 3px;")
+        self.btn_speed1.clicked.connect(lambda: self.sp_speed.setValue(1.0))
+        tb.addWidget(self.btn_speed1)
         tb.addSeparator()
         for a in (self.a_key, self.a_fit, self.a_cam):
             tb.addAction(a)
@@ -509,6 +533,7 @@ class MainWindow(QMainWindow):
             f.setBold(True)
             w.setFont(f)
         tb.addAction(self.a_heat)
+        tb.addAction(self.a_tap)
         spacer = QWidget()
         spacer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         tb.addWidget(spacer)
@@ -520,6 +545,19 @@ class MainWindow(QMainWindow):
             a.setShortcut(QKeySequence(key))
             a.triggered.connect(fn)
             self.addAction(a)
+
+    # ================================================================== tap to keyframe
+    def open_tap_mode(self):
+        """Explain the mode, ask what each tap advances by, then count down and start."""
+        if self.score is None or not self.project.time_map:
+            return
+        if self.tap_session is None:
+            self.tap_session = TapSession(self)
+        if self.tap_session.active:
+            return
+        dlg = TapDialog(self)
+        if dlg.exec() == QDialog.Accepted:
+            self.tap_session.begin(dlg.mode)
 
     # ================================================================== guide
     def start_tour(self):
@@ -542,6 +580,7 @@ class MainWindow(QMainWindow):
             a.setEnabled(has)
         self.a_unalign.setEnabled(has and bool(self.project.time_map))
         self.a_heat.setEnabled(has and bool(self.project.sync_conf))
+        self.a_tap.setEnabled(has and bool(self.project.time_map))
         self.a_undo.setEnabled(self.history.can_undo())
         self.a_redo.setEnabled(self.history.can_redo())
         self.tabs.setEnabled(True)
@@ -622,6 +661,8 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(f"Sheet Music Animator — {name}{' *' if self.scene and self.is_dirty() else ''}")
 
     def closeEvent(self, e):
+        if self.tap_session is not None:
+            self.tap_session.finish()
         self.pause()
         if self._confirm_discard():
             super().closeEvent(e)
@@ -634,6 +675,8 @@ class MainWindow(QMainWindow):
     def load_score(self, old_score=None, fresh: bool = True) -> bool:
         """(Re)engrave the project's MusicXML and rebuild the scene.  With `old_score` the project is carried
         over from that layout (undo history is kept); otherwise a fresh history starts."""
+        if self.tap_session is not None:
+            self.tap_session.finish()
         self.pause()
         s = self.project.settings
         QApplication.setOverrideCursor(Qt.WaitCursor)
@@ -729,6 +772,7 @@ class MainWindow(QMainWindow):
         self._clock_t0 = self.t
         self._clock.start()
         if self.player and self.wav_path:
+            self.player.setPlaybackRate(self.speed)
             self.player.setPosition(int(self.t * 1000))
             self.player.play()
         self._timer.start()
@@ -744,8 +788,24 @@ class MainWindow(QMainWindow):
         if self.player:
             self.player.pause()
 
+    def current_time(self) -> float:
+        """The playhead time right now (the display only updates every frame)."""
+        if not self.playing:
+            return self.t
+        return min(self._clock_t0 + self._clock.elapsed() / 1000.0 * self.speed, self.end_time())
+
+    def set_speed(self, v: float):
+        v = min(max(float(v), SPEED_MIN), SPEED_MAX)
+        if self.playing:     # carry on from where it is at the new speed
+            self._clock_t0 = self.current_time()
+            self._clock.restart()
+        self.speed = v
+        self.cfg.setValue("speed", v)
+        if self.player:
+            self.player.setPlaybackRate(v)
+
     def _tick(self):
-        t = self._clock_t0 + self._clock.elapsed() / 1000.0
+        t = self._clock_t0 + self._clock.elapsed() / 1000.0 * self.speed
         if t >= self.end_time():
             self.t = self.end_time()
             self.pause()
@@ -884,6 +944,7 @@ class MainWindow(QMainWindow):
         aligned = bool(self.project.time_map)
         self.a_unalign.setEnabled(self.score is not None and aligned)
         self.a_heat.setEnabled(self.score is not None and bool(self.project.sync_conf))
+        self.a_tap.setEnabled(self.score is not None and aligned)
         if not self.project.sync_conf and self.a_heat.isChecked():
             self.a_heat.setChecked(False)
         if self.scene is not None:
