@@ -199,6 +199,7 @@ class MainWindow(QMainWindow):
         self.editor = EditorView()
         self.editor.cameraEdited.connect(self._camera_dragged)
         self.editor.cameraEditFinished.connect(self._camera_edit_finished)
+        self.editor.deleteRequested.connect(self.delete_selection)
         self.editor.setDragMode(EditorView.RubberBandDrag)
         self.preview = PreviewWidget()
 
@@ -407,8 +408,15 @@ class MainWindow(QMainWindow):
         reset.clicked.connect(lambda: self.sp_note.setValue(0.0))
         self.btn_reset_geom = QPushButton("Reset position and size")
         self.btn_reset_geom.clicked.connect(self._reset_geometry)
-        self.lbl_geom = QLabel("Drag the selected engraving to move it; drag a corner handle to resize it. "
-                               "Noteheads, note tails and beams cannot be moved.")
+        self.btn_delete = QPushButton("Delete selected engravings (Delete key)")
+        self.btn_delete.clicked.connect(self.delete_selection)
+        self.btn_restore = QPushButton("Restore deleted engravings")
+        self.btn_restore.setVisible(False)
+        self.btn_delete.setVisible(False)
+        self.btn_restore.clicked.connect(self.restore_deleted)
+        self.lbl_geom = QLabel("Drag the selected engraving to move it. The white handles stretch it (edges: one "
+                               "direction, corners: both), the round handle above it rotates it (Shift snaps to "
+                               "15°), and Delete removes it. Noteheads, note tails and beams cannot be edited.")
         self.lbl_geom.setWordWrap(True)
         self.lbl_geom.setStyleSheet("color:#9a9aa0")
         # measures
@@ -436,6 +444,8 @@ class MainWindow(QMainWindow):
         f.addRow(reset)
         f.addRow(self.lbl_geom)
         f.addRow(self.btn_reset_geom)
+        f.addRow(self.btn_delete)
+        f.addRow(self.btn_restore)
         f.addRow(self.grp_measures)
         # the category list is long: scroll it instead of making the window taller than the screen
         self.sel_scroll = QScrollArea()
@@ -1057,6 +1067,9 @@ class MainWindow(QMainWindow):
         movable = [u for u in units if u.kind not in FIXED_KINDS]
         self.lbl_geom.setVisible(bool(units))
         self.btn_reset_geom.setVisible(any(u.uid in self.project.transforms for u in units))
+        self.btn_delete.setVisible(bool(movable))
+        self.btn_restore.setVisible(bool(self.project.deleted))
+        self.btn_restore.setText(f"Restore deleted engravings ({len(self.project.deleted)})")
         if not units:
             self.sp_note.setValue(0.0)
             self.lbl_sel.setText(SELECT_HINT if not measures else
@@ -1122,6 +1135,36 @@ class MainWindow(QMainWindow):
         for u in self._sel_units:
             self.project.transforms.pop(u.uid, None)
         self.scene.refresh()
+        self._update_selection_panel()
+        self.editor.viewport().update()
+        self.commit()
+
+    def delete_selection(self):
+        """Delete the selected engravings (the ones that can be edited): they disappear from the sheet and the video."""
+        if not self.scene:
+            return
+        gone = [u for u in self._sel_units if u.kind not in FIXED_KINDS]
+        if not gone:
+            return
+        self.project.deleted.update(u.uid for u in gone)
+        for u in gone:
+            self.project.transforms.pop(u.uid, None)
+        self._reselecting = True
+        self.scene.clearSelection()
+        self.scene.refresh()
+        self._reselecting = False
+        self._sel_units = []
+        self._refresh_time(follow=False)
+        self._update_selection_panel()
+        self.editor.viewport().update()
+        self.commit()
+
+    def restore_deleted(self):
+        if not self.scene or not self.project.deleted:
+            return
+        self.project.deleted.clear()
+        self.scene.refresh()
+        self._refresh_time(follow=False)
         self._update_selection_panel()
         self.editor.viewport().update()
         self.commit()

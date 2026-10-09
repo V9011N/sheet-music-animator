@@ -116,6 +116,14 @@ class Settings:
         return self.width / self.height
 
 
+def norm_transform(v) -> list:
+    """[dx, dy, sx, sy, rotation]; older projects stored [dx, dy, scale]."""
+    v = [float(x) for x in v]
+    if len(v) == 3:
+        v = [v[0], v[1], v[2], v[2], 0.0]
+    return (v + [1.0, 1.0, 0.0][len(v) - 2:])[:5] if len(v) < 5 else v[:5]
+
+
 def _blank_channels():
     return {c: [] for c in CAMERA_CHANNELS}
 
@@ -152,7 +160,8 @@ class Project:
     keys_edited: bool = False
     timed: set[int] = field(default_factory=set)   # clefs, barlines... (static units) that follow the music
     hidden: dict[int, set[str]] = field(default_factory=dict)   # measure index -> hidden CATEGORIES
-    transforms: dict[int, list[float]] = field(default_factory=dict)   # unit uid -> [dx, dy, scale]
+    transforms: dict[int, list[float]] = field(default_factory=dict)   # unit uid -> [dx, dy, scale x, scale y, rotation (degrees)]
+    deleted: set[int] = field(default_factory=set)                      # unit uids of engravings the user deleted
     line_starts: list[int] | None = None   # measure index that starts each line (None: every measures_per_line)
     effects: Effects = field(default_factory=Effects)
     sync_conf: list = field(default_factory=list)   # [[recording seconds, confidence 0..1], ...] of that alignment
@@ -363,6 +372,7 @@ class Project:
                 "keys_edited": self.keys_edited, "timed": sorted(self.timed),
                 "hidden": {str(m): sorted(c) for m, c in sorted(self.hidden.items()) if c},
                 "transforms": {str(u): list(v) for u, v in sorted(self.transforms.items())},
+                "deleted": sorted(self.deleted),
                 "line_starts": self.line_starts, "effects": self.effects.to_dict(), "time_map": self.time_map,
                 "sync_conf": self.sync_conf, "sync_overall": self.sync_overall}
 
@@ -390,7 +400,8 @@ class Project:
         self.keys_edited = d.get("keys_edited", False)
         self.timed = {int(u) for u in d.get("timed", [])}
         self.hidden = {int(m): set(c) for m, c in d.get("hidden", {}).items()}
-        self.transforms = {int(u): list(v) for u, v in d.get("transforms", {}).items()}
+        self.transforms = {int(u): norm_transform(v) for u, v in d.get("transforms", {}).items()}
+        self.deleted = {int(u) for u in d.get("deleted", [])}
         self.line_starts = d.get("line_starts")
         self.effects = Effects.from_dict(d.get("effects", {}))
         for ch in self.channels:             # a lane always has its entry in the effects

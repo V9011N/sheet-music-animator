@@ -436,10 +436,12 @@ def build_steps(win) -> list[Step]:
           "key signature and bracket). Select the <i>first</i> measure of a line and <b>Move this line up</b> "
           "joins it to the previous line. The canvas and camera follow.", tab=lambda: win.tab_selection, target=line_buttons,
           setup=changed(lambda: tuple(win.score.line_starts) if win.score else ())),
-        S("Move and resize engravings",
+        S("Move, stretch, rotate and delete engravings",
           "Click almost any engraved element — clef, barline, slur, dynamic, text, accidental — then "
-          "<b>drag it</b> to move it, or drag a <b>corner handle</b> to resize it. (Noteheads, note tails and "
-          "beams stay put.) <i>Reset position and size</i> in the Selection tab undoes it.",
+          "<b>drag it</b> to move it. The white handles <b>stretch</b> it (edges one way, corners both), the "
+          "round handle above it <b>rotates</b> it (Shift snaps to 15°), and <b>Delete</b> removes it. "
+          "(Noteheads, note tails and beams stay put.) <i>Reset position and size</i> in the Selection tab "
+          "undoes it, and <i>Restore deleted engravings</i> brings deleted ones back.",
           tab=lambda: win.tab_selection, target=lambda: win.editor, setup=changed(lambda: repr(sorted(win.project.transforms.items())))),
         S("Time one element",
           "Select any element, such as a note, and use <b>Reveal earlier / later</b> to shift when it appears. "

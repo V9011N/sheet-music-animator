@@ -17,10 +17,10 @@ SELECTABLE = NOTE_KINDS | REST_KINDS
 
 class SvgItem(QGraphicsItem):
     """Draws a small standalone SVG 1:1 into its own bounding rect (page space).  Elements that may be
-    moved or resized carry an offset and a scale (see `set_geom`)."""
+    edited carry an offset, a stretch in x and y and a rotation (see `set_geom`); the handles for that are
+    drawn and handled by the editor view."""
 
     LOWRES_BELOW = 0.03   # device pixels per page unit under which `lowres` items are drawn from a small bitmap
-    HANDLE_PX = 6         # half the size of a resize handle on screen
 
     def __init__(self, svg: bytes, rect: tuple, lowres: bool = False, movable: bool = False):
         super().__init__()
@@ -34,11 +34,9 @@ class SvgItem(QGraphicsItem):
         self.alpha = 1.0     # opacity the scene gave this item (also set with setOpacity)
         self.ghost = 0.0     # opacity of the part that has not been revealed yet
         self.movable = movable
-        self._lod = 1.0
-        self._silent = False         # set while the scene positions the item itself
-        self._scaling = None         # (centre in the scene, start distance, start scale) while a handle is dragged
+        self._silent = False         # set while the scene or an edit handle positions the item itself
         self._moved = False
-        self.scale_factor = 1.0
+        self.geom = (1.0, 1.0, 0.0)  # stretch x, stretch y, rotation (degrees) about the centre
         self.setAcceptedMouseButtons(Qt.NoButton)
         if movable:
             self.setFlag(QGraphicsItem.ItemIsMovable, True)
@@ -103,32 +101,29 @@ class SvgItem(QGraphicsItem):
             else:
                 self._draw(painter)
         if option.state & QStyle.State_Selected and not getattr(self.scene(), "rendering", False):
-            lod = max(option.levelOfDetailFromTransform(painter.worldTransform()), 1e-9)
-            self._lod = lod
             box = r.adjusted(10, 10, -10, -10)
             painter.setPen(QPen(QColor("#2f7bff"), 0, Qt.DashLine))
             painter.setBrush(Qt.NoBrush)
             painter.drawRect(box)
-            if self.movable:   # resize handles
-                h = self.HANDLE_PX / lod
-                painter.setPen(QPen(QColor("#2f7bff"), 0))
-                painter.setBrush(QColor("#ffffff"))
-                for c in self._corners(box):
-                    painter.drawRect(QRectF(c.x() - h / 2, c.y() - h / 2, h, h))
 
-    @staticmethod
-    def _corners(box):
-        return (box.topLeft(), box.topRight(), box.bottomLeft(), box.bottomRight())
+    def edit_box(self) -> QRectF:
+        """The frame the edit handles sit on (in item coordinates)."""
+        return self._rect.adjusted(10, 10, -10, -10)
 
-    # -- moving and resizing --------------------------------------------------------------------------
-    def set_geom(self, dx: float, dy: float, s: float):
-        """Place the item: offset (dx, dy) and uniform scale s about its centre."""
+    # -- moving, stretching, rotating --------------------------------------------------------------------
+    def set_geom(self, dx: float, dy: float, sx: float = 1.0, sy: float | None = None, rot: float = 0.0):
+        """Place the item: offset (dx, dy), stretch (sx, sy) and rotation about its centre."""
+        sy = sx if sy is None else sy
         self._silent = True
-        self.scale_factor = s
+        self.geom = (sx, sy, rot)
         self.setPos(dx, dy)
         c = self._rect.center()
-        self.setTransform(QTransform.fromTranslate(c.x(), c.y()).scale(s, s).translate(-c.x(), -c.y()))
+        self.setTransform(QTransform.fromTranslate(c.x(), c.y()).rotate(rot).scale(sx, sy).translate(-c.x(), -c.y()))
         self._silent = False
+
+    def geometry(self) -> list:
+        return [round(self.pos().x(), 2), round(self.pos().y(), 2), round(self.geom[0], 4),
+                round(self.geom[1], 4), round(self.geom[2], 2)]
 
     def itemChange(self, change, value):
         if change == QGraphicsItem.ItemPositionHasChanged and not self._silent and self.scene() is not None:
@@ -136,36 +131,9 @@ class SvgItem(QGraphicsItem):
             self.scene().item_geometry_changed(self)
         return super().itemChange(change, value)
 
-    def _handle_hit(self, pos) -> bool:
-        box = self._rect.adjusted(10, 10, -10, -10)
-        tol = (self.HANDLE_PX + 3) / max(self._lod, 1e-9)
-        return any(abs(c.x() - pos.x()) <= tol and abs(c.y() - pos.y()) <= tol for c in self._corners(box))
-
-    def mousePressEvent(self, e):
-        if self.movable and self.isSelected() and e.button() == Qt.LeftButton and self._handle_hit(e.pos()):
-            centre = self.mapToScene(self._rect.center())
-            d = math.hypot(e.scenePos().x() - centre.x(), e.scenePos().y() - centre.y())
-            self._scaling = (centre, max(d, 1e-6), self.scale_factor)
-            e.accept()
-            return
-        super().mousePressEvent(e)
-
-    def mouseMoveEvent(self, e):
-        if self._scaling is not None:
-            centre, d0, s0 = self._scaling
-            d = math.hypot(e.scenePos().x() - centre.x(), e.scenePos().y() - centre.y())
-            self.set_geom(self.pos().x(), self.pos().y(), min(max(s0 * d / d0, 0.1), 10.0))
-            self._moved = True
-            self.scene().item_geometry_changed(self)
-            e.accept()
-            return
-        super().mouseMoveEvent(e)
-
     def mouseReleaseEvent(self, e):
-        was = self._scaling is not None
-        self._scaling = None
         super().mouseReleaseEvent(e)
-        if (was or self._moved) and self.scene() is not None:
+        if self._moved and self.scene() is not None:
             self._moved = False
             self.scene().item_edit_finished()
 
@@ -261,11 +229,12 @@ class SheetScene(QGraphicsScene):
             it.set_font(font)
 
     def apply_categories(self):
-        """Hide the engravings of the categories switched off in each measure (see Project.hidden)."""
+        """Hide the engravings of the categories switched off in each measure (see Project.hidden) and the
+        ones the user deleted."""
         hidden = self.project.hidden
         classes = {m: {c for cat in cats for c in CATEGORIES.get(cat, ())} for m, cats in hidden.items() if cats}
         for i, u in enumerate(self.score.units):
-            self._cat_hidden[i] = u.kind in classes.get(u.measure, ())
+            self._cat_hidden[i] = u.kind in classes.get(u.measure, ()) or u.uid in self.project.deleted
 
     def apply_geometry(self):
         """Position every element as recorded in Project.transforms."""
@@ -273,16 +242,16 @@ class SheetScene(QGraphicsScene):
         for it in self._items:
             if not it.movable:
                 continue
-            dx, dy, s = tf.get(it.unit.uid, (0.0, 0.0, 1.0))
-            if (it.pos().x(), it.pos().y(), it.scale_factor) != (dx, dy, s):
-                it.set_geom(dx, dy, s)
+            dx, dy, sx, sy, rot = tf.get(it.unit.uid, (0.0, 0.0, 1.0, 1.0, 0.0))
+            if (it.pos().x(), it.pos().y(), *it.geom) != (dx, dy, sx, sy, rot):
+                it.set_geom(dx, dy, sx, sy, rot)
 
     def item_geometry_changed(self, item: SvgItem):
         if not self._geom_ready:
             return
         uid = item.unit.uid
-        g = [round(item.pos().x(), 2), round(item.pos().y(), 2), round(item.scale_factor, 4)]
-        if g == [0.0, 0.0, 1.0]:
+        g = item.geometry()
+        if g == [0.0, 0.0, 1.0, 1.0, 0.0]:
             self.project.transforms.pop(uid, None)
         else:
             self.project.transforms[uid] = g
@@ -430,6 +399,7 @@ class EditorView(QGraphicsView):
 
     cameraEdited = Signal(float, float, float, float)   # cx, cy, w, rotation
     cameraEditFinished = Signal()
+    deleteRequested = Signal()                          # Delete / Backspace in the editor
 
     HANDLE = 9  # px
 
@@ -438,6 +408,7 @@ class EditorView(QGraphicsView):
         self.cam: tuple | None = None       # (cx, cy, w, h, rotation) in scene units
         self.aspect = 16 / 9
         self._drag = None
+        self._edit = None       # an edit handle of the selected engraving that is being dragged
         self._panning = None
         self.setRenderHints(QPainter.Antialiasing | QPainter.SmoothPixmapTransform)
         self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
@@ -491,6 +462,115 @@ class EditorView(QGraphicsView):
         lx, ly = self._to_local(self.mapToScene(pos.toPoint()))
         return "move" if abs(lx) <= self.cam[2] / 2 and abs(ly) <= self.cam[3] / 2 else None
 
+    # -- edit handles of the selected engraving (stretch, rotate) ---------------------------------------------
+    EDIT_PX = 5            # half the size of an edit handle on screen
+    EDIT_HIT = 9
+    ROT_PX = 26            # how far the rotation handle floats beyond the top edge
+
+    def _edit_target(self):
+        sc = self.scene()
+        if sc is None or self._drag is not None:
+            return None
+        sel = sc.selectedItems()
+        its = [i for i in sel if isinstance(i, SvgItem) and i.movable and i.isVisible()]
+        return its[0] if len(its) == 1 and len(sel) == 1 else None
+
+    def _edit_points(self, item):
+        """Scene positions of the 8 resize handles and the rotation handle, and the item's centre."""
+        b = item.edit_box()
+        loc = {"tl": b.topLeft(), "t": QPointF(b.center().x(), b.top()), "tr": b.topRight(),
+               "r": QPointF(b.right(), b.center().y()), "br": b.bottomRight(),
+               "b": QPointF(b.center().x(), b.bottom()), "bl": b.bottomLeft(),
+               "l": QPointF(b.left(), b.center().y())}
+        pts = {k: item.mapToScene(v) for k, v in loc.items()}
+        ctr = item.mapToScene(b.center())
+        up = QPointF(pts["t"].x() - ctr.x(), pts["t"].y() - ctr.y())
+        n = math.hypot(up.x(), up.y()) or 1.0
+        k = self._k() * self.ROT_PX
+        pts["rot"] = QPointF(pts["t"].x() + up.x() / n * k, pts["t"].y() + up.y() / n * k)
+        return pts, ctr
+
+    def _edit_hit(self, item, pos: QPointF):
+        pts, _ = self._edit_points(item)
+        for name in ("rot", "tl", "tr", "bl", "br", "t", "b", "l", "r"):
+            vp = self.mapFromScene(pts[name])
+            if abs(vp.x() - pos.x()) <= self.EDIT_HIT and abs(vp.y() - pos.y()) <= self.EDIT_HIT:
+                return name
+        return None
+
+    def _edit_begin(self, item, name, pos: QPointF):
+        pts, ctr = self._edit_points(item)
+        b = item.edit_box()
+        opposite = {"tl": "br", "t": "b", "tr": "bl", "r": "l", "br": "tl", "b": "t", "bl": "tr", "l": "r"}
+        loc = {"tl": b.topLeft(), "t": QPointF(b.center().x(), b.top()), "tr": b.topRight(),
+               "r": QPointF(b.right(), b.center().y()), "br": b.bottomRight(),
+               "b": QPointF(b.center().x(), b.bottom()), "bl": b.bottomLeft(),
+               "l": QPointF(b.left(), b.center().y())}
+        m = self.mapToScene(pos.toPoint())
+        self._edit = {"item": item, "name": name, "pos0": QPointF(item.pos()), "geom0": item.geom,
+                      "centre": ctr, "box": b, "loc": loc, "opp": opposite.get(name),
+                      "angle0": math.atan2(m.y() - ctr.y(), m.x() - ctr.x())}
+
+    def _edit_move(self, pos: QPointF, snap: bool):
+        d = self._edit
+        item, name = d["item"], d["name"]
+        sx0, sy0, rot0 = d["geom0"]
+        m = self.mapToScene(pos.toPoint())
+        if name == "rot":
+            ang = math.degrees(math.atan2(m.y() - d["centre"].y(), m.x() - d["centre"].x()) - d["angle0"])
+            rot = rot0 + ang
+            if snap:
+                rot = round(rot / 15.0) * 15.0
+            item.set_geom(d["pos0"].x(), d["pos0"].y(), sx0, sy0, ((rot + 180) % 360) - 180)
+        else:
+            c = item._rect.center()
+            a, h = d["loc"][d["opp"]], d["loc"][name]
+            cr, sr = math.cos(math.radians(rot0)), math.sin(math.radians(rot0))
+            # the mouse in the item's own (stretched, not rotated) frame, relative to the centre
+            rx, ry = m.x() - d["pos0"].x() - c.x(), m.y() - d["pos0"].y() - c.y()
+            vx, vy = rx * cr + ry * sr, -rx * sr + ry * cr
+            fa0 = (sx0 * (a.x() - c.x()), sy0 * (a.y() - c.y()))
+            fh0 = (sx0 * (h.x() - c.x()), sy0 * (h.y() - c.y()))
+            sx, sy = sx0, sy0
+            if name in ("l", "r"):
+                sx = (vx - fa0[0]) / (h.x() - a.x())
+            elif name in ("t", "b"):
+                sy = (vy - fa0[1]) / (h.y() - a.y())
+            else:
+                ex, ey = fh0[0] - fa0[0], fh0[1] - fa0[1]
+                k = ((vx - fa0[0]) * ex + (vy - fa0[1]) * ey) / max(ex * ex + ey * ey, 1e-9)
+                sx, sy = sx0 * k, sy0 * k
+            sx, sy = min(max(sx, 0.05), 30.0), min(max(sy, 0.05), 30.0)
+            fa1 = (sx * (a.x() - c.x()), sy * (a.y() - c.y()))
+            dx, dy = fa0[0] - fa1[0], fa0[1] - fa1[1]          # keep the opposite edge where it was
+            item.set_geom(d["pos0"].x() + dx * cr - dy * sr, d["pos0"].y() + dx * sr + dy * cr, sx, sy, rot0)
+        self.scene().item_geometry_changed(item)
+
+    def _draw_edit_handles(self, painter):
+        item = self._edit_target()
+        if item is None or not item.movable:
+            return
+        pts, _ = self._edit_points(item)
+        k = self._k()
+        hs = self.EDIT_PX * k
+        pen = QPen(QColor("#2f7bff"), 1)
+        pen.setCosmetic(True)
+        painter.setPen(pen)
+        painter.drawLine(pts["t"], pts["rot"])
+        painter.setBrush(QColor("#ffffff"))
+        for name in ("tl", "t", "tr", "r", "br", "b", "bl", "l"):
+            p = pts[name]
+            painter.drawRect(QRectF(p.x() - hs, p.y() - hs, 2 * hs, 2 * hs))
+        painter.setBrush(QColor("#2f7bff"))
+        painter.drawEllipse(pts["rot"], hs * 1.2, hs * 1.2)
+
+    def keyPressEvent(self, e):
+        if e.key() in (Qt.Key_Delete, Qt.Key_Backspace) and not e.modifiers():
+            self.deleteRequested.emit()
+            e.accept()
+            return
+        super().keyPressEvent(e)
+
     # -- sync heat map (editor only: it is never part of the video) ------------------------------------------
     def set_heat(self, strips):
         """`strips`: [(QRectF, [(position 0..1, confidence 0..1), ...])] or None to switch the overlay off."""
@@ -526,9 +606,10 @@ class EditorView(QGraphicsView):
                 painter.setCompositionMode(QPainter.CompositionMode_Multiply)
                 painter.fillRect(r, g)
                 painter.restore()
+        _hq(painter)
+        self._draw_edit_handles(painter)
         if self.cam is None:
             return
-        _hq(painter)
         cx, cy, w, h, rot = self.cam
         poly = QPolygonF([self._to_scene(-w / 2, -h / 2), self._to_scene(w / 2, -h / 2),
                           self._to_scene(w / 2, h / 2), self._to_scene(-w / 2, h / 2)])
@@ -559,6 +640,12 @@ class EditorView(QGraphicsView):
             self.setCursor(Qt.ClosedHandCursor)
             return
         if e.button() == Qt.LeftButton:
+            item = self._edit_target()
+            if item is not None:
+                name = self._edit_hit(item, e.position())
+                if name:
+                    self._edit_begin(item, name, e.position())
+                    return
             hit = self._hit(e.position())
             if hit and self.cam is not None:
                 if hit == "move" and any(isinstance(i, SvgItem) and i.isSelected()
@@ -578,6 +665,17 @@ class EditorView(QGraphicsView):
             self.horizontalScrollBar().setValue(self.horizontalScrollBar().value() - int(d.x()))
             self.verticalScrollBar().setValue(self.verticalScrollBar().value() - int(d.y()))
             return
+        if self._edit:
+            self._edit_move(e.position(), bool(e.modifiers() & Qt.ShiftModifier))
+            return
+        item = self._edit_target()
+        if item is not None and not self._drag:
+            name = self._edit_hit(item, e.position())
+            if name:
+                self.setCursor({"rot": Qt.CrossCursor, "tl": Qt.SizeFDiagCursor, "br": Qt.SizeFDiagCursor,
+                                "tr": Qt.SizeBDiagCursor, "bl": Qt.SizeBDiagCursor, "t": Qt.SizeVerCursor,
+                                "b": Qt.SizeVerCursor, "l": Qt.SizeHorCursor, "r": Qt.SizeHorCursor}[name])
+                return
         if self._drag:
             pend = self._drag.get("pending")
             if pend is not None:
@@ -595,6 +693,10 @@ class EditorView(QGraphicsView):
         if self._panning is not None:
             self._panning = None
             self.setCursor(Qt.ArrowCursor)
+            return
+        if self._edit:
+            self._edit = None
+            self.scene().item_edit_finished()
             return
         if self._drag:
             pend = self._drag.get("pending")

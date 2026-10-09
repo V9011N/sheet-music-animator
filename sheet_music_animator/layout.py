@@ -30,6 +30,7 @@ def relayout_project(project: Project, old: Score, new: Score) -> None:
     project.overrides = {tr(u): v for u, v in project.overrides.items() if tr(u) is not None}
     project.timed = {tr(u) for u in project.timed if tr(u) is not None}
     project.transforms = {tr(u): v for u, v in project.transforms.items() if tr(u) is not None}
+    project.deleted = {tr(u) for u in project.deleted if tr(u) is not None}
     if not project.keys_edited or not old.measure_infos or not new.measure_infos:
         project.channels.update(auto_camera(new, project.settings))
         project.keys_edited = False

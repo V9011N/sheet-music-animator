@@ -89,8 +89,10 @@ NORM_FLOOR = 0.25      # frames quieter than this fraction of the typical frame 
 PENALTY = 0.12         # extra cost of advancing only one of the two sequences
 START_SLACK = 0.0      # seconds the first note may come after the start of the (trimmed) recording
 START_PENALTY = 0.3    # cost per second of that delay
-OPEN_END = False       # let the recording go on after the last note
-END_PENALTY = 0.25
+OPEN_END = False       # (coarse stage) the whole recording is matched; the fine stage ends openly, inside a corridor
+END_PENALTY = 3.0
+END_SPAN = 8.0         # seconds at the end of the score whose corridor is widened...
+END_CORRIDOR = 4.0     # ...to this many seconds either side: a long held final chord rings on past its written length
 CORRIDOR = 1.5         # seconds either side of the coarse path searched by the fine alignment
 
 
@@ -146,11 +148,12 @@ def score_features(notes, fps: int, length: float) -> np.ndarray:
 
 
 # ------------------------------------------------------------------------------------ DTW
-def _dtw(X, Y, lo, hi, penalty=None, fps=50):
+def _dtw(X, Y, lo, hi, penalty=None, fps=50, open_end=None):
     """Dynamic time warping of rows of X against rows of Y inside the window [lo[i], hi[i]) of every row.
     Cost is cosine distance; stepping along only one sequence costs `penalty` extra.  Returns, for every
     row of X, the (float) column it is matched to."""
     penalty = PENALTY if penalty is None else penalty
+    open_end = OPEN_END if open_end is None else open_end
     n, m = len(X), len(Y)
     Ds = []
     prev, plo = None, 0
@@ -175,7 +178,7 @@ def _dtw(X, Y, lo, hi, penalty=None, fps=50):
     i = n - 1
     a = int(lo[i])
     tail = np.maximum(m - 1 - np.arange(a, int(hi[i])), 0)
-    j = a + int(np.argmin(Ds[i] + (END_PENALTY * penalty * tail if OPEN_END else np.where(tail > 0, np.inf, 0))))
+    j = a + int(np.argmin(Ds[i] + (END_PENALTY * penalty * tail if open_end else np.where(tail > 0, np.inf, 0))))
     cols = [[] for _ in range(n)]
     cols[i].append(j)
     pen = np.float32(penalty)
@@ -269,35 +272,36 @@ def align_score(notes, audio_path: str, progress=None, refine: bool = True) -> A
     Xf, Yf = score_features(shifted, ff, ls), audio_features(ya, ff)
     nx, ny = len(Xf), len(Yf)
     centre = np.interp(np.arange(nx) / ff, np.arange(nxc) / fc, wc / fc) * ff
-    r = int(CORRIDOR * ff)
+    r = np.full(nx, int(CORRIDOR * ff))
+    r[max(nx - int(END_SPAN * ff), 0):] = int(END_CORRIDOR * ff)   # the last seconds: the final chord may ring on
     lo = np.maximum.accumulate(np.clip(np.round(centre - r), 0, ny - 1)).astype(int)
     hi = np.maximum.accumulate(np.clip(np.round(centre + r) + 1, 1, ny)).astype(int)
     lo[0] = 0
-    if not OPEN_END:
-        hi[-1] = ny
-    wf = _fill(_dtw(Xf, Yf, lo, hi, fps=ff))
+    wf = _fill(_dtw(Xf, Yf, lo, hi, fps=ff, open_end=True))
     wf = np.maximum.accumulate(wf) / ff                                  # recording time of each score frame
 
     onsets = np.unique(np.round([n[1] - s0 for n in notes], 4))
     est = np.interp(onsets, np.arange(nx) / ff, wf)
     shifts = np.zeros(len(onsets))
-    strength = np.zeros(len(onsets))
+    strength = clarity = np.zeros(len(onsets))
     est_dtw = est.copy()
     if refine:
         say(0.7, "Snapping notes to their attacks…")
-        est2, strength = _refine(ya, shifted, onsets, est)   # strength: attack specificity
+        est2, strength, clarity = _refine(ya, shifted, onsets, est)
         shifts = est2 - est
         est = est2
     est = np.maximum.accumulate(est)
     est += np.arange(len(est)) * 1e-5                                    # strictly increasing
     say(0.9, "Judging the fit…")
-    conf, evidence = onset_confidence(Xf, Yf, wf, onsets, est, shifts, strength, ff)
+    conf, evidence = onset_confidence(Xf, Yf, wf, onsets, est, shifts, strength, clarity, ff)
     say(1.0, "Done")
     return Alignment(onsets + s0, est + a0, shifts, conf, evidence)
 
 
 # ------------------------------------------------------------------------------------ confidence
 ATTACK_FLOOR, ATTACK_FULL = 1.5, 2.6        # attack specificity (onset energy in the note's bins vs the average bin) that counts as unmistakable
+CLEAR_FLOOR, CLEAR_FULL = 1.8, 4.0   # broadband attack clarity (z-score against the surrounding seconds)
+CLEAR_NEEDS_MATCH = 0.6      # match (0..1) at which a clear attack counts in full
 MATCH_FULL = 0.13        # how far the fit's similarity must stand above that of unrelated moments to be fully convincing
 MATCH_DECOYS = (-4.0, -2.5, -1.2, 1.2, 2.5, 4.0)   # seconds the recording is shifted by for the comparison
 SIM_WINDOW = 0.15        # seconds after the onset over which the match is averaged
@@ -308,10 +312,11 @@ SNAP_SPAN = 0.30
 CONF_WEIGHTS = {"attack": 0.40, "match": 0.35, "steady": 0.15, "snap": 0.10}
 
 
-def onset_confidence(Xf, Yf, wf, onsets, est, shifts, strength, ff):
+def onset_confidence(Xf, Yf, wf, onsets, est, shifts, strength, clarity, ff):
     """How sure the alignment is about every onset (0..1), from four independent kinds of evidence:
 
-    * attack  - did an attack that is specific to the note's own pitches turn up where it was placed?
+    * attack  - did an attack turn up where the note was placed: one specific to the note's own pitches, or
+                simply an unmistakable event (big chords after a rest)?
     * match   - does the recording sound like the score around that moment (pitch content, along the path)?
     * steady  - is the local tempo believable compared with the notes around it (no sudden lurches)?
     * snap    - did the attack search agree with the coarse alignment, or did it have to drag the note far?
@@ -342,6 +347,9 @@ def onset_confidence(Xf, Yf, wf, onsets, est, shifts, strength, ff):
             sim_raw[k] = float(np.mean(sim[i:i + w][m]))
     match_c = np.clip(match / MATCH_FULL, 0, 1)
     attack_c = np.clip((strength - ATTACK_FLOOR) / (ATTACK_FULL - ATTACK_FLOOR), 0, 1)
+    clear_c = np.clip((clarity - CLEAR_FLOOR) / (CLEAR_FULL - CLEAR_FLOOR), 0, 1)
+    # an attack that merely stands out counts only where the recording also sounds like the score there
+    attack_c = np.maximum(attack_c, clear_c * np.clip(match_c / CLEAR_NEEDS_MATCH, 0, 1))
 
     steady_c = np.ones(n)
     if n > 2:
@@ -358,9 +366,9 @@ def onset_confidence(Xf, Yf, wf, onsets, est, shifts, strength, ff):
     return np.clip(conf, 0, 1), ev
 
 
-LOST_BELOW = 0.35        # a note this unsure counts as lost
-MILD_WEIGHT = 0.35       # how much general, diffuse uncertainty weighs...
-LOST_WEIGHT = 1.5        # ...against the share of notes that were lost (a few bad bars matter more)
+LOST_BELOW = 0.4         # a note this unsure counts as lost
+MILD_WEIGHT = 0.4        # how much general, diffuse uncertainty weighs...
+LOST_WEIGHT = 1.2        # ...against the share of notes that were lost (a few bad bars matter more)
 
 
 def overall_confidence(conf) -> float:
@@ -381,7 +389,7 @@ def overall_confidence(conf) -> float:
 
 SNAP_WINDOW = 0.55       # how far (s) from the DTW estimate an attack may be taken in dense music...
 SNAP_SPARSE = 2.5        # ...and this many times the gap to the neighbouring notes in sparse music (a long pause)
-SNAP_MAX = 1.6
+SNAP_MAX = 3.0
 SNAP_CANDIDATES = 10
 SNAP_FREE_RATIO = 2.2    # an interval between two notes may differ from the DTW's by this factor at no cost
 SNAP_RATIO_COST = 1.5
@@ -470,4 +478,15 @@ def _refine(ya, notes, onsets, est):
         own = [b for b in bins if b < top]      # harmonics above the compared range do not count
         if own and len(seg):
             spec[k] = float(seg[:, own].mean() / (seg.mean() + 1e-6))
-    return final, spec
+    # How clear is the attack as an event?  The broadband onset energy there against the typical one of the
+    # surrounding seconds.  Pitch specificity says little in sparse, heavy passages (a big chord lights up
+    # every bin), but there an attack stands out as an event on its own.
+    bf = flux[:, 5:top].sum(axis=1)
+    clarity = np.zeros(n)
+    w = int(1.5 * fps)
+    for k, t in enumerate(final):
+        f = int(round(t * fps))
+        loc = bf[max(f - w, 0):f + w]
+        if len(loc) > 10:
+            clarity[k] = (bf[max(f - 2, 0):f + 3].max() - np.median(loc)) / (loc.std() + 1e-9)
+    return final, spec, clarity

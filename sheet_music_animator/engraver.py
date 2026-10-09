@@ -605,7 +605,7 @@ def beam_conflicts(path) -> dict:
     return out
 
 
-_BEAM_KEEP = {"beam", "tuplet", "note", "chord", "rest", "accid", "artic", "dot"}
+_BEAM_KEEP = {"beam", "tuplet", "note", "chord", "rest", "accid", "artic", "dot", "clef"}   # clef: a change inside the measure
 _EVENTS = ("note", "chord", "rest")
 
 
@@ -629,10 +629,16 @@ def _regroup_beams(root, conflicts) -> bool:
             tuplets = list(layer.iter(f"{{{MEI_NS}}}tuplet"))
             if any(t.get("num.visible") != "false" or t.get("bracket.visible") != "false" for t in tuplets):
                 continue
-            events = []
-            for e in layer.iter(*(f"{{{MEI_NS}}}{t}" for t in _EVENTS)):
-                if etree.QName(e.getparent()).localname != "chord":
-                    events.append(e)
+            items = []      # events and clef changes, in order
+            for e in layer.iter():
+                if not isinstance(e.tag, str):
+                    continue
+                name = etree.QName(e).localname
+                if name in _EVENTS and etree.QName(e.getparent()).localname != "chord":
+                    items.append(e)
+                elif name == "clef":
+                    items.append(e)
+            events = [e for e in items if etree.QName(e).localname in _EVENTS]
             if len(events) != len(states):
                 continue
             for e in events:     # the tuplet ratio moves onto the notes
@@ -640,12 +646,17 @@ def _regroup_beams(root, conflicts) -> bool:
                 if ratio:
                     e.set("num", str(ratio[0][0]))
                     e.set("numbase", str(ratio[0][1]))
-            for e in events:
+            for e in items:
                 e.getparent().remove(e)
             for e in list(layer):
                 layer.remove(e)
+            state = dict(zip(map(id, events), states))
             cur = None
-            for e, st in zip(events, states):
+            for e in items:
+                st = state.get(id(e), "clef")
+                if st == "clef":
+                    (cur if cur is not None else layer).append(e)
+                    continue
                 if st == "begin" or (st in ("continue", "end") and cur is None):
                     cur = etree.SubElement(layer, f"{{{MEI_NS}}}beam")
                 (cur if cur is not None else layer).append(e)

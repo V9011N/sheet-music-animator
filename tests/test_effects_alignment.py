@@ -115,6 +115,20 @@ class TestAlignment(unittest.TestCase):
         self.assertLess(np.median(err), 0.04)
         self.assertLess(err.max(), 0.08)                           # every note, including the one after the pause
 
+    def test_a_held_final_chord_does_not_drag_the_ending_late(self):
+        """The recording rings on for seconds after the last attack (a fermata): the last notes must still be
+        found at their attacks, not stretched over the ring."""
+        tmp = Path(tempfile.mkdtemp())
+        score = build_score(make_project(tmp))
+        warp = lambda t: 1.1 * t + 0.4 * np.sin(t / 3.0) + 0.5                              # noqa: E731
+        last = max(n[2] for n in score.nominal_notes)
+        notes = [(p, warp(a), warp(b) + (6.0 if b >= last - 0.01 else 0.0), v) for p, a, b, v in score.nominal_notes]
+        wav = tmp / "fermata.wav"
+        audio.write_wav(wav, audio.synthesize(notes, warp(score.duration) + 6.0))
+        al = analysis.align_score(score.nominal_notes, str(wav))
+        err = np.abs(al.actual - np.array([warp(x) for x in al.nominal]))
+        self.assertLess(err.max(), 0.1)
+
     def test_loudness_follows_the_music(self):
         tmp = Path(tempfile.mkdtemp())
         notes = [(60, 0.0, 1.0, 120), (60, 2.0, 3.0, 30)]
