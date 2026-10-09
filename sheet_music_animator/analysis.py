@@ -96,6 +96,7 @@ END_COST = 1.0         # (fine stage) cost of every frame of the recording left 
 END_SPAN = 4.0         # seconds at the end of the score whose corridor is widened...
 END_CORRIDOR = 4.0     # ...to this many seconds either side: a long held final chord rings on past its written length
 CORRIDOR = 1.5         # seconds either side of the coarse path searched by the fine alignment
+PULL = 0.05            # (fine stage) cost per frame and second of lying away from the coarse path
 
 
 def _unit_rows(x: np.ndarray, floor: float = 0.0) -> np.ndarray:
@@ -150,14 +151,15 @@ def score_features(notes, fps: int, length: float) -> np.ndarray:
 
 
 # ------------------------------------------------------------------------------------ DTW
-def _dtw(X, Y, lo, hi, penalty=None, fps=50, open_end=None):
+def _dtw(X, Y, lo, hi, penalty=None, fps=50, open_end=None, centre=None, pull=0.0):
     """Dynamic time warping of rows of X against rows of Y inside the window [lo[i], hi[i]) of every row.
     Cost is cosine distance; stepping along only one sequence costs `penalty` extra.  A diagonal step counts
     its cell DIAG_WEIGHT times (the symmetric form): otherwise a path that takes more steps -- one that lets a
     passage last longer or shorter in the recording than in the score -- collects more cells and pays the
     typical mismatch of a cell (about 0.6 in dense, pedalled music) on top of `penalty` for every step it
-    deviates, which squeezes slow passages and drags fast ones.  Returns, for every row of X, the (float)
-    column it is matched to."""
+    deviates, which squeezes slow passages and drags fast ones.  With `centre` (a column for every row) each
+    cell also costs `pull` per second it lies away from it.  Returns, for every row of X, the (float) column it
+    is matched to."""
     penalty = PENALTY if penalty is None else penalty
     open_end = OPEN_END if open_end is None else open_end
     n, m = len(X), len(Y)
@@ -166,6 +168,8 @@ def _dtw(X, Y, lo, hi, penalty=None, fps=50, open_end=None):
     for i in range(n):
         a, b = int(lo[i]), int(hi[i])
         c = (1.0 - Y[a:b] @ X[i]).astype(np.float64)
+        if pull:
+            c += pull * np.abs(np.arange(a, b) - centre[i]) / fps
         if prev is None:
             q = np.full(b - a, np.inf)
             if a == 0:                                         # the first note may sound a little after the recording starts
@@ -195,7 +199,8 @@ def _dtw(X, Y, lo, hi, penalty=None, fps=50, open_end=None):
             pa = int(lo[i - 1])
             Dp = Ds[i - 1]
             if j - 1 >= pa and j - 1 - pa < len(Dp) and j - 1 >= 0:
-                extra = (DIAG_WEIGHT - 1.0) * (1.0 - float(Y[j] @ X[i]))   # the diagonal step's cell counts again
+                cell = 1.0 - float(Y[j] @ X[i]) + (pull * abs(j - centre[i]) / fps if pull else 0.0)
+                extra = (DIAG_WEIGHT - 1.0) * cell                 # the diagonal step's cell counts again
                 best, step = Dp[j - 1 - pa] + extra, (-1, -1)
             if pa <= j < pa + len(Dp) and Dp[j - pa] + pen < best:
                 best, step = Dp[j - pa] + pen, (-1, 0)
@@ -284,7 +289,7 @@ def align_score(notes, audio_path: str, progress=None, refine: bool = True) -> A
     lo = np.maximum.accumulate(np.clip(np.round(centre - r), 0, ny - 1)).astype(int)
     hi = np.maximum.accumulate(np.clip(np.round(centre + r) + 1, 1, ny)).astype(int)
     lo[0] = 0
-    wf = _fill(_dtw(Xf, Yf, lo, hi, fps=ff, open_end=True))
+    wf = _fill(_dtw(Xf, Yf, lo, hi, fps=ff, open_end=True, centre=centre, pull=PULL))
     wf = np.maximum.accumulate(wf) / ff                                  # recording time of each score frame
 
     onsets = np.unique(np.round([n[1] - s0 for n in notes], 4))
