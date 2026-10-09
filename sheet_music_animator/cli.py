@@ -59,8 +59,10 @@ def render(args) -> int:
         al = analysis.align_score(score.nominal_notes, s.audio,
                                   lambda f, text="": print(f"  {100 * f:3.0f}% {text}", flush=True) or True)
         project.time_map, s.align_audio = al.points(), s.audio
+        project.sync_conf, project.sync_overall = al.heat(), al.overall
         score = build_score(project)
         print(f"  score now lasts {score.duration:.1f} s ({len(al.nominal)} note positions fitted)")
+        print(f"  audio synced with {al.overall * 100:.0f}% confidence")
     if args.look:
         key = args.look
         if key not in looks.BUILTIN and not key.startswith(("user:", "file:")):

@@ -11,7 +11,9 @@ from PySide6.QtWidgets import QApplication, QCheckBox, QFrame, QHBoxLayout, QLab
 
 SAMPLE = Path(__file__).with_name("sample.musicxml")
 ACCENT = "#ff9f1c"
-PAD = 6          # space between the spotlighted control and the dimmed area
+PAD = 2          # space between the spotlighted control and the dimmed area.  Keep it small: the spotlight is
+                 # also the part that reacts to the mouse, and a wide margin would light up slivers of the
+                 # neighbouring controls (hover highlights) that are otherwise dimmed.
 CARD_W = 380
 
 
@@ -92,7 +94,6 @@ class Tour(QWidget):
         self.esc = QShortcut(QKeySequence("Esc"), win)
         self.esc.setEnabled(False)
         self.esc.activated.connect(lambda: self.stop(finished=False))
-        win.installEventFilter(self)
 
     # -- lifecycle ---------------------------------------------------------------------------------
     @property
@@ -105,6 +106,7 @@ class Tour(QWidget):
         self.show()
         self.raise_()
         self.esc.setEnabled(True)
+        QApplication.instance().installEventFilter(self)   # to follow the window and silence tooltips
         self.poll.start()
         self.go(0)
 
@@ -112,12 +114,17 @@ class Tour(QWidget):
         self._disconnect()
         self.poll.stop()
         self.esc.setEnabled(False)
+        QApplication.instance().removeEventFilter(self)
         self.hide()
         self.win.cfg.setValue("tour_done", "false" if self.chk_again.isChecked() else "true")
         self.win.editor.viewport().update()
 
     def eventFilter(self, obj, ev):
-        if obj is self.win and ev.type() in (QEvent.Resize, QEvent.Move) and self.isVisible():
+        if not self.isVisible():
+            return False
+        if ev.type() == QEvent.ToolTip:     # a tooltip over the spotlight only gets in the way of the guide
+            return True
+        if obj is self.win and ev.type() in (QEvent.Resize, QEvent.Move):
             self.setGeometry(self.win.rect())
             self._refresh(force=True)
         return False
@@ -367,6 +374,13 @@ def build_steps(win) -> list[Step]:
           "This is the whole score as empty staves. Scroll to move around, <b>Ctrl+wheel</b> to zoom "
           "(or middle-drag to pan), and press <b>F</b> or <b>Fit sheet</b> to see everything. The notes appear "
           "when you play.", target=lambda: win.editor),
+        S("Fit the score to a recording",
+          "The flagship feature. <b>Fit Score to Recording…</b> listens to a recording of the piece and moves "
+          "every note of the score to where it is played, so the animation lands exactly on the sound (the "
+          "recording becomes the soundtrack, and your keyframes move along). When it finishes it tells you how "
+          "confident it is, and <b>Sync Heat Map</b> colours the score green where the sync is sure of itself and "
+          "red where it is not. <b>Use the Score's Own Timing</b> goes back.",
+          target=[act(win.a_align), act(win.a_unalign), act(win.a_heat)]),
         S("The camera window",
           "The orange rectangle is what the video will show. <b>Drag it</b> to move it, drag a corner to "
           "resize it, drag the round handle above it to rotate it (hold Shift to snap).<br><br>Try moving it "
@@ -394,7 +408,8 @@ def build_steps(win) -> list[Step]:
         S("Camera settings",
           "Exact numbers for the camera live here. Switch <b>Auto keyframe</b> off to move the camera without "
           "creating keys, or press <b>Follow music</b> to build a whole camera path that tracks the notes and "
-          "glides from line to line.", tab=lambda: win.tab_camera, target=tabs_and_panel,
+          "glides from line to line. <b>Lead / lag</b> sets how far ahead of (or behind) the playing notes "
+          "that camera sits.", tab=lambda: win.tab_camera, target=tabs_and_panel,
           setup=flagged(lambda: win.btn_follow.clicked)),
         S("Appear instantly or fade in",
           "Under <b>Look &amp; timing</b>, <b>Note reveal</b> chooses whether notes pop in or fade in. Switch it "
@@ -442,8 +457,7 @@ def build_steps(win) -> list[Step]:
           setup=flagged(lambda: win.fx_panel.chk_enabled.toggled)),
         S("Output",
           "Choose the resolution and frame rate, and the audio: a built-in piano synth, your own recording, or "
-          "none (<b>Fit the score to a recording…</b> even moves every note to where it is played in a "
-          "recording). <b>Render video…</b> writes the MP4 of everything the camera sees; <b>Save current "
+          "none. <b>Render video…</b> writes the MP4 of everything the camera sees; <b>Save current "
           "frame as PNG…</b> grabs a single still.", tab=lambda: win.tab_output, target=tabs_and_panel),
         S("Save your project",
           "<b>Save project</b> (Ctrl+S) stores the camera keys, timing, hidden items, moved elements and line "

@@ -209,9 +209,22 @@ class Alignment:
     nominal: np.ndarray       # score seconds (anchor points)
     actual: np.ndarray        # matching seconds in the recording
     shifts: np.ndarray        # how far the refinement moved each onset from the DTW estimate (s)
+    confidence: np.ndarray | None = None   # 0..1 per anchor point: how sure the algorithm is about it
+    evidence: dict | None = None           # the separate measures the confidence is made of (per anchor)
 
     def points(self) -> list:
         return [[round(float(a), 4), round(float(b), 4)] for a, b in zip(self.nominal, self.actual)]
+
+    @property
+    def overall(self) -> float:
+        """The headline confidence, 0..1 (see `overall_confidence`)."""
+        return overall_confidence(self.confidence)
+
+    def heat(self) -> list:
+        """[[recording seconds, confidence 0..1], ...] for the heat map over the score."""
+        if self.confidence is None:
+            return []
+        return [[round(float(a), 4), round(float(c), 4)] for a, c in zip(self.actual, self.confidence)]
 
 
 SILENCE = 0.02       # frames quieter than this fraction of the loudest one count as silence at the ends
@@ -268,15 +281,91 @@ def align_score(notes, audio_path: str, progress=None, refine: bool = True) -> A
     onsets = np.unique(np.round([n[1] - s0 for n in notes], 4))
     est = np.interp(onsets, np.arange(nx) / ff, wf)
     shifts = np.zeros(len(onsets))
+    strength = np.zeros(len(onsets))
+    est_dtw = est.copy()
     if refine:
         say(0.7, "Snapping notes to their attacks…")
-        est2 = _refine(ya, shifted, onsets, est)
+        est2, strength = _refine(ya, shifted, onsets, est)   # strength: attack specificity
         shifts = est2 - est
         est = est2
     est = np.maximum.accumulate(est)
     est += np.arange(len(est)) * 1e-5                                    # strictly increasing
+    say(0.9, "Judging the fit…")
+    conf, evidence = onset_confidence(Xf, Yf, wf, onsets, est, shifts, strength, ff)
     say(1.0, "Done")
-    return Alignment(onsets + s0, est + a0, shifts)
+    return Alignment(onsets + s0, est + a0, shifts, conf, evidence)
+
+
+# ------------------------------------------------------------------------------------ confidence
+ATTACK_FULL = 3.0        # attack specificity (onset energy in the note's bins vs the average bin) that counts as unmistakable
+MATCH_FULL = 0.16        # how far the fit's similarity must stand above that of unrelated moments to be fully convincing
+MATCH_DECOYS = (-4.0, -2.5, -1.2, 1.2, 2.5, 4.0)   # seconds the recording is shifted by for the comparison
+SIM_WINDOW = 0.15        # seconds after the onset over which the match is averaged
+STEADY_FREE = 0.7        # a note's tempo may differ from its neighbours' by e^0.7 = 2x at no cost
+STEADY_SPAN = 0.9
+SNAP_FREE = 0.10         # snapping an onset by less than this (s) says nothing against it
+SNAP_SPAN = 0.30
+CONF_WEIGHTS = {"attack": 0.40, "match": 0.35, "steady": 0.15, "snap": 0.10}
+
+
+def onset_confidence(Xf, Yf, wf, onsets, est, shifts, strength, ff):
+    """How sure the alignment is about every onset (0..1), from four independent kinds of evidence:
+
+    * attack  - did an attack that is specific to the note's own pitches turn up where it was placed?
+    * match   - does the recording sound like the score around that moment (pitch content, along the path)?
+    * steady  - is the local tempo believable compared with the notes around it (no sudden lurches)?
+    * snap    - did the attack search agree with the coarse alignment, or did it have to drag the note far?
+    Also returns the four components."""
+    n = len(onsets)
+    ny = len(Yf)
+    cols = np.clip(np.round(wf * ff).astype(int), 0, ny - 1)
+    has = np.linalg.norm(Xf, axis=1) > 1e-6           # frames where the score has something to say
+
+    def frame_sim(c):
+        out = np.full(len(Xf), -1.0)
+        for d in (-2, -1, 0, 1, 2):                   # a couple of frames of slack either way
+            out = np.maximum(out, np.einsum("ij,ij->i", Yf[np.clip(c + d, 0, ny - 1)], Xf))
+        return out
+
+    sim = frame_sim(cols)
+    # what the same score frames would match if the recording were somewhere else: the typical similarity
+    # of unrelated moments.  A fit is convincing when it stands out from that.
+    base = np.mean([frame_sim(np.clip(cols + int(round(o * ff)), 0, ny - 1)) for o in MATCH_DECOYS], axis=0)
+    w = max(int(SIM_WINDOW * ff), 1)
+    match = np.zeros(n)
+    sim_raw = np.zeros(n)
+    for k, t in enumerate(onsets):
+        i = int(round(t * ff))
+        m = has[i:i + w]
+        if m.any():
+            match[k] = float(np.mean((sim - base)[i:i + w][m]))
+            sim_raw[k] = float(np.mean(sim[i:i + w][m]))
+    match_c = np.clip(match / MATCH_FULL, 0, 1)
+    attack_c = np.clip((strength - 1.0) / (ATTACK_FULL - 1.0), 0, 1)
+
+    steady_c = np.ones(n)
+    if n > 2:
+        gaps = np.diff(onsets)
+        r = np.diff(est) / np.maximum(gaps, 1e-3)
+        lr = np.log(np.clip(r, 1e-3, 1e3))
+        med = np.array([np.median(lr[max(0, i - 6):i + 7]) for i in range(len(lr))])
+        g = np.clip(1 - np.maximum(np.abs(lr - med) - STEADY_FREE, 0) / STEADY_SPAN, 0, 1)
+        steady_c = np.minimum(np.r_[g, g[-1]], np.r_[g[0], g])
+    snap_c = np.clip(1 - np.maximum(np.abs(shifts) - SNAP_FREE, 0) / SNAP_SPAN, 0, 1)
+    conf = (CONF_WEIGHTS["attack"] * attack_c + CONF_WEIGHTS["match"] * match_c +
+            CONF_WEIGHTS["steady"] * steady_c + CONF_WEIGHTS["snap"] * snap_c)
+    ev = {"attack": attack_c, "match": match_c, "steady": steady_c, "snap": snap_c, "sim": sim_raw, "margin": match}
+    return np.clip(conf, 0, 1), ev
+
+
+def overall_confidence(conf) -> float:
+    """One number (0..1) for the whole fit: the average confidence of the notes, minus half the share of notes
+    that are plainly lost (confidence under 0.5) -- a few notes that were not found matter, but a quiet bass
+    note with a weak attack should not drag a good fit down."""
+    if conf is None or len(conf) == 0:
+        return 0.0
+    c = np.asarray(conf, float)
+    return float(np.clip(c.mean() - 0.5 * np.mean(c < 0.5), 0, 1))
 
 
 SNAP_WINDOW = 0.55       # how far (s) from the DTW estimate an attack may be taken in dense music...
@@ -308,6 +397,7 @@ def _refine(ya, notes, onsets, est):
     gaps = np.diff(onsets)
     room = np.minimum(np.r_[np.inf, gaps], np.r_[gaps, np.inf])        # distance to the nearest neighbouring onset
     cands = []     # per onset: (times, strengths); the DTW estimate is always one of them
+    own_bins = []  # per onset: the spectrum bins of its notes' pitches (for judging the attack afterwards)
     for (t, e), rm in zip(zip(onsets, est), room):
         win = float(np.clip(SNAP_SPARSE * rm, SNAP_WINDOW, SNAP_MAX))
         bins = []
@@ -317,6 +407,7 @@ def _refine(ya, notes, onsets, est):
                 b = int(round(f0 * h / binhz))
                 if 1 <= b < nb - 1:
                     bins += [b - 1, b, b + 1]
+        own_bins.append(bins)
         a, b = max(int((e - win) * fps), 1), min(int((e + win) * fps) + 1, len(flux) - 1)
         if not bins or b - a < 5:
             cands.append((np.array([e]), np.array([0.0])))
@@ -356,4 +447,15 @@ def _refine(ya, notes, onsets, est):
     for k in range(n - 2, -1, -1):
         idx.append(int(back[k][idx[-1]]))
     idx.reverse()
-    return np.array([cands[k][0][idx[k]] for k in range(n)])
+    final = np.array([cands[k][0][idx[k]] for k in range(n)])
+    # How specific is the attack at the chosen moment?  The onset energy in the note's own bins against the
+    # average onset energy of the pitch range: about 1 for an unrelated moment (or noise), well above for a
+    # note that really starts there.
+    top = min(int(4000.0 / binhz), nb)
+    spec = np.zeros(n)
+    for k, (t, bins) in enumerate(zip(final, own_bins)):
+        f = int(round(t * fps))
+        seg = flux[max(f - 2, 0):f + 3, :top]
+        if bins and len(seg):
+            spec[k] = float(seg[:, bins].mean() / (seg.mean() + 1e-6))
+    return final, spec

@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (QApplication, QCheckBox, QColorDialog, QComboBox,
                                QSplitter, QTabWidget, QToolBar, QVBoxLayout, QWidget)
 
 from . import analysis, audio
+from .engraver import NOTE_KINDS, REST_KINDS
 from .build import build_score
 from .effects_ui import EffectsPanel
 from .export import (EffectsRenderer, default_workers, effect_loudness, render_frame, render_video,
@@ -264,6 +265,14 @@ class MainWindow(QMainWindow):
         self.sp_follow.setToolTip("Width of the camera used by 'Follow music' (about 200 units per staff space)")
         self.sp_follow.valueChanged.connect(self._settings_changed)
         f.addRow("Follow-music width", self.sp_follow)
+        self.sp_lead = spin(-50, 50, 5, 0, " %")
+        self.sp_lead.setToolTip("Where 'Follow music' puts the camera relative to the notes being played, as a share "
+                                "of the frame width.\n0 % centres the playing notes; positive values lead the music "
+                                "(the camera shows what is coming: +25 % puts the playing notes in the left quarter); "
+                                "negative values lag behind it.")
+        self.sp_lead.valueChanged.connect(self._settings_changed)
+        self.sp_lead.valueChanged.connect(self._follow_changed)
+        f.addRow("Follow-music lead (+) / lag (−)", self.sp_lead)
         row = QHBoxLayout()
         for text, fn in (("Add keys here", lambda: self.add_key_at(None, self.t)),
                          ("Delete keys", self.timeline.delete_selected),
@@ -358,19 +367,9 @@ class MainWindow(QMainWindow):
         f.addRow("Frame rate", self.cb_fps)
         f.addRow("Audio", self.cb_audio)
         f.addRow("", self.lbl_audio)
-        self.btn_align = QPushButton("Fit the score to a recording…")
-        self.btn_align.setToolTip("Listens to a recording of the piece and moves every note of the score to where it "
-                                  "is played, so lit-up notes and effects land on the sound.")
-        self.btn_align.clicked.connect(self.align_to_recording)
-        self.btn_unalign = QPushButton("Use the score's own timing")
-        self.btn_unalign.clicked.connect(self.remove_alignment)
         self.lbl_align = QLabel("")
         self.lbl_align.setWordWrap(True)
         self.lbl_align.setStyleSheet("color:#9a9aa0")
-        row = QHBoxLayout()
-        row.addWidget(self.btn_align)
-        row.addWidget(self.btn_unalign)
-        f.addRow(row)
         f.addRow(self.lbl_align)
         self.sp_workers = QSpinBox()
         self.sp_workers.setRange(1, 16)
@@ -472,6 +471,14 @@ class MainWindow(QMainWindow):
         self.a_fit = act("Fit sheet", self.editor_fit, "F", "Fit the sheet to the editor (F)")
         self.a_cam = act("Show camera", self.editor_to_camera, "C", "Centre the editor on the camera (C)")
         self.a_render = act("Render…", self.render, "Ctrl+R")
+        self.a_align = act("Fit Score to Recording…", self.align_to_recording, None,
+                           "Listens to a recording of the piece and moves every note of the score to where it is "
+                           "played, so lit-up notes and effects land on the sound")
+        self.a_unalign = act("Use the Score's Own Timing", self.remove_alignment, None,
+                             "Forget the fit to the recording and use the timing written in the score")
+        self.a_heat = act("Sync Heat Map", self.toggle_heat, None,
+                          "Colour the score by how sure the sync was: green = confident, red = unsure")
+        self.a_heat.setCheckable(True)
         self.a_guide = act("? Guide", self.start_tour, None, "Walk through the features with an interactive guide")
         for a in (self.a_open, self.a_openp, self.a_save, self.a_undo, self.a_redo):
             tb.addAction(a)
@@ -484,6 +491,14 @@ class MainWindow(QMainWindow):
         tb.addSeparator()
         for a in (self.a_key, self.a_fit, self.a_cam):
             tb.addAction(a)
+        tb.addSeparator()
+        for a in (self.a_align, self.a_unalign):     # the flagship feature: bold, right after "Show camera"
+            tb.addAction(a)
+            w = tb.widgetForAction(a)
+            f = w.font()
+            f.setBold(True)
+            w.setFont(f)
+        tb.addAction(self.a_heat)
         spacer = QWidget()
         spacer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         tb.addWidget(spacer)
@@ -512,8 +527,11 @@ class MainWindow(QMainWindow):
 
     def _update_enabled(self):
         has = self.score is not None
-        for a in (self.a_play, self.a_home, self.a_key, self.a_fit, self.a_cam, self.a_render, self.a_save):
+        for a in (self.a_play, self.a_home, self.a_key, self.a_fit, self.a_cam, self.a_render, self.a_save,
+                  self.a_align):
             a.setEnabled(has)
+        self.a_unalign.setEnabled(has and bool(self.project.time_map))
+        self.a_heat.setEnabled(has and bool(self.project.sync_conf))
         self.a_undo.setEnabled(self.history.can_undo())
         self.a_redo.setEnabled(self.history.can_redo())
         self.tabs.setEnabled(True)
@@ -635,6 +653,7 @@ class MainWindow(QMainWindow):
                 self.history.reset(self.project.snapshot())
                 self._saved_state = self.history.states[0]
             self._update_title()
+            self._refresh_heat()
             self.seek(0.0)
             QTimer.singleShot(60, self.editor_fit)  # after the window has been laid out
             self.status.showMessage(f"{len(score.units)} elements, {len(score.notes)} notes, "
@@ -806,6 +825,14 @@ class MainWindow(QMainWindow):
         self._refresh_time()
         self.timeline.update()
 
+    def _follow_changed(self, *_):
+        """While the camera path is still the automatic one, it follows the lead/lag setting live."""
+        if self._updating or self.score is None or self.project.keys_edited:
+            return
+        self.project.channels.update(auto_camera(self.score, self.project.settings))
+        self._keys_changed()
+        self.commit()
+
     def generate_camera(self):
         if self.score is None:
             return
@@ -842,11 +869,21 @@ class MainWindow(QMainWindow):
         s = self.project.settings
         self._updating = True
         self.sp_follow.setValue(s.follow_width)
+        self.sp_lead.setValue(round((0.5 - s.follow_lead) * 100))
         self.fx_panel.sync()
         aligned = bool(self.project.time_map)
-        self.btn_unalign.setEnabled(aligned)
-        self.lbl_align.setText(f"Fitted to {Path(s.align_audio).name}" if aligned and s.align_audio else
-                               "The notes use the timing written in the score.")
+        self.a_unalign.setEnabled(self.score is not None and aligned)
+        self.a_heat.setEnabled(self.score is not None and bool(self.project.sync_conf))
+        if not self.project.sync_conf and self.a_heat.isChecked():
+            self.a_heat.setChecked(False)
+        if self.scene is not None:
+            self._refresh_heat()
+        self.lbl_align.setText(
+            (f"Fitted to {Path(s.align_audio).name}" +
+             (f" — {self.project.sync_overall * 100:.0f}% confidence" if self.project.sync_conf else "") +
+             ". Change it with the bold buttons in the toolbar.") if aligned and s.align_audio else
+            "The notes use the timing written in the score. To fit them to a recording use "
+            "“Fit Score to Recording…” in the toolbar.")
         self._show_effect_lanes()
         self.cb_reveal.setCurrentIndex(self.cb_reveal.findData(s.reveal))
         self.sp_fade.setValue(s.fade)
@@ -877,6 +914,7 @@ class MainWindow(QMainWindow):
             return
         s = self.project.settings
         s.follow_width = self.sp_follow.value()
+        s.follow_lead = 0.5 - self.sp_lead.value() / 100.0
         s.reveal = self.cb_reveal.currentData()
         s.lookahead = self.sp_look.value()
         self.sp_look.setEnabled(self.sp_ghost.value() > 0)
@@ -1391,17 +1429,76 @@ class MainWindow(QMainWindow):
             return
         dlg.close()
         self.cfg.setValue("last_dir", str(Path(path).parent))
-        self._apply_time_map(al.points(), path)
+        self._apply_time_map(al.points(), path, al.heat(), al.overall)
         self.status.showMessage(f"Fitted {len(al.nominal)} note positions to {Path(path).name}; "
                                 f"{np.mean(np.abs(al.shifts) > 0.001) * 100:.0f}% were snapped to an attack.", 10000)
+        self._show_sync_result(al.overall)
+
+    def _show_sync_result(self, overall: float):
+        pct = int(round(overall * 100))
+        verdict = ("Few adjustments need to be made" if pct > 95 else
+                   "Some adjustments need to be made" if pct >= 85 else
+                   "Many adjustments need to be made")
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Information)
+        box.setWindowTitle("Sync complete")
+        box.setText(f"<b>Audio synced with {pct}% confidence!</b>")
+        box.setInformativeText(verdict + ".<br><br>The heat map shows where the sync is sure of itself (green) "
+                               "and where it is not (red).")
+        heat = box.addButton("Show heat map", QMessageBox.ActionRole)
+        box.addButton("OK", QMessageBox.AcceptRole)
+        box.exec()
+        if box.clickedButton() is heat:
+            self.a_heat.setChecked(True)
+            self.toggle_heat()
+
+    def toggle_heat(self):
+        """Show or hide the sync heat map over the score."""
+        self._refresh_heat()
+        if self.a_heat.isChecked():
+            self.status.showMessage("Sync heat map: green = the sync is confident, red = it is not sure.", 8000)
+
+    def _refresh_heat(self):
+        if not self.a_heat.isChecked() or self.score is None or not self.project.sync_conf:
+            self.editor.set_heat(None)
+            return
+        self.editor.set_heat(self._heat_strips())
+
+    def _heat_strips(self):
+        """One horizontal strip per line of music, coloured by the sync confidence of the notes along it."""
+        sc = self.score
+        pts = np.array(self.project.sync_conf, float)
+        times, conf = pts[:, 0], pts[:, 1]
+        strips = []
+        for si in range(len(sc.systems)):
+            rects = [QRectF(*m.rect) for m in sc.measure_infos if m.system == si]
+            if not rects:
+                continue
+            area = rects[0]
+            for r in rects[1:]:
+                area = area.united(r)
+            area = area.adjusted(0, -40, 0, 40)
+            xs = sorted((QRectF(*u.rect).center().x(), float(np.interp(u.time, times, conf)))
+                        for u in sc.units if u.system == si and u.kind in NOTE_KINDS | REST_KINDS)
+            if not xs:
+                continue
+            c = np.array([v for _, v in xs])
+            if len(c) > 2:   # a little smoothing, so one odd note does not make a hard stripe
+                c = np.convolve(np.pad(c, 1, mode="edge"), np.ones(3) / 3, mode="valid")
+            stops = [((x - area.left()) / max(area.width(), 1.0), float(v)) for (x, _), v in zip(xs, c)]
+            stops = [(0.0, stops[0][1])] + stops + [(1.0, stops[-1][1])]
+            strips.append((area, stops))
+        return strips
 
     def remove_alignment(self):
         if self.score is not None and self.project.time_map:
             self._apply_time_map([], "")
 
-    def _apply_time_map(self, points: list, audio_path: str):
+    def _apply_time_map(self, points: list, audio_path: str, heat: list | None = None, overall: float = 0.0):
         """Re-time the score with `points` and move the keyframes along with the music."""
         s = self.project.settings
+        self.project.sync_conf = list(heat) if points and heat else []
+        self.project.sync_overall = float(overall) if self.project.sync_conf else 0.0
         grid = [n[1] for n in self.score.nominal_notes] + [0.0]
         self.project.retime(retimer(self.project.time_map, points, grid))
         self.project.time_map = points

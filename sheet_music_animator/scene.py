@@ -5,7 +5,7 @@ import math
 from bisect import bisect_left, bisect_right
 
 from PySide6.QtCore import QByteArray, QPointF, QRectF, Qt, Signal
-from PySide6.QtGui import QBrush, QColor, QPainter, QPainterPath, QPen, QPicture, QMouseEvent, QPolygonF, QPixmap, QPixmapCache, QTransform
+from PySide6.QtGui import QBrush, QColor, QLinearGradient, QPainter, QPainterPath, QPen, QPicture, QMouseEvent, QPolygonF, QPixmap, QPixmapCache, QTransform
 from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import (QGraphicsItem, QGraphicsScene, QGraphicsView, QLabel, QStyle, QWidget)
 
@@ -401,6 +401,19 @@ class SheetScene(QGraphicsScene):
         return [i.unit for i in self.selectedItems() if hasattr(i, "unit")]
 
 
+def heat_color(c: float, alpha: int = 150) -> QColor:
+    """Red (unsure) through amber to green (confident); most good fits sit in the upper half."""
+    t = min(max((c - 0.45) / 0.5, 0.0), 1.0)
+    return QColor.fromHsv(int(t * 118), 210, 240, alpha)
+
+
+def _heat_gradient(rect: QRectF, stops) -> QLinearGradient:
+    g = QLinearGradient(rect.left(), 0, rect.right(), 0)
+    for pos, c in stops:
+        g.setColorAt(min(max(pos, 0.0), 1.0), heat_color(c))
+    return g
+
+
 def _hq(painter):
     painter.setRenderHints(QPainter.Antialiasing | QPainter.SmoothPixmapTransform | QPainter.TextAntialiasing)
 
@@ -478,7 +491,41 @@ class EditorView(QGraphicsView):
         lx, ly = self._to_local(self.mapToScene(pos.toPoint()))
         return "move" if abs(lx) <= self.cam[2] / 2 and abs(ly) <= self.cam[3] / 2 else None
 
+    # -- sync heat map (editor only: it is never part of the video) ------------------------------------------
+    def set_heat(self, strips):
+        """`strips`: [(QRectF, [(position 0..1, confidence 0..1), ...])] or None to switch the overlay off."""
+        self._heat = None if not strips else [(r, _heat_gradient(r, stops)) for r, stops in strips]
+        self.viewport().update()
+
+    def paintEvent(self, e):
+        super().paintEvent(e)
+        if getattr(self, "_heat", None):
+            p = QPainter(self.viewport())
+            p.setRenderHint(QPainter.Antialiasing)
+            box = QRectF(self.viewport().width() - 188, 10, 176, 40)
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor(20, 20, 24, 215))
+            p.drawRoundedRect(box, 6, 6)
+            g = QLinearGradient(box.left() + 10, 0, box.right() - 10, 0)
+            for c in (0.45, 0.7, 0.95):
+                g.setColorAt((c - 0.45) / 0.5, heat_color(c, 255))
+            p.setBrush(g)
+            p.drawRoundedRect(QRectF(box.left() + 10, box.top() + 8, box.width() - 20, 8), 3, 3)
+            p.setPen(QColor("#d8d8de"))
+            f = p.font()
+            f.setPointSizeF(max(f.pointSizeF() * 0.85, 7.0)) if f.pointSizeF() > 0 else None
+            p.setFont(f)
+            p.drawText(QRectF(box.left() + 8, box.top() + 19, 80, 18), Qt.AlignLeft | Qt.AlignVCenter, "unsure")
+            p.drawText(QRectF(box.right() - 88, box.top() + 19, 80, 18), Qt.AlignRight | Qt.AlignVCenter, "confident")
+            p.end()
+
     def drawForeground(self, painter, rect):
+        for r, g in getattr(self, "_heat", None) or ():
+            if r.intersects(rect):
+                painter.save()
+                painter.setCompositionMode(QPainter.CompositionMode_Multiply)
+                painter.fillRect(r, g)
+                painter.restore()
         if self.cam is None:
             return
         _hq(painter)

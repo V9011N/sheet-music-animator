@@ -155,6 +155,8 @@ class Project:
     transforms: dict[int, list[float]] = field(default_factory=dict)   # unit uid -> [dx, dy, scale]
     line_starts: list[int] | None = None   # measure index that starts each line (None: every measures_per_line)
     effects: Effects = field(default_factory=Effects)
+    sync_conf: list = field(default_factory=list)   # [[recording seconds, confidence 0..1], ...] of that alignment
+    sync_overall: float = 0.0                       # the headline confidence (0..1) of that alignment
     time_map: list = field(default_factory=list)   # [[score seconds, recording seconds], ...] from aligning to audio
 
     # ---- camera ---------------------------------------------------------------------
@@ -361,7 +363,8 @@ class Project:
                 "keys_edited": self.keys_edited, "timed": sorted(self.timed),
                 "hidden": {str(m): sorted(c) for m, c in sorted(self.hidden.items()) if c},
                 "transforms": {str(u): list(v) for u, v in sorted(self.transforms.items())},
-                "line_starts": self.line_starts, "effects": self.effects.to_dict(), "time_map": self.time_map}
+                "line_starts": self.line_starts, "effects": self.effects.to_dict(), "time_map": self.time_map,
+                "sync_conf": self.sync_conf, "sync_overall": self.sync_overall}
 
     def snapshot(self) -> str:
         return json.dumps(self.to_dict(), sort_keys=True)
@@ -396,6 +399,8 @@ class Project:
         for name in self.effects.lanes:
             self.channels.setdefault(LANE + name, [])
         self.time_map = [list(p) for p in d.get("time_map", [])]
+        self.sync_conf = [list(p) for p in d.get("sync_conf", [])] if self.time_map else []
+        self.sync_overall = float(d.get("sync_overall", 0.0)) if self.sync_conf else 0.0
 
     def restore(self, snapshot: str) -> None:
         self.load_dict(json.loads(snapshot))
