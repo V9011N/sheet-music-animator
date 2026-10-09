@@ -358,14 +358,25 @@ def onset_confidence(Xf, Yf, wf, onsets, est, shifts, strength, ff):
     return np.clip(conf, 0, 1), ev
 
 
+LOST_BELOW = 0.35        # a note this unsure counts as lost
+MILD_WEIGHT = 0.35       # how much general, diffuse uncertainty weighs...
+LOST_WEIGHT = 1.5        # ...against the share of notes that were lost (a few bad bars matter more)
+
+
 def overall_confidence(conf) -> float:
-    """One number (0..1) for the whole fit: the average confidence of the notes, minus half the share of notes
-    that are plainly lost (confidence under 0.5) -- a few notes that were not found matter, but a quiet bass
-    note with a weak attack should not drag a good fit down."""
+    """One number (0..1) for the whole fit.  Real recordings leave a little doubt about many notes (dense
+    chords, a pedalled bass), which says little about the result; notes that are plainly lost -- a skipped
+    or misread bar -- say a lot.  So: 1 minus a small share of the average doubt, minus the share of lost
+    notes times a larger factor.  Calibrated so that a good fit of a real performance with a few trouble
+    spots lands around 90 %, and a recording of something else lands near zero."""
     if conf is None or len(conf) == 0:
         return 0.0
     c = np.asarray(conf, float)
-    return float(np.clip(c.mean() - 0.5 * np.mean(c < 0.5), 0, 1))
+    score = 1.0 - MILD_WEIGHT * np.mean(1.0 - c) - LOST_WEIGHT * np.mean(c < LOST_BELOW)
+    # when the average itself is poor the recording is probably something else: never let the lenient
+    # per-note weighting hide that
+    score *= float(np.clip((c.mean() - 0.3) / 0.45, 0.0, 1.0))
+    return float(np.clip(score, 0, 1)) + 0.0
 
 
 SNAP_WINDOW = 0.55       # how far (s) from the DTW estimate an attack may be taken in dense music...

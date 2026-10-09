@@ -559,7 +559,103 @@ def _set_line_breaks(root, breaks) -> bool:
     return True
 
 
-def _adjust_mei(tk, path, hidden, cross, breaks=None) -> set[str]:
+def beam_conflicts(path) -> dict:
+    """Voices whose beams cut across their tuplets, read from the MusicXML.
+
+    {(measure number, staff, voice): [first-level beam state of every event: 'begin'/'continue'/'end'/None]}
+    A beam group that covers part of a tuplet (e.g. a group of four sixteenths over three-note tuplets) cannot
+    be nested in MEI, and Verovio's import answers with beams inside beams, mixed stem directions it cannot
+    draw and extra stacked beam lines.  Only the voices where that happens are returned.  Staves are numbered
+    the way MEI numbers them (continuing across parts)."""
+    root = _read_musicxml(path)
+    if root is None or root.tag != "score-partwise":
+        return {}
+    out: dict = {}
+    base = 0
+    for part in root.findall("part"):
+        nstaves = max([int(t) for t in part.xpath(".//attributes/staves/text()") if t.strip().isdigit()] or [1])
+        for m in part.findall("measure"):
+            voices: dict = {}
+            for n in m.findall("note"):
+                if n.find("chord") is not None:
+                    continue
+                key = (int(n.findtext("staff") or 1), n.findtext("voice") or "1")
+                voices.setdefault(key, []).append(n)
+            for (staff, voice), notes in voices.items():
+                if any(n.find("grace") is not None for n in notes):
+                    continue
+                beams, tuplets, runs, open_t, run = [], [], [], [], None
+                for i, n in enumerate(notes):
+                    b = next((x.text for x in n.findall("beam") if x.get("number") == "1"), None)
+                    beams.append(b)
+                    if b == "begin":
+                        run = i
+                    if b == "end" and run is not None:
+                        runs.append((run, i))
+                        run = None
+                    for t in n.findall("notations/tuplet"):
+                        if t.get("type") == "start":
+                            open_t.append(i)
+                        elif t.get("type") == "stop" and open_t:
+                            tuplets.append((open_t.pop(), i))
+                if any(a <= d and c <= b and not (a <= c and d <= b) and not (c <= a and b <= d)
+                       for a, b in tuplets for c, d in runs):
+                    out[(m.get("number"), base + staff, voice)] = beams
+        base += nstaves
+    return out
+
+
+_BEAM_KEEP = {"beam", "tuplet", "note", "chord", "rest", "accid", "artic", "dot"}
+_EVENTS = ("note", "chord", "rest")
+
+
+def _regroup_beams(root, conflicts) -> bool:
+    """Rebuild the beams of the voices in `conflicts` the way the MusicXML groups them: invisible tuplet
+    wrappers become a duration ratio on every note (so timing is unchanged) and each first-level beam group
+    of the MusicXML becomes one plain <beam>."""
+    ns = {"m": MEI_NS}
+    changed = False
+    for measure in root.iterfind(".//m:measure", ns):
+        for (num, staff_n, voice), states in conflicts.items():
+            if measure.get("n") != num:
+                continue
+            staff = next((s for s in measure.findall("m:staff", ns) if s.get("n") == str(staff_n)), None)
+            layer = None if staff is None else next((l for l in staff.findall("m:layer", ns) if l.get("n") == voice), None)
+            if layer is None:
+                continue
+            tags = {etree.QName(e).localname for e in layer.iterdescendants() if isinstance(e.tag, str)}
+            if not tags <= _BEAM_KEEP:
+                continue
+            tuplets = list(layer.iter(f"{{{MEI_NS}}}tuplet"))
+            if any(t.get("num.visible") != "false" or t.get("bracket.visible") != "false" for t in tuplets):
+                continue
+            events = []
+            for e in layer.iter(*(f"{{{MEI_NS}}}{t}" for t in _EVENTS)):
+                if etree.QName(e.getparent()).localname != "chord":
+                    events.append(e)
+            if len(events) != len(states):
+                continue
+            for e in events:     # the tuplet ratio moves onto the notes
+                ratio = [(int(t.get("num", 3)), int(t.get("numbase", 2))) for t in e.iterancestors(f"{{{MEI_NS}}}tuplet")]
+                if ratio:
+                    e.set("num", str(ratio[0][0]))
+                    e.set("numbase", str(ratio[0][1]))
+            for e in events:
+                e.getparent().remove(e)
+            for e in list(layer):
+                layer.remove(e)
+            cur = None
+            for e, st in zip(events, states):
+                if st == "begin" or (st in ("continue", "end") and cur is None):
+                    cur = etree.SubElement(layer, f"{{{MEI_NS}}}beam")
+                (cur if cur is not None else layer).append(e)
+                if st == "end" or st is None:
+                    cur = None
+            changed = True
+    return changed
+
+
+def _adjust_mei(tk, path, hidden, cross, breaks=None, beams=None) -> set[str]:
     """Work around Verovio's MusicXML import by re-loading the score through MEI:
     * hidden staves (print-object="no"): marked invisible, their xml:ids returned so that
       `_remove_hidden_staves` can take them out of the SVG afterwards (only rest-only staves are touched);
@@ -568,6 +664,8 @@ def _adjust_mei(tk, path, hidden, cross, breaks=None) -> set[str]:
     ns = {"m": MEI_NS}
     root = etree.fromstring(tk.getMEI().encode("utf8"))
     changed = _fix_cross_staff_clefs(root) if cross else False
+    if beams:
+        changed = _regroup_beams(root, beams) or changed
     if cross:
         changed = _merge_slur_chains(root) or changed
     ids: set[str] = set()
@@ -671,13 +769,14 @@ def engrave(path, layout: str = "pages", ink: str = "#000000", progress=None,
             breaks = sorted(set(line_starts)) if line_starts is not None else measures_per_line
     else:
         opts.update(LAYOUTS[layout])
-    hidden, cross = hidden_staves(path), has_cross_staff(path)
+    hidden, cross, beams = hidden_staves(path), has_cross_staff(path), beam_conflicts(path)
     if cross:   # a beam that crosses between staves is not taken into account when Verovio spaces the staves
         opts["spacingStaff"] = CROSS_STAFF_SPACING
     tk.setOptions(opts)
     if not tk.loadFile(str(path)):
         raise ValueError(f"Verovio could not read {path}")
-    hidden_ids = _adjust_mei(tk, path, hidden, cross, breaks) if hidden or cross or breaks else set()
+    hidden_ids = (_adjust_mei(tk, path, hidden, cross, breaks, beams)
+                  if hidden or cross or breaks or beams else set())
     svg = tk.renderToSVG(1)
     timemap = tk.renderToTimemap({"includeRests": True, "includeMeasures": True})
     timemap = json.loads(timemap) if isinstance(timemap, str) else timemap
