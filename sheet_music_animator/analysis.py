@@ -86,12 +86,14 @@ def _band_matrix(n_fft: int, lo: int, hi: int):
 
 
 NORM_FLOOR = 0.25      # frames quieter than this fraction of the typical frame are not scaled up to full size
-PENALTY = 0.03         # extra cost of advancing only one of the two sequences
+PENALTY = 0.32         # extra cost of advancing only one of the two sequences
+DIAG_WEIGHT = 2.0      # a diagonal step counts its cell twice, so every path between two points weighs the same
 START_SLACK = 0.0      # seconds the first note may come after the start of the (trimmed) recording
 START_PENALTY = 0.3    # cost per second of that delay
 OPEN_END = False       # (coarse stage) the whole recording is matched; the fine stage ends openly, inside a corridor
-END_PENALTY = 3.0
-END_SPAN = 8.0         # seconds at the end of the score whose corridor is widened...
+END_COST = 1.0         # (fine stage) cost of every frame of the recording left over after the last note: what
+                       # matching it to nothing would cost, so ending early never pays for itself
+END_SPAN = 4.0         # seconds at the end of the score whose corridor is widened...
 END_CORRIDOR = 4.0     # ...to this many seconds either side: a long held final chord rings on past its written length
 CORRIDOR = 1.5         # seconds either side of the coarse path searched by the fine alignment
 
@@ -150,8 +152,12 @@ def score_features(notes, fps: int, length: float) -> np.ndarray:
 # ------------------------------------------------------------------------------------ DTW
 def _dtw(X, Y, lo, hi, penalty=None, fps=50, open_end=None):
     """Dynamic time warping of rows of X against rows of Y inside the window [lo[i], hi[i]) of every row.
-    Cost is cosine distance; stepping along only one sequence costs `penalty` extra.  Returns, for every
-    row of X, the (float) column it is matched to."""
+    Cost is cosine distance; stepping along only one sequence costs `penalty` extra.  A diagonal step counts
+    its cell DIAG_WEIGHT times (the symmetric form): otherwise a path that takes more steps -- one that lets a
+    passage last longer or shorter in the recording than in the score -- collects more cells and pays the
+    typical mismatch of a cell (about 0.6 in dense, pedalled music) on top of `penalty` for every step it
+    deviates, which squeezes slow passages and drags fast ones.  Returns, for every row of X, the (float)
+    column it is matched to."""
     penalty = PENALTY if penalty is None else penalty
     open_end = OPEN_END if open_end is None else open_end
     n, m = len(X), len(Y)
@@ -169,7 +175,7 @@ def _dtw(X, Y, lo, hi, penalty=None, fps=50, open_end=None):
             ext = np.full(m + 2, np.inf)                       # previous row, indexed by column + 1
             ext[plo + 1:plo + 1 + len(prev)] = prev
             j = np.arange(a, b)
-            q = c + np.minimum(ext[j + 1] + penalty, ext[j])   # from above (+penalty) or diagonally
+            q = np.minimum(c + ext[j + 1] + penalty, DIAG_WEIGHT * c + ext[j])   # from above (+penalty) or diagonally
         T = np.cumsum(c + penalty)
         D = np.minimum.accumulate(q - T) + T                   # horizontal steps within the row
         Ds.append(D.astype(np.float32))
@@ -178,7 +184,7 @@ def _dtw(X, Y, lo, hi, penalty=None, fps=50, open_end=None):
     i = n - 1
     a = int(lo[i])
     tail = np.maximum(m - 1 - np.arange(a, int(hi[i])), 0)
-    j = a + int(np.argmin(Ds[i] + (END_PENALTY * penalty * tail if open_end else np.where(tail > 0, np.inf, 0))))
+    j = a + int(np.argmin(Ds[i] + (END_COST * tail if open_end else np.where(tail > 0, np.inf, 0))))
     cols = [[] for _ in range(n)]
     cols[i].append(j)
     pen = np.float32(penalty)
@@ -189,7 +195,8 @@ def _dtw(X, Y, lo, hi, penalty=None, fps=50, open_end=None):
             pa = int(lo[i - 1])
             Dp = Ds[i - 1]
             if j - 1 >= pa and j - 1 - pa < len(Dp) and j - 1 >= 0:
-                best, step = Dp[j - 1 - pa], (-1, -1)
+                extra = (DIAG_WEIGHT - 1.0) * (1.0 - float(Y[j] @ X[i]))   # the diagonal step's cell counts again
+                best, step = Dp[j - 1 - pa] + extra, (-1, -1)
             if pa <= j < pa + len(Dp) and Dp[j - pa] + pen < best:
                 best, step = Dp[j - pa] + pen, (-1, 0)
         if j > a and Ds[i][j - 1 - a] + pen < best:

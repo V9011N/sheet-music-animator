@@ -128,6 +128,41 @@ class TestAlignment(unittest.TestCase):
         err = np.abs(al.actual - np.array([warp(x) for x in al.nominal]))
         self.assertLess(err.max(), 0.1)
 
+    def test_broad_chords_then_a_fast_final_scale(self):
+        """The end of Winter Wind as Kissin plays it: pedalled A-minor-ish chords, each broader than written, the
+        last one cut short, then a written-out scale at three times its written speed.  The chords sound alike
+        and the low notes of the scale sound like their ring, so the alignment used to squeeze the chords and
+        start the scale early, then crawl up it."""
+        tmp = Path(tempfile.mkdtemp())
+        rng = random.Random(3)
+        score, perf = [], []                  # (pitch, start, end, velocity) as written and as played
+        for i in range(40):                   # a melody over a bass, played as written
+            n = rng.choice([60, 62, 64, 65, 67, 69, 71, 72, 74, 76])
+            score.append((n, 0.3 * i, 0.3 * i + 0.3, 80))
+            if i % 4 == 0:
+                score.append((45, 0.3 * i, 0.3 * i + 1.2, 70))
+        perf = list(score)
+        s = q = 12.0
+        am, dm, fm = (45, 52, 57, 60, 64, 69), (45, 50, 57, 62, 65, 69), (45, 53, 57, 60, 65, 69)
+        for chord, written, played in ((am, 0.87, 1.2), (dm, 0.87, 1.2), (am, 0.87, 1.25), (fm, 0.87, 1.3),
+                                       (am, 0.87, 1.4), (dm, 0.87, 1.5), (am, 1.74, 0.35)):
+            for n in chord:
+                score.append((n, s, s + written, 90))
+                perf.append((n, q, q + max(played, 0.9), 90))       # pedalled: rings on
+            s, q = s + written, q + played
+        for k, n in enumerate([45, 47, 48, 50, 52, 53, 55, 57, 59, 60, 62, 64, 65, 67, 69, 71, 72, 74, 76, 77, 79, 81]):
+            score.append((n, s + 0.217 * k, s + 0.217 * (k + 1), 90))
+            perf.append((n, q + 0.07 * k, q + 0.07 * (k + 1), 90))
+        s, q = s + 0.217 * 22, q + 0.07 * 22
+        score.append((81, s, s + 0.43, 100))
+        perf.append((81, q, q + 1.5, 100))
+        played_at = {round(a[1], 4): b[1] for a, b in zip(score, perf)}
+        wav = tmp / "coda.wav"
+        audio.write_wav(wav, audio.synthesize(perf, q + 2.0))
+        al = analysis.align_score(score, str(wav))
+        err = np.abs(al.actual - np.array([played_at[round(x, 4)] for x in al.nominal]))
+        self.assertLess(err.max(), 0.1)                            # was 2.9 s (the last chord)
+
     def test_a_held_final_chord_does_not_drag_the_ending_late(self):
         """The recording rings on for seconds after the last attack (a fermata): the last notes must still be
         found at their attacks, not stretched over the ring."""
