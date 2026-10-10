@@ -41,9 +41,9 @@ class TestGlyphs(unittest.TestCase):
     def test_dynamics_in_text_become_letters(self):
         el = self.fix('<tspan font-family="Leipzig" font-size="720px">&#58658;</tspan><tspan>&#160;&#160;risoluto</tspan>')
         t = list(el.iter(f"{{{SVG}}}tspan"))
-        self.assertEqual(t[0].text, "f")
+        self.assertEqual(t[0].text, "f ")    # the no-break spaces survive as a gap Qt draws (an en space)
         self.assertNotIn("font-family", t[0].attrib)
-        self.assertEqual(t[1].text, "  risoluto")                 # the no-break spaces survive as spaces
+        self.assertEqual(t[1].text, "risoluto")
 
     def test_metronome_notes_become_symbols_and_nothing_is_left_to_show_as_a_box(self):
         el = self.fix('<tspan font-family="Leipzig">&#60579;</tspan><tspan font-family="Leipzig">&#57344;</tspan>')

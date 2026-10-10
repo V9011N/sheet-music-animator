@@ -42,8 +42,9 @@ CATEGORIES = {
     "Ornaments and fermatas": ("trill", "mordent", "turn", "ornam", "fermata"),
     "Measure numbers": ("mNum",),
 }
-# Engravings that cannot be moved or resized: noteheads and note tails (the note itself) and beams.
-FIXED_KINDS = {"note", "chord", "beam", "beamSpan", "fTrem", "bTrem"}
+# Engravings that cannot be moved or resized: noteheads and note tails (the note itself), beams, and the stems,
+# flags and ledger lines that MuseScore draws apart from the note.
+FIXED_KINDS = {"note", "chord", "beam", "beamSpan", "fTrem", "bTrem", "stem", "flag", "ledger"}
 
 
 @dataclass(eq=False)
@@ -110,6 +111,7 @@ class Settings:
     follow_width: float = 14000.0  # camera width (page units) used by the automatic camera path
     follow_lead: float = 0.5     # where "now" sits in the frame (fraction from the left) when following the music
     align_audio: str = ""        # recording the score timing was fitted to ("" = the score's own timing)
+    engraver: str = "verovio"    # "musescore" (the notation program lays the score out; new projects, when installed)
 
     @property
     def aspect(self) -> float:

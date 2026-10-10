@@ -121,6 +121,9 @@ END_SPAN = 4.0         # seconds at the end of the score whose corridor is widen
 END_CORRIDOR = 4.0     # ...to this many seconds either side: a long held final chord rings on past its written length
 CORRIDOR = 1.5         # seconds either side of the coarse path searched by the fine alignment
 PULL = 0.05            # (fine stage) cost per frame and second of lying away from the coarse path
+HOLD_AFTER = 0.15      # seconds after the last onset from which the final chord may be held as long as it rings
+ANCHOR_LATE = 0.3      # the final chord found this much (s) later than the alignment put it: align again up to it,
+ANCHOR_TOLERANCE = 0.005   # and keep that unless it fits this much worse (a long final ring is judged harshly)
 
 
 def _unit_rows(x: np.ndarray, floor: float = 0.0) -> np.ndarray:
@@ -175,18 +178,20 @@ def score_features(notes, fps: int, length: float) -> np.ndarray:
 
 
 # ------------------------------------------------------------------------------------ DTW
-def _dtw(X, Y, lo, hi, penalty=None, fps=50, open_end=None, centre=None, pull=0.0):
+def _dtw(X, Y, lo, hi, penalty=None, fps=50, open_end=None, centre=None, pull=0.0, free_from=None):
     """Dynamic time warping of rows of X against rows of Y inside the window [lo[i], hi[i]) of every row.
     Cost is cosine distance; stepping along only one sequence costs `penalty` extra.  A diagonal step counts
     its cell DIAG_WEIGHT times (the symmetric form): otherwise a path that takes more steps -- one that lets a
     passage last longer or shorter in the recording than in the score -- collects more cells and pays the
     typical mismatch of a cell (about 0.6 in dense, pedalled music) on top of `penalty` for every step it
     deviates, which squeezes slow passages and drags fast ones.  With `centre` (a column for every row) each
-    cell also costs `pull` per second it lies away from it.  Returns, for every row of X, the (float) column it
-    is matched to."""
+    cell also costs `pull` per second it lies away from it.  From row `free_from` on (the final chord, once it has
+    sounded) the recording may advance alone at no extra cost: how long the last chord is held and rings is up
+    to the performer.  Returns, for every row of X, the (float) column it is matched to."""
     penalty = PENALTY if penalty is None else penalty
     open_end = OPEN_END if open_end is None else open_end
     n, m = len(X), len(Y)
+    free_from = n if free_from is None else free_from
     Ds = []
     prev, plo = None, 0
     for i in range(n):
@@ -204,7 +209,7 @@ def _dtw(X, Y, lo, hi, penalty=None, fps=50, open_end=None, centre=None, pull=0.
             ext[plo + 1:plo + 1 + len(prev)] = prev
             j = np.arange(a, b)
             q = np.minimum(c + ext[j + 1] + penalty, DIAG_WEIGHT * c + ext[j])   # from above (+penalty) or diagonally
-        T = np.cumsum(c + penalty)
+        T = np.cumsum(c + (penalty if i < free_from else 0.0))
         D = np.minimum.accumulate(q - T) + T                   # horizontal steps within the row
         Ds.append(D.astype(np.float32))
         prev, plo = D, a
@@ -228,8 +233,9 @@ def _dtw(X, Y, lo, hi, penalty=None, fps=50, open_end=None, centre=None, pull=0.
                 best, step = Dp[j - 1 - pa] + extra, (-1, -1)
             if pa <= j < pa + len(Dp) and Dp[j - pa] + pen < best:
                 best, step = Dp[j - pa] + pen, (-1, 0)
-        if j > a and Ds[i][j - 1 - a] + pen < best:
-            best, step = Ds[i][j - 1 - a] + pen, (0, -1)
+        hpen = pen if i < free_from else np.float32(0.0)
+        if j > a and Ds[i][j - 1 - a] + hpen < best:
+            best, step = Ds[i][j - 1 - a] + hpen, (0, -1)
         if step is None:
             break
         i, j = i + step[0], j + step[1]
@@ -269,13 +275,69 @@ class Alignment:
 SILENCE = 0.02       # frames quieter than this fraction of the loudest one count as silence at the ends
 
 
+NOISY = 0.3          # spectral flatness above which a frame is noise (applause, the hall, hiss), not music
+TONAL_RUN = 5        # loud frames that sound like music within...
+TONAL_SPAN = 0.5     # ...this many seconds make the start (or end) of the music
+STRONG = 0.2         # frames louder than this share of the loudest are music whatever their spectrum...
+QUIET = 0.005        # ...and tonal frames are music from this share on (a soft first note under SILENCE)
+ATTACK_BACK = 0.3    # seconds of loud sound right before the first tonal run that are its attack
+
+
+def _tonal(y: np.ndarray, frames: np.ndarray, hop: int) -> np.ndarray:
+    """Whether each of the given frames sounds like notes rather than noise (spectral flatness, 50 Hz - 4 kHz)."""
+    n_fft = 2048
+    out = np.zeros(len(frames), bool)
+    for s in range(0, len(frames), 512):
+        idx = frames[s:s + 512]
+        seg = np.stack([np.pad(y[i * hop:i * hop + n_fft], (0, max(0, n_fft - len(y[i * hop:i * hop + n_fft]))))
+                        for i in idx])
+        mag = np.abs(np.fft.rfft(seg * np.hanning(n_fft), axis=1))[:, 5:372] + 1e-9
+        out[s:s + 512] = np.exp(np.mean(np.log(mag), axis=1)) / np.mean(mag, axis=1) < NOISY
+    return out
+
+
 def _active_range(y: np.ndarray, fps: int = 50, floor: float | None = None):
+    """(start, end) in seconds of the music in a recording: from the first to the last run of TONAL_RUN frames that
+    sound like music -- tonal, or louder than STRONG of the loudest frame whatever they sound like -- starting and
+    ending above `floor`.  Applause, the noise of a hall or a tape before or after the music can be louder than a
+    soft first note, but it is not tonal.  Without such runs: the frames above `floor`."""
     floor = SILENCE if floor is None else floor
     hop = SR // fps
     n = len(y) // hop
     rms = np.sqrt(np.mean(y[:n * hop].reshape(n, hop) ** 2, axis=1))
     loud = np.nonzero(rms > floor * rms.max())[0]
-    return (loud[0] / fps, (loud[-1] + 1) / fps) if len(loud) else (0.0, len(y) / SR)
+    if not len(loud):
+        return 0.0, len(y) / SR
+
+    strong = rms > STRONG * rms.max()      # far above any noise: music, however noisy its spectrum (big chords)
+    span = int(TONAL_SPAN * fps)
+    is_loud = rms > floor * rms.max()
+
+    def first_run(order):
+        """The first frame (in scan order) above the floor that sounds like music and is followed, within
+        TONAL_SPAN, by TONAL_RUN frames that do -- tonal ones counting down to QUIET (a soft note fades fast)."""
+        heard = order[rms[order] > QUIET * rms.max()]
+        for s0 in range(0, len(heard), 256):
+            block = heard[s0:s0 + 256 + 4 * span]
+            ok = _tonal(y, block, hop) | strong[block]
+            for k in range(min(256, len(block))):
+                if not (ok[k] and is_loud[block[k]]):
+                    continue
+                near = np.abs(block[k:] - block[k]) <= span
+                near = near[:np.argmin(near)] if not near.all() else near
+                if ok[k:k + len(near)].sum() >= TONAL_RUN:
+                    return int(block[k])
+        return None
+    a = first_run(np.arange(n))
+    b = first_run(np.arange(n)[::-1])
+    if a is None or b is None or b <= a:
+        return loud[0] / fps, (loud[-1] + 1) / fps
+    back = int(ATTACK_BACK * fps)        # the attack of the first sound is noisy (a hammer hitting strings): it
+    level = 0.3 * rms[a:a + TONAL_RUN].max()     # belongs to the music when it is about as loud, right before it
+    k = a
+    while k > 0 and a - k < back and rms[k - 1] >= level:
+        k -= 1
+    return k / fps, (b + 1) / fps
 
 
 def align_score(notes, audio_path: str, progress=None, refine: bool = True, rolls=()) -> Alignment:
@@ -294,13 +356,15 @@ def align_score(notes, audio_path: str, progress=None, refine: bool = True, roll
     ya = y[int(a0 * SR):int(a1 * SR)]
     shifted = [(p, s - s0, e - s0) for p, s, e, *_ in notes]
     ls = s1 - s0
+    held = shifted[-1][1] + HOLD_AFTER if HOLD_AFTER is not None else None   # the last chord has sounded
 
     # coarse: the whole matrix at 10 frames/s
     say(0.08, "Coarse alignment…")
     fc = 10
     Xc, Yc = score_features(shifted, fc, ls), audio_features(ya, fc)
     nxc, nyc = len(Xc), len(Yc)
-    wc = _dtw(Xc, Yc, np.zeros(nxc, int), np.full(nxc, nyc), fps=fc)
+    wc = _dtw(Xc, Yc, np.zeros(nxc, int), np.full(nxc, nyc), fps=fc,
+              free_from=None if held is None else int(np.ceil(held * fc)))
     wc = np.maximum.accumulate(_fill(wc))
 
     # fine: 50 frames/s inside a corridor around the coarse path
@@ -314,23 +378,51 @@ def align_score(notes, audio_path: str, progress=None, refine: bool = True, roll
     lo = np.maximum.accumulate(np.clip(np.round(centre - r), 0, ny - 1)).astype(int)
     hi = np.maximum.accumulate(np.clip(np.round(centre + r) + 1, 1, ny)).astype(int)
     lo[0] = 0
-    wf = _fill(_dtw(Xf, Yf, lo, hi, fps=ff, open_end=True, centre=centre, pull=PULL))
+    free = None if held is None else int(np.ceil(held * ff))
+    wf = _fill(_dtw(Xf, Yf, lo, hi, fps=ff, open_end=True, centre=centre, pull=PULL, free_from=free))
     wf = np.maximum.accumulate(wf) / ff                                  # recording time of each score frame
 
     onsets = np.unique(np.round([n[1] - s0 for n in notes], 4))
     est = np.interp(onsets, np.arange(nx) / ff, wf)
     shifts = np.zeros(len(onsets))
     strength = clarity = np.zeros(len(onsets))
-    est_dtw = est.copy()
+    def judged(wf_, est_, shifts_, strength_, clarity_):
+        est_ = np.maximum.accumulate(est_) + np.arange(len(est_)) * 1e-5       # strictly increasing
+        conf_, ev_ = onset_confidence(Xf, Yf, wf_, onsets, est_, shifts_, strength_, clarity_, ff)
+        return est_, shifts_, conf_, ev_
+
     if refine:
         say(0.7, "Snapping notes to their attacks…")
-        est2, strength, clarity = _refine(ya, shifted, onsets, est, [tuple(t - s0 for t in r) for r in rolls])
-        shifts = est2 - est
-        est = est2
-    est = np.maximum.accumulate(est)
-    est += np.arange(len(est)) * 1e-5                                    # strictly increasing
+        rolls_s = [tuple(t - s0 for t in r) for r in rolls]
+        est2, strength, clarity = _refine(ya, shifted, onsets, est, rolls_s, reach=False)
+        fit = judged(wf, est2, est2 - est, strength, clarity)
+        late2, lstrength, lclarity = _refine(ya, shifted, onsets, est, rolls_s)
+        if late2[-1] - est2[-1] > ANCHOR_LATE:
+            # The final chord may come well after where the alignment put it: the performer paused before it,
+            # and the last chord (held at no cost) took over what was played before.  Align again with the final
+            # chord held back to that attack, so that the music before it reaches up to where it is really
+            # played -- and keep whichever of the two fits the recording better (the attack found that late may
+            # be applause, a cough, or a passage the score does not have).
+            say(0.8, "Placing the final chord…")
+            k = int(np.round(late2[-1] * ff))
+            last_row = int(onsets[-1] * ff)
+            lo2, hi2 = lo.copy(), hi.copy()
+            lo2[last_row:] = np.maximum(lo2[last_row:], min(k, ny - 1))
+            hi2[:last_row] = np.minimum(hi2[:last_row], k)
+            hi2 = np.maximum(hi2, lo2 + 1)
+            wf2 = np.maximum.accumulate(_fill(_dtw(Xf, Yf, lo2, hi2, fps=ff, open_end=True, centre=centre,
+                                                   pull=PULL, free_from=free))) / ff
+            e2 = np.interp(onsets, np.arange(nx) / ff, wf2)
+            est3, strength3, clarity3 = _refine(ya, shifted, onsets, e2, rolls_s)
+            other = judged(wf2, est3, est3 - e2, strength3, clarity3)
+            if overall_confidence(other[2]) >= overall_confidence(fit[2]) - ANCHOR_TOLERANCE:
+                fit, wf = other, wf2
+        elif late2[-1] - est2[-1] > 1e-3:
+            fit = judged(wf, late2, late2 - est, lstrength, lclarity)
+        est, shifts, conf, evidence = fit
+    else:
+        est, shifts, conf, evidence = judged(wf, est, shifts, strength, clarity)
     say(0.9, "Judging the fit…")
-    conf, evidence = onset_confidence(Xf, Yf, wf, onsets, est, shifts, strength, clarity, ff)
     say(1.0, "Done")
     return Alignment(onsets + s0, est + a0, shifts, conf, evidence)
 
@@ -437,6 +529,7 @@ SNAP_NEAR = 0.2          # notes written closer than this (s) are expected to be
 SNAP_EARLY = 0.25        # ...and one that lies more than this ahead of the next one is suspicious
 SNAP_TOGETHER = 0.03     # how close to the next note's attack a candidate must be to count as the same moment
 SNAP_GRACE = 0.05        # notes written closer than this (s) before a chord are grace notes, played with it or before
+FINAL_EVENT = 0.1        # onsets this close (s) before the last one belong to the final chord
 
 
 RUN_MIN = 8              # this many notes or more, written evenly...
@@ -548,7 +641,7 @@ def _room(onsets, first, last) -> np.ndarray:
     return np.minimum(before, after)
 
 
-def _refine(ya, notes, onsets, est, rolls=()):
+def _refine(ya, notes, onsets, est, rolls=(), reach=True):
     """Choose, for every onset, the attack of its own pitches that makes the best monotone sequence.
 
     Candidates are the peaks of a per-pitch onset detector around the DTW estimate; a Viterbi pass
@@ -572,8 +665,10 @@ def _refine(ya, notes, onsets, est, rolls=()):
     cands = []     # per onset: (times, strengths); the DTW estimate is always one of them
     norm = []      # per onset: (mean, std) of its onset curve in its window, to judge other moments the same way
     own_bins = []  # per onset: the spectrum bins of its notes' pitches (for judging the attack afterwards)
-    for (t, e), rm in zip(zip(onsets, est), room):
+    last_chord = onsets[-1] - FINAL_EVENT    # the last chord (with the notes written just before it): a performer
+    for (t, e), rm in zip(zip(onsets, est), room):     # may pause before it for as long as they like
         win = float(np.clip(SNAP_SPARSE * rm, SNAP_WINDOW, SNAP_MAX))
+        far = len(ya) / SR - e if reach and t >= last_chord else win
         bins = []
         for p in by_time.get(round(t, 4), ()):
             f0 = 440.0 * 2 ** ((p - 69) / 12)
@@ -582,7 +677,7 @@ def _refine(ya, notes, onsets, est, rolls=()):
                 if 1 <= b < nb - 1:
                     bins += [b - 1, b, b + 1]
         own_bins.append(bins)
-        a, b = max(int((e - win) * fps), 1), min(int((e + win) * fps) + 1, len(flux) - 1)
+        a, b = max(int((e - win) * fps), 1), min(int((e + max(win, far)) * fps) + 1, len(flux) - 1)
         if not bins or b - a < 5:
             cands.append((np.array([e]), np.array([0.0])))
             norm.append(None)

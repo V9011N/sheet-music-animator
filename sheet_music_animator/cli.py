@@ -31,7 +31,7 @@ def render(args) -> int:
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     from PySide6.QtWidgets import QApplication
     _app = QApplication.instance() or QApplication(["cli"])      # noqa: F841 - keeps Qt alive
-    from . import analysis
+    from . import analysis, msengraver
     from .build import build_score
     from .export import render_video, render_video_parallel, total_duration
     from . import looks
@@ -43,6 +43,8 @@ def render(args) -> int:
         project = Project.load(src)
     else:
         project = Project(xml_path=str(src))
+        if not args.verovio and msengraver.find_musescore():
+            project.settings.engraver = "musescore"
         project.settings.measures_per_line = args.measures_per_line
         project.settings.layout = "horizontal" if args.measures_per_line == 0 else "pages"
     s = project.settings
@@ -111,13 +113,15 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="python -m sheet_music_animator.cli", description=__doc__.split("\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
     r = sub.add_parser("render", help="render a MusicXML file or a .smanim project to a video")
-    r.add_argument("input", help="a MusicXML file (.mxl/.musicxml/.xml) or a .smanim project")
+    r.add_argument("input", help="a score (.mscz, or MusicXML .mxl/.musicxml/.xml) or a .smanim project")
+    r.add_argument("--verovio", action="store_true", help="engrave with Verovio even when MuseScore is installed")
     r.add_argument("--out", required=True, help="output .mp4")
     r.add_argument("--audio", help="recording to use as the soundtrack (default: the built-in synth)")
     r.add_argument("--align", action="store_true", help="fit the score's timing to the recording first")
     r.add_argument("--look", help="apply a look (after aligning): a built-in name (plain, winter_wind, ember, fireflies, "
                                   "ocean, golden_rain, neon, mono_storm, paper, photo), the name of one of yours, or a .json file")
-    r.add_argument("--measures-per-line", type=int, default=4, help="0 = the whole score on one line")
+    r.add_argument("--measures-per-line", type=int, default=4,
+                   help="0 = the whole score on one line, -1 = as printed (MuseScore's own line breaks)")
     r.add_argument("--size", help="e.g. 1920x1080")
     r.add_argument("--fps", type=int)
     r.add_argument("--crf", type=int, help="quality: lower is better and bigger (default 16)")

@@ -20,7 +20,7 @@ from PySide6.QtWidgets import (QApplication, QCheckBox, QColorDialog, QComboBox,
                                QSplitter, QStackedWidget, QTabBar, QTabWidget, QToolBar, QToolButton, QVBoxLayout,
                                QWidget)
 
-from . import analysis, audio, pdfimport
+from . import analysis, audio, msengraver, pdfimport
 from .engraver import NOTE_KINDS, REST_KINDS
 from .build import build_score
 from .effects_ui import EffectsPanel
@@ -110,13 +110,15 @@ class TriBox(QCheckBox):
 class LayoutDialog(QDialog):
     """Asks how many measures go on each line of the score."""
 
-    def __init__(self, parent, default: int, measures: int | None = None):
+    def __init__(self, parent, default: int, measures: int | None = None, printed: bool = False):
         super().__init__(parent)
         self.setWindowTitle("Measures per line")
         self.result_value: int | None = None
         lay = QVBoxLayout(self)
         lay.addWidget(QLabel("How many measures should each line of the score hold?\n"
-                             "This sets the size of the canvas and the automatic camera path."))
+                             "This sets the size of the canvas and the automatic camera path." +
+                             ("\n\nAs printed: MuseScore lays the score out with its own line breaks, exactly as "
+                              "it prints it." if printed else "")))
         row = QHBoxLayout()
         self.spin = QSpinBox()
         self.spin.setRange(1, 500)
@@ -127,10 +129,15 @@ class LayoutDialog(QDialog):
         lay.addLayout(row)
         buttons = QHBoxLayout()
         ok, one, cancel = QPushButton("OK"), QPushButton("Whole score on one line"), QPushButton("Cancel")
-        ok.setDefault(True)
+        ok.setDefault(not printed)
         ok.clicked.connect(lambda: self._done(self.spin.value()))
         one.clicked.connect(lambda: self._done(0))
         cancel.clicked.connect(self.reject)
+        if printed:
+            as_printed = QPushButton("As printed")
+            as_printed.setDefault(True)
+            as_printed.clicked.connect(lambda: self._done(-1))
+            buttons.addWidget(as_printed)
         for b in (ok, one, cancel):
             buttons.addWidget(b)
         lay.addLayout(buttons)
@@ -338,6 +345,7 @@ class MainWindow(QMainWindow):
         self.sp_mpl.setSuffix(" measures")
         self.sp_mpl.setKeyboardTracking(False)
         self.btn_one_line = QPushButton("Whole score on one line")
+        self.btn_printed = QPushButton("As printed (MuseScore's own line breaks)")
         self.font_box = QFontComboBox()
         self.font_box.setEditable(True)
         self.font_box.currentFontChanged.connect(lambda f: self._font_changed(f.family()))
@@ -348,6 +356,7 @@ class MainWindow(QMainWindow):
             s.valueChanged.connect(self._settings_changed)
         self.sp_mpl.editingFinished.connect(lambda: self._layout_changed(self.sp_mpl.value()))
         self.btn_one_line.clicked.connect(lambda: self._layout_changed(0))
+        self.btn_printed.clicked.connect(lambda: self._layout_changed(-1))
         self.cb_reveal.activated.connect(self._settings_changed)
         f.addRow("Note reveal", self.cb_reveal)
         f.addRow("Fade-in time", self.sp_fade)
@@ -358,6 +367,7 @@ class MainWindow(QMainWindow):
         f.addRow("Font (all text)", self.font_box)
         f.addRow("Measures per line", self.sp_mpl)
         f.addRow(self.btn_one_line)
+        f.addRow(self.btn_printed)
         f.addRow("Ink colour", self.btn_ink)
         f.addRow("Paper colour", self.btn_paper)
         return w
@@ -493,7 +503,9 @@ class MainWindow(QMainWindow):
                 a.setToolTip(tip)
             return a
 
-        self.a_open_xml = act("Open XML…", self.open_xml, "Ctrl+O", "Open a MusicXML score (.mxl, .musicxml, .xml)")
+        self.a_open_xml = act("Open score…", self.open_xml, "Ctrl+O",
+                              "Open a score: MuseScore (.mscz, laid out by MuseScore itself) or MusicXML "
+                              "(.mxl, .musicxml, .xml)")
         self.a_open_pdf = act("Open PDF (EXPERIMENTAL!)", self.open_pdf, "Ctrl+Shift+P",
                               "Read the music of an engraved PDF score (needs Audiveris or homr installed)")
         self.a_open = QAction("Open", self)
@@ -755,7 +767,8 @@ class MainWindow(QMainWindow):
         if not self._confirm_discard():
             return
         path, _ = QFileDialog.getOpenFileName(
-            self, "Open MusicXML", self.cfg.value("last_dir", ""),
+            self, "Open score", self.cfg.value("last_dir", ""),
+            "Scores (*.mscz *.mscx *.mxl *.musicxml *.xml);;MuseScore (*.mscz *.mscx);;"
             "MusicXML (*.mxl *.musicxml *.xml);;All files (*)")
         if path:
             self.open_xml_path(path)
@@ -846,7 +859,13 @@ class MainWindow(QMainWindow):
 
     def open_xml_path(self, path: str) -> bool:
         """Start a new project from a MusicXML file, asking how many measures go on a line."""
-        dlg = LayoutDialog(self, int(self.cfg.value("measures_per_line", 4)))
+        mscore = msengraver.find_musescore() is not None
+        if Path(path).suffix.lower() in (".mscz", ".mscx") and not mscore:
+            QMessageBox.warning(self, "MuseScore needed", "A MuseScore score (.mscz) is laid out by MuseScore, which "
+                                "was not found on this computer.\n\nInstall MuseScore 4 (musescore.org), or set the "
+                                "MUSESCORE environment variable to its program, or open a MusicXML export instead.")
+            return False
+        dlg = LayoutDialog(self, int(self.cfg.value("measures_per_line", 4)), printed=mscore)
         if dlg.exec() != QDialog.Accepted:
             return False
         self.cfg.setValue("last_dir", str(Path(path).parent))
@@ -857,6 +876,7 @@ class MainWindow(QMainWindow):
         settings = replace(self.project.settings, audio="synth", align_audio="", offset=0.0)
         self._clear_audio_cache()
         self.project = Project(xml_path=path, settings=settings)
+        self.project.settings.engraver = "musescore" if mscore else "verovio"
         self.project.settings.measures_per_line = dlg.result_value
         self.project.settings.layout = "horizontal" if dlg.result_value == 0 else "pages"
         self.project_path = None
@@ -1230,6 +1250,7 @@ class MainWindow(QMainWindow):
         self.sp_offset.setValue(s.offset)
         self.sp_tail.setValue(s.tail)
         self.sp_mpl.setValue(s.measures_per_line if s.measures_per_line > 0 else int(self.cfg.value("measures_per_line", 4)))
+        self.btn_printed.setVisible(s.engraver == "musescore")
         self.sp_mpl.setEnabled(True)
         self.font_box.setCurrentFont(QFont(s.font))
         self.font_box.lineEdit().setText(s.font)

@@ -343,7 +343,7 @@ class TestOpenMenu(unittest.TestCase):
     def test_open_is_a_drop_down_with_xml_and_pdf(self):
         button = self.win._open_button()
         self.assertEqual(button.text(), "Open")
-        self.assertEqual([a.text() for a in self.win.a_open.menu().actions()], ["Open XML…", "Open PDF (EXPERIMENTAL!)"])
+        self.assertEqual([a.text() for a in self.win.a_open.menu().actions()], ["Open score…", "Open PDF (EXPERIMENTAL!)"])
 
     def test_a_pdf_without_music_is_refused_with_a_message(self):
         pdf = make_pdf(Path(tempfile.mkdtemp()) / "letter.pdf", ["text"])

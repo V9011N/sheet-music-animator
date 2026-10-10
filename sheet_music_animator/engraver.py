@@ -28,11 +28,13 @@ import verovio
 from lxml import etree
 from svgelements import Path as SvgPath
 
+from . import xmlfix
+
 SVG_NS = "http://www.w3.org/2000/svg"
 XLINK_NS = "http://www.w3.org/1999/xlink"
 _G, _SVG, _USE = (f"{{{SVG_NS}}}{t}" for t in ("g", "svg", "use"))
 _HREF = f"{{{XLINK_NS}}}href"
-_NUM = re.compile(r"-?(?:\d+\.?\d*|\.\d+)(?:e-?\d+)?", re.I)
+_NUM = re.compile(r"-?(?:\d+\.?\d*|\.\d+)(?:e[-+]?\d+)?", re.I)
 _NOT_LINES = re.compile(r"[^eE\d\s.,+-]")   # what is left once absolute M/L commands are removed from plain-polyline paths
 
 NOTE_KINDS = {"note", "chord"}
@@ -266,7 +268,7 @@ class BoxCalculator:
             if len(v) >= 4:
                 xs, ys = v[0::2], v[1::2]
                 b = (min(xs), min(ys), max(xs), max(ys))
-        elif tag == "rect":
+        elif tag in ("rect", "image"):
             x, y = float(el.get("x", 0)), float(el.get("y", 0))
             b = (x, y, x + float(el.get("width", 0)), y + float(el.get("height", 0)))
         elif tag == "ellipse":
@@ -342,6 +344,51 @@ def hidden_staves(path) -> dict[str, set[int]]:
                 hidden.setdefault(m.get("number"), set()).update(base + n for n in off)
         base += nstaves
     return hidden
+
+
+def empty_extra_staves(root, breaks) -> dict[str, set[int]]:
+    """{measure number: staves to hide} for the lines given by `breaks` (a number of measures per line, 0 = one
+    line, or the indices of the measures that start a line): in an instrument written on three staves or more, a
+    staff with nothing but rests for a whole line is left out of that line (the way three-stave piano music is
+    printed), as long as two staves remain (if not, the lowest empty ones stay).  Staves are numbered the way
+    Verovio/MEI numbers them."""
+    if root is None or root.tag != "score-partwise" or breaks is None:
+        return {}
+    parts = root.findall("part")
+    names = {(p.findtext("part-name") or "").strip().lower() for p in root.findall("part-list/score-part")}
+    # one instrument spread over several parts (an extra staff for the piano written as a second "Piano") counts
+    # as one instrument
+    groups = [parts] if len(parts) > 1 and len(names) == 1 else [[p] for p in parts]
+    out: dict[str, set[int]] = {}
+    base = 0
+    for group in groups:
+        staves, measures = [], []        # (staff number, part, its own staff number); the measures of each part
+        for part in group:
+            n = max([int(t) for t in part.xpath(".//attributes/staves/text()") if t.strip().isdigit()] or [1])
+            staves += [(base + s, part, s) for s in range(1, n + 1)]
+            measures.append(part.findall("measure"))
+            base += n
+        count = min(len(ms) for ms in measures)
+        if len(staves) < 3 or not count:
+            continue
+        if isinstance(breaks, (list, tuple, set)):
+            starts = sorted({0, *breaks})
+        else:
+            starts = list(range(0, count, breaks)) if breaks else [0]
+        for a, b in zip(starts, starts[1:] + [count]):
+            sounding = set()
+            for part, ms in zip(group, measures):
+                for m in ms[a:b]:
+                    sounding |= {(id(part), int(n.findtext("staff") or 1)) for n in m.iter("note")
+                                 if n.find("rest") is None and n.get("print-object") != "no"}
+            empty = [g for g, part, s in staves if (id(part), s) not in sounding]
+            short = 2 - (len(staves) - len(empty))       # empty staves that must stay so that two are shown:
+            if short > 0:                                 # the lowest ones (the piano keeps its bass staff)
+                empty = empty[:len(empty) - short]
+            if empty:
+                for m in measures[0][a:b]:
+                    out.setdefault(m.get("number"), set()).update(empty)
+    return out
 
 
 def has_cross_staff(path) -> bool:
@@ -539,26 +586,119 @@ def _flip_slurs(tk, sides: dict[str, str]) -> bool:
     return hit and tk.loadData(etree.tostring(root, encoding="unicode"))
 
 
+def _page_size(svg: str) -> tuple[float, float]:
+    """Width and height of Verovio's page (the inner <svg>, in the units its drawing uses)."""
+    root = etree.fromstring(svg.encode("utf8"))
+    inner = next((e for e in root if e.tag == _SVG), root)
+    vb = [float(v) for v in (inner.get("viewBox") or "0 0 0 0").split()]
+    return vb[2], vb[3]
+
+
+def _wild_curves(svg_root, width: float, height: float) -> set[str]:
+    """Ids of the slurs and ties whose curve reaches far outside a page of this size (Verovio sometimes computes
+    control points millions of units away, and the systems after them are pushed down as far)."""
+    out = set()
+    for g in svg_root.iter(_G):
+        if not _classes(g) & {"slur", "tie"} or not g.get("id"):
+            continue
+        for p in g.iter(f"{{{SVG_NS}}}path"):
+            v = [float(x) for x in _NUM.findall(p.get("d") or "")]
+            xs, ys = v[0::2], v[1::2]
+            if xs and (min(xs) < -width or max(xs) > 2 * width or min(ys) < -height or max(ys) > 2 * height):
+                out.add(g.get("id"))
+    return out
+
+
+def _check_flipped(tk, before: str, flipped: dict[str, str]) -> str:
+    """The SVG after `_flip_slurs`, unless the flip broke the layout: a flipped slur whose curve flies off the page
+    (and pushes every later system down with it) goes back to the side it had; if the page is still out of all
+    proportion, every flip is undone (a slur that loops is better than a page a million times too tall)."""
+    w, h = _page_size(before)
+    svg = tk.renderToSVG(1)
+    wild = _wild_curves(etree.fromstring(svg.encode("utf8")), w, h) & set(flipped)
+    if wild and _flip_slurs(tk, {i: ("below" if flipped[i] == "above" else "above") for i in wild}):
+        svg = tk.renderToSVG(1)
+    if _page_size(svg)[1] > 1.5 * h + 20000:
+        _flip_slurs(tk, {i: ("below" if s == "above" else "above") for i, s in flipped.items()})
+        svg = tk.renderToSVG(1)
+    return svg
+
+
 _DYNAMIC_WORD = re.compile(r"^[pmfrszn]+$")
+
+
+def _merged_dynamic(texts: list[str]) -> str:
+    """What to print for dynamics written at the same moment of a staff.  The notation programs keep a hidden
+    loudness next to an accent for the playback ("f" under "fz", "fff" under "fz") without saying so in the
+    MusicXML, and two plain levels at one moment contradict each other.  So: a level that an accent already
+    implies (f, ff, ... next to sf, fz, sfz, rf ...) goes, as does every plain level but the last written; a
+    softer level next to an accent is a real "p sf" and both stay."""
+    accents = [t for t in texts if not _PLAIN_DYNAMIC.match(t)]
+    plain = [t for t in texts if _PLAIN_DYNAMIC.match(t)]
+    if plain and not accents:
+        return plain[-1]
+    loud = any("f" in a for a in accents)
+    keep = [p for p in plain[-1:] if not (loud and p.startswith("f"))]
+    return " ".join([t for t in texts if t in keep or t in accents])
+
+
+_PLAIN_DYNAMIC = re.compile(r"^(p+|f+|mp|mf)$")
 
 
 def _merge_dynamics(root) -> bool:
     """Dynamics written separately at the same moment of a staff ("p" and "sf" as two markings) are drawn on top
-    of each other by Verovio; they become one marking, "p sf", the way the notation programs set them."""
+    of each other by Verovio; they become one marking, "p sf", the way the notation programs set them (see
+    `_merged_dynamic` for which of them are printed).  A dynamic on the very spot of words that are dynamics too
+    ("pp" and "cresc. - - -") goes in front of the words: "pp cresc. - - -"."""
     m = f"{{{MEI_NS}}}"
     changed = False
     for meas in root.iter(m + "measure"):
         groups: dict = {}
+        words: dict = {}
         for d in meas.findall(m + "dynam"):
             text = "".join(d.itertext()).strip()
             if len(d) == 0 and _DYNAMIC_WORD.match(text):
                 key = (d.get("staff"), d.get("tstamp"), d.get("startid"), d.get("place"))
                 groups.setdefault(key, []).append(d)
-        for ds in groups.values():
+            elif text:
+                words.setdefault((d.get("staff"), d.get("tstamp"), d.get("startid"), d.get("place")), []).append(d)
+        for key, ds in groups.items():
             if len(ds) > 1:
-                ds[0].text = " ".join(d.text.strip() for d in ds)
+                ds[0].text = _merged_dynamic([d.text.strip() for d in ds])
                 for d in ds[1:]:
                     meas.remove(d)
+                changed = True
+            w = words.get(key)
+            if w and len(w) == 1:
+                w[0].text = ds[0].text.strip() + " " + (w[0].text or "").lstrip()
+                meas.remove(ds[0])
+                changed = True
+                continue
+            # the same dynamic written once more at the start of words there ("pp" and "pp dolciss.", the letters
+            # typed in the music font): it is printed once
+            for d in meas.findall(m + "dir"):
+                if (d.get("staff"), d.get("tstamp")) != key[:2]:
+                    continue
+                lead = "".join(_DYN_GLYPHS.get(c, c) for c in "".join(d.itertext())).split()[:1]
+                if lead == [ds[0].text.strip()]:
+                    meas.remove(ds[0])
+                    changed = True
+                    break
+    return changed
+
+
+def _pedal_forms(root, forms) -> bool:
+    """Give the pedal marks of every measure the forms read from the MusicXML (matched in order, and only where a
+    measure has as many marks as the MusicXML says)."""
+    m = f"{{{MEI_NS}}}"
+    changed = False
+    for meas, fs in zip(root.iter(m + "measure"), forms):
+        ps = meas.findall(m + "pedal")
+        if len(ps) != len(fs):
+            continue
+        for p, f in zip(ps, fs):
+            if f and p.get("form") == "line":
+                p.set("form", f)
                 changed = True
     return changed
 
@@ -637,16 +777,42 @@ _DYN_GLYPHS = {"\ue520": "p", "\ue521": "m", "\ue522": "f", "\ue523": "r", "\ue5
                "\ue538": "sfpp", "\ue539": "sfz", "\ue53a": "sfzp", "\ue53b": "sffz", "\ue53c": "rf", "\ue53d": "rfz"}
 
 
+_SMUFL_DIGITS = {chr(base + d): str(d) for base in (0xE080, 0xE880, 0xED10) for d in range(10)}   # time signature,
+_SMUFL_DIGITS.update({"": ":", "": "+"})                                   # tuplet, fingering digits
+
+
 def _fix_text_glyphs(root) -> None:
     """Give the Leipzig glyphs inside <text> a stand-in that Qt can draw: dynamics become bold italic letters,
     metronome notes become Unicode music symbols (drawn with a font that has them); anything else is dropped
     rather than shown as a box."""
     for text in root.iter(f"{{{SVG_NS}}}text"):    # keep the spaces between the pieces ("f  risoluto")
         text.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
-    for ts in root.iter(f"{{{SVG_NS}}}tspan"):
+    dynamics = set()                                 # the pieces that became dynamic letters
+    for ts in list(root.iter(f"{{{SVG_NS}}}tspan")):
         if ts.text and "\xa0" in ts.text:      # Qt's SVG renderer swallows no-break spaces
             ts.text = ts.text.replace("\xa0", " ")
-        if ts.get("font-family") != "Leipzig" or not ts.text:
+        prev = ts.getprevious()
+        lead = len(ts.text or "") - len((ts.text or "").lstrip())
+        if lead and len(ts) == 0 and prev is not None and _tag(prev) == "tspan" and prev.text:
+            # ...and the spaces a <tspan> starts with ("p", " ", "sf"; "pp", " cresc."), or draws them narrower than
+            # one: the gap becomes one en space at the end of the piece before it
+            prev.text += " "
+            ts.text = ts.text[lead:]
+            if not ts.text:
+                ts.getparent().remove(ts)
+                continue
+        elif ts.text and prev is not None and prev in dynamics and not ts.text[0].isspace():
+            prev.text += " "          # dynamic letters right before words ("mp", "cresc."): Verovio drops the space
+        if ts.get("font-family") != "Leipzig" and ts.text and ts.text.strip() and \
+                all(c in _DYN_GLYPHS or c.isspace() for c in ts.text):
+            ts.set("font-family", "Leipzig")       # dynamics typed as music-font text ("pp dolciss."): as Verovio's
+        if ts.get("font-family") != "Leipzig":
+            if ts.text and any(0xE000 <= ord(c) <= 0xF8FF for c in ts.text):
+                # music-font characters typed into ordinary text (MuseScore's tuplet "3" in a text line): digits
+                # become digits, the rest cannot be drawn without the music font
+                ts.text = "".join(_SMUFL_DIGITS.get(c, c) for c in ts.text if c in _SMUFL_DIGITS or not 0xE000 <= ord(c) <= 0xF8FF)
+            continue
+        if not ts.text:
             continue
         text = ts.text
         if all(c in _DYN_GLYPHS or c.isspace() for c in text):
@@ -655,6 +821,7 @@ def _fix_text_glyphs(root) -> None:
             ts.set("font-style", "italic")
             ts.set("font-weight", "bold")
             ts.set("font-size", "520px")
+            dynamics.add(ts)
         elif any(c in _NOTE_GLYPHS for c in text):
             ts.text = "".join(_NOTE_GLYPHS.get(c, c) for c in text)
             ts.set("font-family", SYMBOL_TOKEN.decode())
@@ -958,7 +1125,8 @@ def _ties_of_hidden_notes(root) -> set[str]:
             if {(t.get("startid") or "").lstrip("#"), (t.get("endid") or "").lstrip("#")} & hidden and t.get(XML_ID)}
 
 
-def _adjust_mei(tk, path, hidden, cross, breaks=None, beams=None, arpeggios=False) -> tuple[set[str], set[str]]:
+def _adjust_mei(tk, load, hidden, cross, breaks=None, beams=None, arpeggios=False,
+                pedals=None) -> tuple[set[str], set[str], dict]:
     """Work around Verovio's MusicXML import by re-loading the score through MEI:
     * hidden staves (print-object="no"): marked invisible, their xml:ids returned so that
       `_remove_hidden_staves` can take them out of the SVG afterwards (only rest-only staves are touched);
@@ -968,7 +1136,9 @@ def _adjust_mei(tk, path, hidden, cross, breaks=None, beams=None, arpeggios=Fals
       dynamics drawn on top of each other (`_merge_dynamics`).
     The score is only re-loaded when something changed.  Returns the ids of the hidden <staff> elements and of
     the ties of hidden notes (`_ties_of_hidden_notes`), both to be taken out of the SVG (and re-breaks the
-    lines when `breaks` is given)."""
+    lines when `breaks` is given).  `load` loads the score as it was before (when the changes cannot be applied).
+    `pedals`: the form of every pedal mark (`xmlfix.pedal_forms`).  Also returns what `_drop_hidden_staves` took
+    out of which lines."""
     ns = {"m": MEI_NS}
     root = etree.fromstring(tk.getMEI().encode("utf8"))
     changed = _fix_cross_staff_clefs(root) if cross else False
@@ -981,6 +1151,8 @@ def _adjust_mei(tk, path, hidden, cross, breaks=None, beams=None, arpeggios=Fals
     if arpeggios:
         changed = _split_arpeggios(root) or changed
     changed = _merge_dynamics(root) or changed
+    if pedals:
+        changed = _pedal_forms(root, pedals) or changed
     if cross:
         changed = _fix_run_slurs(root) or changed
     ids: set[str] = set()
@@ -995,15 +1167,198 @@ def _adjust_mei(tk, path, hidden, cross, breaks=None, beams=None, arpeggios=Fals
                 elif staff.get("visible") == "false":
                     del staff.attrib["visible"]   # Verovio's import switches off *every* staff of such a measure
         changed = changed or bool(ids)
+    dropped: dict = {}
     if breaks:
         changed = _set_line_breaks(root, breaks) or changed
+        if hidden:     # after the line breaks: a line's <scoreDef> follows the break that starts it
+            dropped = _drop_hidden_staves(root, hidden, breaks)
+            changed = changed or bool(dropped)
     ghosts = _ties_of_hidden_notes(root)
     if not changed:
-        return set(), ghosts
+        return set(), ghosts, {}
     if not tk.loadData(etree.tostring(root, encoding="unicode")):
-        tk.loadFile(str(path))   # could not be applied: keep the plain import (whose ids are new)
-        return set(), set()
-    return ids, ghosts
+        load()   # could not be applied: keep the plain import (whose ids are new)
+        return set(), set(), {}
+    return ids, ghosts, dropped
+
+
+def _bare_staff_grp(grp, drop: set[str], names: bool):
+    """A copy of a <staffGrp> without the staves in `drop`: its brace or bracket, the staves' numbers and lines
+    (clefs and keys stay as they are when it takes effect), and with `names` the names of the instruments."""
+    keep = lambda k: k != XML_ID and (names or not k.startswith("label"))            # noqa: E731
+    g = etree.Element(grp.tag, {k: v for k, v in grp.attrib.items() if keep(k)})
+    for ch in grp:
+        name = _local(ch)
+        if name == "staffDef" and ch.get("n") not in drop:
+            d = etree.SubElement(g, ch.tag, {k: v for k, v in ch.attrib.items() if k in ("n", "lines") or
+                                             (names and k.startswith("label"))})
+            if names:
+                for lab in ch:
+                    if _local(lab) in ("label", "labelAbbr"):
+                        d.append(_copy_without_ids(lab))
+        elif name == "staffGrp":
+            sub = _bare_staff_grp(ch, drop, names)
+            if sub.find(f"{{{MEI_NS}}}staffDef") is not None or sub.find(f"{{{MEI_NS}}}staffGrp") is not None:
+                g.append(sub)
+        elif name == "grpSym" or (names and name in ("label", "labelAbbr")):
+            g.append(_copy_without_ids(ch))
+    return g
+
+
+def _copy_without_ids(el):
+    c = copy.deepcopy(el)
+    for e in c.iter():
+        if isinstance(e.tag, str):
+            e.attrib.pop(XML_ID, None)
+    return c
+
+
+def _drop_hidden_staves(root, hidden, breaks) -> dict:
+    """Take the staves that are hidden for a whole line out of that line, so that Verovio lays the line out with
+    the staves that are shown (a staff it is told is invisible keeps its room: a gap above the music).  A
+    <scoreDef> without them starts the line, one with all of them the next line that shows them again.  Only
+    staves without notes go; what is hidden in only some measures of a line is left to `_remove_hidden_staves`.
+    Returns {"lines": {line index: the staff numbers it keeps}, "groups": [(staff numbers) of every braced or
+    bracketed group]} for the lines that lost staves (Verovio draws no brace on them: `_restore_braces`)."""
+    m = f"{{{MEI_NS}}}"
+    measures = list(root.iter(m + "measure"))
+    sd = next(root.iter(m + "scoreDef"), None)
+    grp = sd.find(m + "staffGrp") if sd is not None else None
+    if grp is None or not measures:
+        return {}
+    starts = sorted({0, *breaks}) if isinstance(breaks, (list, tuple, set)) else list(range(0, len(measures), breaks))
+    lines = [(a, b) for a, b in zip(starts, starts[1:] + [len(measures)]) if a < len(measures)]
+    shown, kept = set(), {}
+    for li, (a, b) in enumerate(lines):
+        drop = None
+        for meas in measures[a:b]:
+            silent = {st.get("n") for st in meas.findall(m + "staff") if not st.xpath(".//m:note", namespaces={"m": MEI_NS})}
+            here = {str(n) for n in hidden.get(meas.get("n"), set())} & silent
+            drop = here if drop is None else drop & here
+        drop = drop or set()
+        if drop != shown:
+            new = etree.Element(m + "scoreDef")
+            new.append(_bare_staff_grp(grp, drop, names=a == 0))
+            measures[a].addprevious(new)
+            shown = drop
+        top = min((n for n in (st.get("n") for st in measures[a].findall(m + "staff")) if n not in drop),
+                  key=int, default=None)
+        if drop:
+            kept[li] = sorted(int(st.get("n")) for st in measures[a].findall(m + "staff") if st.get("n") not in drop)
+        for meas in measures[a:b] if drop else ():
+            gone = set()
+            for st in [st for st in meas.findall(m + "staff") if st.get("n") in drop]:
+                gone |= {e.get(XML_ID) for e in st.iter() if e.get(XML_ID)}
+                meas.remove(st)
+            for ev in [e for e in meas if _local(e) != "staff"]:
+                refs = {(ev.get(k) or "").lstrip("#") for k in ("startid", "endid")} | \
+                       {r.lstrip("#") for r in (ev.get("plist") or "").split()}
+                staves = (ev.get("staff") or "").split()
+                if refs & gone:
+                    meas.remove(ev)
+                elif staves and set(staves) <= drop:      # a tempo or a dynamic of the staff: on the top one shown
+                    ev.set("staff", top) if top else meas.remove(ev)
+                elif staves and set(staves) & drop:
+                    ev.set("staff", " ".join(s for s in staves if s not in drop))
+    if not kept:
+        return {}
+    groups = [tuple(int(d.get("n")) for d in g.iter(m + "staffDef")) for g in grp.iter(m + "staffGrp")
+              if g.find(m + "grpSym") is not None or g.get("symbol")]
+    return {"lines": kept, "groups": [g for g in groups if g]}
+
+
+def _map_y(d: str, a: float, c: float) -> str:
+    """Map the y coordinates of an absolute M/C/L path: y -> a * y + c."""
+    nums = _NUM.findall(d)
+    out, i = [], 0
+    for tok in re.split(r"(-?(?:\d+\.?\d*|\.\d+)(?:e-?\d+)?)", d):
+        if i < len(nums) and tok == nums[i]:
+            out.append(f"{a * float(tok) + c if i % 2 else float(tok):.2f}")
+            i += 1
+        else:
+            out.append(tok)
+    return "".join(out)
+
+
+def _staves_of(system) -> list[tuple]:
+    """(left, top, bottom) of the staff lines of every staff in the first measure of a system, top to bottom."""
+    for meas in system:
+        if _tag(meas) == "g" and "measure" in _classes(meas):
+            out = []
+            for st in meas:
+                if _tag(st) == "g" and "staff" in _classes(st):
+                    v = [float(x) for p in st if _tag(p) == "path" for x in _NUM.findall(p.get("d") or "")]
+                    if v:
+                        out.append((min(v[0::2]), min(v[1::2]), max(v[1::2])))
+            return out
+    return []
+
+
+_BRACE: list = []      # (brace <g>, left, top, bottom of the staves it spans) of a two-staff score, made once
+
+
+def _brace_template():
+    """A brace as Verovio draws it, with the staves it spans, from a small two-staff score."""
+    if not _BRACE:
+        mei = ('<mei xmlns="http://www.music-encoding.org/ns/mei" meiversion="5.0"><music><body><mdiv><score>'
+               '<scoreDef><staffGrp><staffGrp bar.thru="true"><grpSym symbol="brace"/>'
+               '<staffDef n="1" lines="5" clef.shape="G" clef.line="2"/><staffDef n="2" lines="5" clef.shape="F" '
+               'clef.line="4"/></staffGrp></staffGrp></scoreDef><section><measure n="1"><staff n="1"><layer n="1">'
+               '<mRest/></layer></staff><staff n="2"><layer n="1"><mRest/></layer></staff></measure></section>'
+               '</score></mdiv></body></music></mei>')
+        tk = verovio.toolkit()
+        tk.setOptions({"scale": 40, "svgViewBox": True, "header": "none", "footer": "none", "pageMarginLeft": 40})
+        tk.loadData(mei)
+        svg = etree.fromstring(tk.renderToSVG(1).encode("utf8"))
+        system = next(g for g in svg.iter(_G) if "system" in _classes(g))
+        brace = next((g for g in system.iter(_G) if "grpSym" in _classes(g)), None)
+        st = _staves_of(system)
+        if brace is not None and len(st) == 2:
+            _BRACE.append((brace, st[0][0], st[0][1], st[1][2]))
+    return _BRACE[0] if _BRACE else None
+
+
+def _restore_braces(svg_root, dropped: dict) -> None:
+    """Verovio draws no brace on a line that leaves staves out (`_drop_hidden_staves`): every braced group that
+    still shows two staves or more there gets one over them, the shape of a brace Verovio drew in this score
+    (or in a small one), stretched."""
+    systems = [g for g in svg_root.iter(_G) if "system" in _classes(g)]
+    lines, groups = dropped.get("lines", {}), dropped.get("groups", [])
+    template = None
+    for i, s in enumerate(systems):        # a brace Verovio drew in this score, with the staves it spans
+        if i in lines:
+            continue
+        st = _staves_of(s)
+        for g in (g for g in s.iter(_G) if "grpSym" in _classes(g)):
+            box = BoxCalculator({}).box(g)
+            inside = [x for x in st if box and box[1] - 300 <= x[1] and x[2] <= box[3] + 300]
+            if box and len(inside) >= 2 and any(len(grp) == len(inside) for grp in groups):
+                template = (g, inside[0][0], inside[0][1], inside[-1][2])
+                break
+        if template:
+            break
+    template = template or _brace_template()
+    if template is None:
+        return
+    brace, left, top, bottom = template
+    for i, keep in lines.items():
+        if i >= len(systems):
+            continue
+        st = _staves_of(systems[i])
+        if len(st) != len(keep):
+            continue
+        at = dict(zip(keep, st))
+        for grp in groups:
+            shown = [at[n] for n in grp if n in at]
+            if len(shown) < 2:
+                continue
+            a = (shown[-1][2] - shown[0][1]) / max(bottom - top, 1e-6)
+            c = copy.deepcopy(brace)
+            c.attrib.pop("id", None)
+            c.set("transform", f"translate({shown[0][0] - left:.2f},0) " + (c.get("transform") or ""))
+            for p in c.iter(f"{{{SVG_NS}}}path"):
+                p.set("d", _map_y(p.get("d"), a, shown[0][1] - a * top))
+            systems[i].insert(0, c)
 
 
 def _scale_y(d: str, top: float, k: float) -> str:
@@ -1076,7 +1431,8 @@ def engrave(path, layout: str = "pages", ink: str = "#000000", progress=None,
     tk = verovio.toolkit()
     opts = {"scale": 40, "svgViewBox": True, "header": "none", "footer": "none",
             "svgAdditionalAttribute": ["tie@endid", "artic@artic", "note@pname", "note@oct"],
-            "pageMarginLeft": 40, "pageMarginRight": 40, "pageMarginTop": 60, "pageMarginBottom": 60}
+            "pageMarginLeft": 40, "pageMarginRight": 40, "pageMarginTop": 60, "pageMarginBottom": 60,
+            "systemDivider": "none"}   # the "//" between the lines of a score of several parts: no score here prints it
     breaks = None
     if line_starts is not None or measures_per_line is not None:
         one_line = len(line_starts) <= 1 if line_starts is not None else measures_per_line == 0
@@ -1089,13 +1445,20 @@ def engrave(path, layout: str = "pages", ink: str = "#000000", progress=None,
     if cross:   # a beam that crosses between staves is not taken into account when Verovio spaces the staves
         opts["spacingStaff"] = CROSS_STAFF_SPACING
     tk.setOptions(opts)
-    if not tk.loadFile(str(path)):
+    root = _read_musicxml(path)
+    data = etree.tostring(root, encoding="unicode") if xmlfix.clean(root) else None
+    load = (lambda: tk.loadData(data)) if data is not None else (lambda: tk.loadFile(str(path)))
+    if not load():
         raise ValueError(f"Verovio could not read {path}")
-    hidden_ids, ghost_ids = _adjust_mei(tk, path, hidden, cross, breaks, beams, not numbered_arpeggios(path))
+    explicit = line_starts is not None or measures_per_line is not None   # we know the lines (else Verovio breaks them)
+    for num, staves in empty_extra_staves(root, (breaks if breaks is not None else 0) if explicit else None).items():
+        hidden.setdefault(num, set()).update(staves)
+    hidden_ids, ghost_ids, dropped = _adjust_mei(tk, load, hidden, cross, breaks, beams, not numbered_arpeggios(path),
+                                        xmlfix.pedal_forms(root) if root is not None else None)
     svg = tk.renderToSVG(1)
     loops = _looping_slurs(etree.fromstring(svg.encode("utf8")))
     if loops and _flip_slurs(tk, loops):
-        svg = tk.renderToSVG(1)
+        svg = _check_flipped(tk, svg, loops)
     timemap = tk.renderToTimemap({"includeRests": True, "includeMeasures": True})
     timemap = json.loads(timemap) if isinstance(timemap, str) else timemap
 
@@ -1115,6 +1478,8 @@ def engrave(path, layout: str = "pages", ink: str = "#000000", progress=None,
     root = etree.fromstring(svg.encode("utf8"), etree.XMLParser(remove_blank_text=True))
     if hidden_ids:
         _remove_hidden_staves(root, hidden_ids)
+    if dropped:
+        _restore_braces(root, dropped)
     defs = {e.get("id"): e for d in root.iter(f"{{{SVG_NS}}}defs") for e in d if e.get("id")}
     for e in [e for e in root.iter(_G) if e.get("id") in ghost_ids] + _stacked_trills(root, BoxCalculator(defs)):
         e.getparent().remove(e)
@@ -1162,6 +1527,81 @@ def _rolls(tk, on) -> list[tuple]:
         else:
             merged.append(g)
     return [tuple(sorted(g)) for g in merged]
+
+
+def read_midi(data: bytes, velocity: bool = False, restrike: bool = False):
+    """(pitch, start, end, velocity) of every note of a standard MIDI file (seconds, tempo changes followed).
+    The velocity is the file's with `velocity`, else 80.  With `restrike` a note struck again ends the one of its
+    pitch still sounding (a piano has one key per pitch; two voices sharing a pitch otherwise pair their note-offs
+    with the wrong note and one of them sounds for seconds).  Returns None when the data cannot be read."""
+    try:
+        if data[:4] != b"MThd":
+            return None
+        ntracks, division = int.from_bytes(data[10:12], "big"), int.from_bytes(data[12:14], "big")
+        if division & 0x8000:
+            return None
+        pos, events, tempos = 14, [], []
+        for _ in range(ntracks):
+            if data[pos:pos + 4] != b"MTrk":
+                return None
+            end = pos + 8 + int.from_bytes(data[pos + 4:pos + 8], "big")
+            pos, tick, status = pos + 8, 0, 0
+
+            def varlen():
+                nonlocal pos
+                v = 0
+                while True:
+                    b = data[pos]
+                    pos += 1
+                    v = (v << 7) | (b & 0x7F)
+                    if not b & 0x80:
+                        return v
+            while pos < end:
+                tick += varlen()
+                if data[pos] & 0x80:
+                    status, pos = data[pos], pos + 1
+                if status == 0xFF:
+                    kind, size = data[pos], None
+                    pos += 1
+                    size = varlen()
+                    if kind == 0x51 and size == 3:
+                        tempos.append((tick, int.from_bytes(data[pos:pos + 3], "big")))
+                    pos += size
+                elif status in (0xF0, 0xF7):
+                    pos += varlen()
+                elif status >> 4 in (0xC, 0xD):
+                    pos += 1
+                else:
+                    if status >> 4 in (0x8, 0x9):
+                        events.append((tick, status >> 4 == 0x9 and data[pos + 1] > 0, data[pos], data[pos + 1]))
+                    pos += 2
+            pos = end
+    except (IndexError, ValueError):
+        return None
+    tempos = sorted(set(tempos)) or [(0, 500000)]
+    marks, sec = [], 0.0   # (tick, seconds at that tick, microseconds per quarter)
+    for i, (tk_, us) in enumerate(tempos):
+        if marks:
+            sec += (tk_ - marks[-1][0]) * marks[-1][2] / 1e6 / division
+        marks.append((tk_, sec, us))
+    ticks = [m[0] for m in marks]
+
+    def seconds(t):
+        m = marks[max(bisect_right(ticks, t) - 1, 0)]
+        return m[1] + (t - m[0]) * m[2] / 1e6 / division
+    notes, open_ = [], {}
+    for tick, on, pitch, vel in sorted(events, key=lambda e: (e[0], e[1])):   # offs before ons
+        if on:
+            if restrike and open_.get(pitch):
+                start, v = open_[pitch].pop()
+                if seconds(tick) > start:
+                    notes.append([pitch, start, seconds(tick), v if velocity else 80])
+                open_[pitch] = []
+            open_.setdefault(pitch, []).append((seconds(tick), vel))
+        elif open_.get(pitch):
+            start, v = open_[pitch].pop(0)
+            notes.append([pitch, start, seconds(tick), v if velocity else 80])
+    return notes or None
 
 
 class _Builder:
@@ -1544,69 +1984,9 @@ class _Builder:
         every time, which took ~10 s for a long piece.  Returns None when the MIDI cannot be read.
         """
         try:
-            data = base64.b64decode(tk.renderToMIDI())
-            if data[:4] != b"MThd":
-                return None
-            ntracks, division = int.from_bytes(data[10:12], "big"), int.from_bytes(data[12:14], "big")
-            if division & 0x8000:
-                return None
-            pos, events, tempos = 14, [], []
-            for _ in range(ntracks):
-                if data[pos:pos + 4] != b"MTrk":
-                    return None
-                end = pos + 8 + int.from_bytes(data[pos + 4:pos + 8], "big")
-                pos, tick, status = pos + 8, 0, 0
-
-                def varlen():
-                    nonlocal pos
-                    v = 0
-                    while True:
-                        b = data[pos]
-                        pos += 1
-                        v = (v << 7) | (b & 0x7F)
-                        if not b & 0x80:
-                            return v
-                while pos < end:
-                    tick += varlen()
-                    if data[pos] & 0x80:
-                        status, pos = data[pos], pos + 1
-                    if status == 0xFF:
-                        kind, size = data[pos], None
-                        pos += 1
-                        size = varlen()
-                        if kind == 0x51 and size == 3:
-                            tempos.append((tick, int.from_bytes(data[pos:pos + 3], "big")))
-                        pos += size
-                    elif status in (0xF0, 0xF7):
-                        pos += varlen()
-                    elif status >> 4 in (0xC, 0xD):
-                        pos += 1
-                    else:
-                        if status >> 4 in (0x8, 0x9):
-                            events.append((tick, status >> 4 == 0x9 and data[pos + 1] > 0, data[pos], data[pos + 1]))
-                        pos += 2
-                pos = end
-        except (IndexError, ValueError):
+            return read_midi(base64.b64decode(tk.renderToMIDI()))
+        except ValueError:
             return None
-        tempos = sorted(set(tempos)) or [(0, 500000)]
-        marks, sec = [], 0.0   # (tick, seconds at that tick, microseconds per quarter)
-        for i, (tk_, us) in enumerate(tempos):
-            if marks:
-                sec += (tk_ - marks[-1][0]) * marks[-1][2] / 1e6 / division
-            marks.append((tk_, sec, us))
-        ticks = [m[0] for m in marks]
-
-        def seconds(t):
-            m = marks[max(bisect_right(ticks, t) - 1, 0)]
-            return m[1] + (t - m[0]) * m[2] / 1e6 / division
-        notes, open_ = [], {}
-        for tick, on, pitch, vel in sorted(events, key=lambda e: (e[0], e[1])):   # offs before ons
-            if on:
-                open_.setdefault(pitch, []).append((seconds(tick), vel))
-            elif open_.get(pitch):
-                start, v = open_[pitch].pop(0)
-                notes.append([pitch, start, seconds(tick), 80])
-        return notes or None
 
     def _audio_notes(self, tk):
         notes = self._midi_notes(tk)

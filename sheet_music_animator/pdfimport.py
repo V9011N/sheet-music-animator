@@ -589,7 +589,7 @@ def recognize(pdf, pages: list[int], out_path, progress=None, engine: str | None
         if not _engraves(out_path, say, work / "engrave.log"):
             raise OmrError(f"{engine} read the music, but this program cannot draw the result (it is saved as "
                            f"{out_path}). Open that file in a notation program such as MuseScore, save it again as "
-                           f"MusicXML and open it with Open XML…")
+                           f"MusicXML and open it with Open score…")
         say(1.0, "")
         return out_path
     finally:
