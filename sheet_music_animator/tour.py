@@ -26,6 +26,7 @@ class Step:
     setup: Callable | None = None       # setup(tour) -> done() ; the step waits for the user to do the task
     extra: tuple | None = None          # (button text, callback) for an optional shortcut
     kind: str = "step"                  # "welcome" | "step" | "end"
+    workspace: int | None = 0           # the view shown first: 0 the score, 1 the MIDI editor, None as it is
 
 
 class Tour(QWidget):
@@ -162,6 +163,8 @@ class Tour(QWidget):
         self._disconnect()
         self.i = i
         step = self.steps[i]
+        if step.workspace is not None and self.win.stack.currentIndex() != step.workspace:
+            self.win.show_workspace(step.workspace)
         if step.tab is not None:
             self.win.tabs.setCurrentWidget(step.tab())
         self._done = step.setup(self) if step.setup else None
@@ -358,17 +361,23 @@ def build_steps(win) -> list[Step]:
             return setup(tour) if setup else None
         return wrapped
 
+    def midi_selected(n):
+        return lambda: len(win.midi.selected) >= n
+
     S = Step
     return [
         S("Welcome to Sheet Music Animator",
-          "This short guide walks through the whole workflow — load a score, move a camera over it, keyframe "
-          "the camera on the timeline, tidy the engraving, and render a video. Each step lights up one control "
+          "This short guide walks through the whole workflow — load a score, fit it to a recording, move a "
+          "camera over it, keyframe the camera on the timeline, tidy the engraving, retime notes in the MIDI "
+          "editor, and render a video. Each step lights up one control "
           "and asks you to try it for real.<br><br>You can leave at any time, and bring the guide back with "
           "the <b>? Guide</b> button in the toolbar.", kind="welcome"),
         S("Open a score",
-          "Start with <b>Open ▸ Open score…</b> (Ctrl+O): pick a MuseScore file (.mscz, laid out by MuseScore itself "
-          "when it is installed) or MusicXML (.mxl, .musicxml, .xml). You will be asked how many <b>measures go on "
-          "each line</b> (or <b>As printed</b>) — that sets the size of the canvas. <b>Open ▸ Open PDF (EXPERIMENTAL!)</b> "
+          "Start with <b>Open ▸ Open score…</b> (Ctrl+O): pick a MuseScore file (.mscz) or MusicXML (.mxl, "
+          ".musicxml, .xml). With MuseScore 4 installed, <b>MuseScore itself lays the score out</b>, so the page "
+          "looks exactly as it does in MuseScore — the same spacing, the same staves hidden where they are empty. "
+          "Something wrong in the music? Fix it in MuseScore, save, and open the .mscz again. You will be asked "
+          "how many <b>measures go on each line</b> (or <b>As printed</b>) — that sets the size of the canvas. <b>Open ▸ Open PDF (EXPERIMENTAL!)</b> "
           "reads the music of an engraved PDF instead (with Audiveris or homr installed).<br><br>No file at hand? "
           "Use the sample score.", target=act(win.a_open), setup=lambda t: scene_ready,
           extra=("Use the sample score", use_sample)),
@@ -426,9 +435,11 @@ def build_steps(win) -> list[Step]:
           "“ghost” of unplayed notes, a global timing shift for audio sync and the ink and paper colours.",
           tab=lambda: win.tab_look, target=lambda: win.cb_reveal, setup=flagged(lambda: win.cb_reveal.activated)),
         S("Measures per line",
-          "This sets how many measures share a line (or put the whole score on one line). The canvas and the "
-          "automatic camera follow. Change the number and press Enter.", tab=lambda: win.tab_look,
-          target=lambda: [win.sp_mpl, win.btn_one_line],
+          "This sets how many measures share a line. <b>Whole score on one line</b> lays everything out in a row "
+          "for a side-scrolling video — a new system (brace, clefs, key) starts on the line wherever the printed "
+          "score shows other staves. <b>As printed</b> keeps the score's own line breaks (MuseScore files). The "
+          "canvas and the automatic camera follow. Change the number and press Enter.", tab=lambda: win.tab_look,
+          target=lambda: [win.sp_mpl, win.btn_one_line, win.btn_printed],
           setup=changed(lambda: tuple(win.score.line_starts) if win.score else ())),
         S("Select a measure",
           "Click the <b>white space inside a measure</b> to select it (not a note). <b>Shift+click</b> selects "
@@ -459,6 +470,25 @@ def build_steps(win) -> list[Step]:
         S("Undo and redo",
           "Every change can be undone — <b>↶</b> or <b>Ctrl+Z</b>; <b>↷</b> or <b>Ctrl+Y</b> redoes. Press "
           "undo now.", target=[act(win.a_undo), act(win.a_redo)], setup=flagged(lambda: win.a_undo.triggered)),
+        S("The MIDI editor",
+          "The score has a second view: the <b>MIDI Editor</b> tab in the toolbar (Ctrl+2; Ctrl+1 goes back). It "
+          "shows every note as a bar of a piano roll, each where it is played, under the waveform of the "
+          "recording — with the sync heat map beneath it when a recording is fitted.<br><br>Open it now.",
+          target=lambda: win.view_tabs, workspace=None, setup=lambda t: (lambda: win.stack.currentIndex() == 1),
+          extra=("Open the MIDI editor", lambda: win.show_workspace(1))),
+        S("Retime notes",
+          "Click a note to select it (its whole chord comes along), <b>Ctrl+click</b> or <b>Shift+click</b> to add, "
+          "or drag over empty space to select a rectangle. <b>Drag</b> selected notes left or right to retime them "
+          "— they snap to the attacks in the recording (hold <b>Alt</b> to drag freely); <b>Ctrl+←/→</b> nudges by "
+          "10 ms. Drag the <b>end</b> of a selected note to stretch or squeeze the whole selection. The engraved "
+          "notes move with them. Clicking a note or key plays it.<br><br>Select a note.",
+          target=lambda: win.midi.roll, workspace=1, setup=lambda t: midi_selected(1)),
+        S("Select to one side, quantize, export",
+          "<b>Select all to the left / right</b> puts a line under the mouse: click to select every note before or "
+          "after it — handy for moving a whole passage. <b>Quantize…</b> spaces the selected notes out evenly (or "
+          "in their written rhythm). <b>Export MIDI…</b> saves the notes as they are timed now. Ctrl+wheel zooms in "
+          "time, Alt+wheel the rows, and <b>Fit</b> shows the whole piece.",
+          target=lambda: [win.midi.btn_left, win.midi.btn_right, win.midi.btn_quant], workspace=1),
         S("Looks and layers",
           "The <b>Effects</b> tab turns the plain page into a produced look: a stack of layers — backdrops, "
           "particles, glowing notes, spotlights, grading, text — that can move with the music. Start from one "
