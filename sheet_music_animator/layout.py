@@ -28,6 +28,7 @@ def relayout_project(project: Project, old: Score, new: Score) -> None:
         return new_by_key.get(old_keys.get(uid))
 
     project.overrides = {tr(u): v for u, v in project.overrides.items() if tr(u) is not None}
+    project.ends = {tr(u): v for u, v in project.ends.items() if tr(u) is not None}
     project.timed = {tr(u) for u in project.timed if tr(u) is not None}
     project.transforms = {tr(u): v for u, v in project.transforms.items() if tr(u) is not None}
     project.deleted = {tr(u) for u in project.deleted if tr(u) is not None}

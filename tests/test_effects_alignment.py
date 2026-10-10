@@ -241,6 +241,36 @@ class TestAlignment(unittest.TestCase):
         err = np.abs(al.actual - np.array([warp(x) for x in al.nominal]))
         self.assertLess(err.max(), 0.1)
 
+    def test_a_pause_before_the_final_chord(self):
+        """The end of Alkan's Festin d'Esope: the performer waits before the last chord.  Holding the chord before it
+        or ending early used to be cheaper for the alignment than reaching the chord, which was put in the pause."""
+        tmp = Path(tempfile.mkdtemp())
+        score = build_score(make_project(tmp))
+        last = max(n[1] for n in score.nominal_notes)
+        warp = lambda t: 1.05 * t + 0.3 + (1.6 if t >= last - 1e-6 else 0.0)                    # noqa: E731
+        notes = [(p, warp(a), warp(b) + (3.0 if a >= last - 1e-6 else 0.0), v) for p, a, b, v in score.nominal_notes]
+        wav = tmp / "pause.wav"
+        audio.write_wav(wav, audio.synthesize(notes, warp(score.duration) + 3.0))
+        al = analysis.align_score(score.nominal_notes, str(wav))
+        err = np.abs(al.actual - np.array([warp(x) for x in al.nominal]))
+        self.assertLess(err[-1], 0.08)                             # the last chord, after the pause
+        self.assertLess(np.median(err), 0.04)
+
+    def test_noise_before_the_music_is_not_its_start(self):
+        """A live recording (Polonaise-fantaisie): a few seconds of the hall before the first chord, as loud as a
+        soft note.  The first note was put at the start of that noise."""
+        tmp = Path(tempfile.mkdtemp())
+        score = build_score(make_project(tmp))
+        music = audio.synthesize(score.nominal_notes, score.duration)
+        rng = np.random.default_rng(5)
+        noise = (0.03 * np.abs(music).max() * rng.standard_normal(3 * audio.SR)).astype(np.float32)
+        wav = tmp / "hall.wav"
+        audio.write_wav(wav, np.concatenate([noise, music]))
+        al = analysis.align_score(score.nominal_notes, str(wav))
+        err = np.abs(al.actual - (al.nominal + 3.0))
+        self.assertLess(err[0], 0.06)
+        self.assertLess(err.max(), 0.1)
+
     def test_loudness_follows_the_music(self):
         tmp = Path(tempfile.mkdtemp())
         notes = [(60, 0.0, 1.0, 120), (60, 2.0, 3.0, 30)]

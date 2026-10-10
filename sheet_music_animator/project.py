@@ -42,8 +42,9 @@ CATEGORIES = {
     "Ornaments and fermatas": ("trill", "mordent", "turn", "ornam", "fermata"),
     "Measure numbers": ("mNum",),
 }
-# Engravings that cannot be moved or resized: noteheads and note tails (the note itself) and beams.
-FIXED_KINDS = {"note", "chord", "beam", "beamSpan", "fTrem", "bTrem"}
+# Engravings that cannot be moved or resized: noteheads and note tails (the note itself), beams, and the stems,
+# flags and ledger lines that MuseScore draws apart from the note.
+FIXED_KINDS = {"note", "chord", "beam", "beamSpan", "fTrem", "bTrem", "stem", "flag", "ledger"}
 
 
 @dataclass(eq=False)
@@ -108,8 +109,9 @@ class Settings:
     crf: int = 16
     preset: str = "medium"       # x264 speed/size trade-off (ultrafast ... veryslow); faster = bigger files
     follow_width: float = 14000.0  # camera width (page units) used by the automatic camera path
-    follow_lead: float = 0.25    # where "now" sits in the frame (fraction from the left) when following the music
+    follow_lead: float = 0.5     # where "now" sits in the frame (fraction from the left) when following the music
     align_audio: str = ""        # recording the score timing was fitted to ("" = the score's own timing)
+    engraver: str = "verovio"    # "musescore" (the notation program lays the score out; new projects, when installed)
 
     @property
     def aspect(self) -> float:
@@ -157,6 +159,7 @@ class Project:
     settings: Settings = field(default_factory=Settings)
     channels: dict[str, list[Key]] = field(default_factory=_blank_channels)
     overrides: dict[int, float] = field(default_factory=dict)   # unit uid -> extra seconds
+    ends: dict[int, float] = field(default_factory=dict)        # unit uid -> extra seconds its notes sound (MIDI editor)
     keys_edited: bool = False      # the automatic path (x and frame size) or the rotation was changed by hand
     y_edited: bool = False         # the y position was changed by hand: the automatic path leaves it alone
     timed: set[int] = field(default_factory=set)   # clefs, barlines... (static units) that follow the music
@@ -384,6 +387,7 @@ class Project:
         return {"version": 5, "xml_path": self.xml_path, "settings": asdict(self.settings),
                 "channels": {ch: [{"t": k.t, "v": k.v, "ease": k.ease} for k in keys] for ch, keys in self.channels.items()},
                 "overrides": {str(k): v for k, v in sorted(self.overrides.items())},
+                "ends": {str(k): v for k, v in sorted(self.ends.items())},
                 "keys_edited": self.keys_edited, "y_edited": self.y_edited, "timed": sorted(self.timed),
                 "hidden": {str(m): sorted(c) for m, c in sorted(self.hidden.items()) if c},
                 "transforms": {str(u): list(v) for u, v in sorted(self.transforms.items())},
@@ -418,6 +422,7 @@ class Project:
                 self.channels["y"].append(Key(k["t"], [k["cy"]], k.get("ease", "smooth")))
                 self.channels["size"].append(Key(k["t"], [k["w"]], k.get("ease", "smooth")))
         self.overrides = {int(k): v for k, v in d.get("overrides", {}).items()}
+        self.ends = {int(k): v for k, v in d.get("ends", {}).items()}
         self.keys_edited = d.get("keys_edited", False)
         self.y_edited = d.get("y_edited", self.keys_edited)   # older projects: a path edited by hand keeps its y
         self.timed = {int(u) for u in d.get("timed", [])}

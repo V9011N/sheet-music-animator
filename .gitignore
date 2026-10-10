@@ -9,3 +9,8 @@ __pycache__/
 *.wav
 # local reference material (scores, recordings, other renderers)
 debug files/
+01_XMLs_PDFs_MP3s_for_training/
+tools/benchmark/out/
+
+# the sample score of the in-app guide
+!sheet_music_animator/sample.musicxml

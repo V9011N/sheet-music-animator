@@ -9,23 +9,28 @@ played. Move a resizable **camera window** over the sheet, keyframe it on a **ti
 ```
 python -m venv .venv
 .venv\Scripts\pip install -r requirements.txt
-.venv\Scripts\python main.py                      # then click "Open" ▸ "Open XML…" in the toolbar
-.venv\Scripts\python main.py piece.mxl            # or open a file directly (a .pdf too)
+.venv\Scripts\python main.py                      # then click "Open" ▸ "Open score…" in the toolbar
+.venv\Scripts\python main.py piece.mscz           # or open a file directly (.mxl and .pdf too)
 ```
+
+With [MuseScore 4](https://musescore.org) installed (found in its usual install folder, on the `PATH`, or through the
+`MUSESCORE` environment variable) MuseScore itself lays the score out, exactly as it prints it; without it Verovio
+engraves MusicXML files.
 
 ## How to use it
 
 | What | How |
 |---|---|
 | Guide | The first time the app opens it offers an interactive guide (skip it with *Skip guide*): it dims the window, spotlights one control at a time and waits for you to try it — open a score (a sample is included), move the camera, play, add and select keyframes, change the look, select measures, hide engravings, change line breaks, move elements, undo, output and save. Replay it any time with **? Guide** in the toolbar. |
-| Load a score | **Open ▸ Open XML…** (`.mxl`, `.musicxml`, `.xml`). You are asked how many **measures go on each line** (or put the **whole score on one line**); this decides the canvas size and the automatic camera. Notes, rests, beams, ties, dynamics, … appear at the time they are heard in the file (tempo included), instantly by default. |
-| Load a PDF | **Open ▸ Open PDF (EXPERIMENTAL!)** reads the music of an engraved PDF score. First every page is checked for music: the file must open (not damaged, not password-protected) and every page must hold staves with notes on them. A file without any music is refused with the reason; when only some pages are not music (a title page, text, a blank page, empty staves, tablature, a scan too faint or crooked to read) they are listed and you can read the other pages only. The music is then read by an optical music recognition program installed on the computer — [Audiveris](https://audiveris.github.io) (best for engraved scores; found on the `PATH`, in its usual install folder, or through the `AUDIVERIS` environment variable) or [homr](https://pypi.org/project/homr/) (`pip install homr`) — and saved next to the PDF as *name (from PDF).musicxml*, which then opens like any MusicXML file. What the engraver cannot take from the recognised score is tidied first (8va lines and hairpins that never end, pedals let go that were never pressed, beams repeated on every note of a chord), and the result is engraved once in a separate process, so a score that would crash the engraver is reported instead of closing the app. Reading the Heroic Polonaise (14 pages) takes Audiveris about 5 minutes. For text (title, tempo words) Audiveris needs Tesseract language data: install English from its *Tools ▸ Install languages* menu once. Recognition makes mistakes: correct that file in a notation program (MuseScore, …) if notes are wrong, and open it with **Open XML…**. |
+| Load a score | **Open ▸ Open score…**: a MuseScore score (`.mscz`, best: it holds everything the notation program shows) or MusicXML (`.mxl`, `.musicxml`, `.xml`). With MuseScore installed the score is laid out by MuseScore (a few seconds the first time, then cached), so it looks exactly like the PDF MuseScore prints; a `.mscz` needs MuseScore. A MusicXML export has lost some of what its `.mscz` had (which marks were hidden, which staves are left out of a line): the app tidies what it can before MuseScore reads it. A new score starts on its own timing with the built-in sound: the recording, the fit to it and the cached audio of the piece that was open are dropped (the look is kept). You are asked how many **measures go on each line** — **As printed** (the score's own lines; MuseScore only), a number (MuseScore still starts a new line where they do not fit), or the **whole score on one line** (with MuseScore, where the printed score shows other staves — a staff it leaves out where it only rests — the line starts a new system with its brace, clefs and key, every staff staying at one height); this decides the canvas size and the automatic camera. Notes, rests, beams, ties, dynamics, … appear at the time they are heard in the file (tempo included), instantly by default. |
+| Load a PDF | **Open ▸ Open PDF (EXPERIMENTAL!)** reads the music of an engraved PDF score. First every page is checked for music: the file must open (not damaged, not password-protected) and every page must hold staves with notes on them. A file without any music is refused with the reason; when only some pages are not music (a title page, text, a blank page, empty staves, tablature, a scan too faint or crooked to read) they are listed and you can read the other pages only. The music is then read by an optical music recognition program installed on the computer — [Audiveris](https://audiveris.github.io) (best for engraved scores; found on the `PATH`, in its usual install folder, or through the `AUDIVERIS` environment variable) or [homr](https://pypi.org/project/homr/) (`pip install homr`) — and saved next to the PDF as *name (from PDF).musicxml*, which then opens like any MusicXML file. What the engraver cannot take from the recognised score is tidied first (8va lines and hairpins that never end, pedals let go that were never pressed, beams repeated on every note of a chord), and the result is engraved once in a separate process, so a score that would crash the engraver is reported instead of closing the app. Reading the Heroic Polonaise (14 pages) takes Audiveris about 5 minutes. For text (title, tempo words) Audiveris needs Tesseract language data: install English from its *Tools ▸ Install languages* menu once. Recognition makes mistakes: correct that file in a notation program (MuseScore, …) if notes are wrong, and open it with **Open score…**. |
 | Playback speed | The **Speed** box in the toolbar plays at 0.1x to 5.0x (the audio follows); **1x** resets it. |
 | Tap to Keyframe | After fitting a recording, the toolbar's **Tap to Keyframe** opens a short explanation and asks whether each tap advances by *Notes only* or *Notes and Rests*; **Start** counts down 3 s and plays from the seeker. Press **Space** on every note — each tap sets when the next engraving appears (Space does not pause) — and **Esc** ends the mode. One undo step reverts everything tapped. |
+| MIDI editor | The **Score Animation** / **MIDI Editor** tabs in the toolbar (`Ctrl+1` / `Ctrl+2`) switch between the animation and a piano roll of the same project. The roll shows every note where it is played now — the fit to the recording, Tap to Keyframe and per-element timing included — with the keyboard on the left and the recording's waveform above it on the same time scale, so the playhead runs through both; click the waveform or ruler to seek. Only timing is edited: click, `Ctrl+click` (toggle), `Shift+click` (everything between) or drag a rectangle to select, then drag left or right (`Ctrl+←/→` nudges by 10 ms). A note moves with its chord — the notes engraved together — and the score animation, the built-in sound and undo follow at once; notes cannot be added or deleted. Drag an end of a selected note to stretch: with one chord selected, its right end makes it longer or shorter and its left end moves its start while its end stays; with a section selected, the whole section is scaled proportionally, about its last end (left) or its first start (right). **Quantize…** (two or more chords selected) spaces the section out over the time it takes now — evenly, or in its written rhythm — with the gap between notes you choose (a percentage); notes written together stay together. **◀ Select all to the left** / **Select all to the right ▶** turn on a line that follows the mouse: a click selects every note to that side of it (click again elsewhere to choose another place); `Esc` leaves the tool and keeps the selection for editing. With **Sync Heat Map** on, the sync confidence is shown under the waveform too. Dragged notes snap to the attacks in the recording and to other notes (**Snap**, or hold `Alt` to drag freely). Clicking a note or a key plays it. `Ctrl+wheel` / `Alt+wheel` zoom in time / pitch (or the −, +, ↕−, ↕+ buttons), `Shift+wheel` and middle-drag pan, **Fit** shows everything, **Export MIDI…** saves the notes as they are timed now as a `.mid` file. |
 | Play / pause / scrub | `Space`, click or drag in the timeline, `←/→` (0.1 s), `Shift+←/→` (1 s), `Home`. Ctrl+wheel zooms the timeline, middle-drag pans it. |
 | Camera | Drag the orange window in the editor to move it, drag a corner to resize (aspect ratio is locked to the output size), drag the round handle above it to rotate. Only the channel you change (x, y, frame size, rotation) gets a keyframe: moving the camera sideways keys x alone, moving it up or down keys y alone. Switch **Add keyframes automatically** off in the Camera tab to edit the camera at the playhead without creating keys. |
 | Keyframes | Each channel has its own lane; the **Camera** label of the timeline is a drop-down that shows or hides the lanes. `K` or double-click a lane adds a key; drag a diamond to retime it; `Ctrl+click` toggles a key, `Shift+click` selects a range, `Ctrl+A` selects all; dragging moves every selected key. Right-click for easing (smooth / linear / hold) or delete; `Delete` removes the selection. |
-| Auto camera | **Follow music** (Camera tab) builds a camera path that tracks the music and glides from line to line. It lays down the **x** channel (and the frame size); **y** only gets a key where the camera arrives at a line and where it leaves it, and once you have keyed y yourself, following the music (again) leaves it alone. "Follow-music width" sets the zoom, and "Follow-music lead (+) / lag (−)" how far the camera sits ahead of (or behind) the notes being played, as a share of the frame (0 % centres them; the default +25 % shows what is coming). While the camera path is still the automatic one it follows that setting live. |
+| Auto camera | **Follow music** (Camera tab) builds a camera path that tracks the music and glides from line to line. It lays down the **x** channel (and the frame size); **y** only gets a key where the camera arrives at a line and where it leaves it, and once you have keyed y yourself, following the music (again) leaves it alone. "Follow-music width" sets the zoom, and "Follow-music lead (+) / lag (−)" how far the camera sits ahead of (or behind) the notes being played, as a share of the frame (0 %, the default, centres them; +25 % shows more of what is coming). While the camera path is still the automatic one it follows that setting live. |
 | Undo / redo | Arrow buttons in the toolbar, `Ctrl+Z` / `Ctrl+Y` (`Ctrl+Shift+Z`). Closing with unsaved changes asks whether to save. |
 | Look & timing | Font of all text (default Times New Roman), note reveal (appear instantly or fade in; beams, 8va lines and hairpins grow note by note), a faint "ghost" of unplayed notes, global note shift, measures per line, ink/paper colours. |
 | Select | Click any engraved element, or click the white space of a measure (`Shift+click` for a range, `Ctrl+click` to add). |
@@ -46,10 +51,25 @@ Staves that MuseScore hid because they are empty (`print-object="no"` in the exp
 
 ## How it works
 
+* `xmlfix.py` – tidies the MusicXML before Verovio reads it, so the score looks the way the notation program
+  printed it: marks the program hid are not drawn (their tempo and loudness still play), tempo marks that only
+  steer the playback (bare numbers, a metronome mark every bar) are hidden, MuseScore's placeholder dynamics go,
+  pedal marks sit under the lowest staff in the program's style (pedalling written twice is drawn once, a pedal
+  pressed while down is a pedal change), and lines (8va, hairpins, pedals) are paired by when they happen – an
+  8va stopped before it was started crashed Verovio's MIDI export.
+* `msengraver.py` – MuseScore lays the score out: in one run it exports every page as SVG (every notehead, stem,
+  beam, slur, dynamic… a path of its own, named by its kind), where every measure and note segment is and when it is
+  played (`.mpos`, `.spos`), its MIDI and MusicXML. Every element becomes a unit timed by the note segment it stands
+  in, the staff lines, barlines and the clefs and keys at the start of a line become the static layers, the notes of
+  the playback come from the MIDI (on the same clock), what the dynamics say from the MusicXML. The result is the
+  same `Score` the Verovio engraver makes, so the rest of the program does not know which one made it. Line breaks
+  asked for in the app are written into the score before MuseScore lays it out.
 * `engraver.py` – Verovio engraves the MusicXML to SVG and gives a timemap. The SVG is split into a
   static layer per measure (staff lines, clefs, key/time signatures, barlines) and one tiny SVG per timed
   element. Beams, ties, ledger lines, dynamics, pedal marks… get their time from where they sit
-  next to the notes.
+  next to the notes. Dynamics written together are merged the way the scores print them ("p sf", "pp cresc."),
+  a third staff that only rests is left out of its line, and a slur Verovio throws off the page is drawn
+  as it was instead of pushing every later line millions of units down.
 * `scene.py` – a Qt graphics scene made of those layers; the editor, the camera preview and the
   exporter all draw this same scene, so the preview is exactly what is rendered.
 * `export.py` – draws the camera rectangle for every frame and pipes raw frames to ffmpeg
@@ -60,6 +80,10 @@ Staves that MuseScore hid because they are empty (`print-object="no"` in the exp
   pitches (Viterbi over candidate attacks).  Checked against the note timing the first Winter Wind
   renderer had worked out for Kissin's recording (with its note list standing in for the score), 80% of
   the notes agree within 30 ms and 96% within 120 ms.
+  The music is found in the recording by sound that is tonal (applause or the hall before the first chord is
+  not), the final chord may be held and may come after a pause for as long as the performer likes, and
+  `tools/benchmark/` compares the engraving with the printed PDFs and the fit with the recordings of a set of
+  difficult pieces.
 * `layers.py` – the catalogue of layer types: for each, its settings, ranges, defaults and which settings can
   follow a signal. The editor builds its panels from it, so adding a new effect means adding one entry there
   and one drawer in `effects.py`.
@@ -84,6 +108,9 @@ Staves that MuseScore hid because they are empty (`print-object="no"` in the exp
 * `export.py` – besides the plain renderer, `EffectsRenderer` makes one finished frame and
   `render_video_parallel` renders slices of the video in separate processes and joins them.
 * `cli.py` – the same pipeline without a window (see below).
+* `midiroll.py` – the MIDI editor: each note linked to the engraved note or chord it belongs to (by time and
+  written pitch, octave lines allowed for), the piano roll and waveform, and the MIDI file writer. Moving
+  notes changes their elements' timing nudges, the same values Tap to Keyframe sets.
 * `audio.py` – a small additive piano synth driven by the notes in the file, so there is sound
   without a soundfont. Supply your own recording in the Output tab for anything better.
 
@@ -118,8 +145,11 @@ An existing `.smanim` project can be rendered the same way.
 
 ## Known limits
 
-* Notes are engraved by Verovio, so the layout is Verovio's, not your notation program's.
-* Only the first page is used; the lines are stacked on one tall page (or laid out on a single line).
+* Without MuseScore, notes are engraved by Verovio, so the layout is Verovio's, not your notation program's.
+  Projects saved before MuseScore engraving keep Verovio (their keyframes and edits belong to its elements).
+* With MuseScore the text is drawn as MuseScore draws it: the *Font* setting does not change it.
+* With Verovio the lines are stacked on one tall page (or laid out on a single line); with MuseScore the pages are
+  stacked as printed.
 * Clefs/key/time signatures at the start of a staff, barlines and the like are always visible unless you time them in the Selection tab.
 * Fitting a score to a recording works best for piano-like music; very free rubato or a recording that
   differs from the score (cuts, repeats taken differently) can leave stretches off by a few tenths of a
